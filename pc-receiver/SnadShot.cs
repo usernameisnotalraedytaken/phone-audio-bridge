@@ -70,7 +70,7 @@ namespace Snad
                 CollectByType(f, typeof(MetricStrip), strips);
                 CollectByType(f, typeof(SpectrumGraph), graphs);
 
-                Console.WriteLine("  自绘按钮 " + buttons.Count + " 个，滚轮选择器 " + combos.Count +
+            Console.WriteLine("  自绘按钮 " + buttons.Count + " 个，滚轮选择器 " + combos.Count +
                                   " 个，通道条 " + strips.Count + " 个，频谱图 " + graphs.Count + " 个");
 
                 // 滚轮选择器必须是收起态（单行），展开态会占三行并压到别的区域

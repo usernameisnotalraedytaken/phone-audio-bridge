@@ -122,8 +122,9 @@ namespace Snad
                 MainText = "SNAD",
                 SubText = "AUDIO BRIDGE",
                 Location = new Point(14, 3),
-                Height = 34,
-                Width = 240
+                Height = 34
+                // 宽度不写死：控件在句柄建立后按内容自动撑开（FitToContent）。
+                // 曾经写死 240 而实际需要约 255，副题被截成 "AUDIO BR"。
             };
             // 状态点：正常绿、异常橙，异常时闪烁
             _dot = new Panel { Size = new Size(7, 7), BackColor = Theme.TextTertiary, Location = new Point(0, 17) };
