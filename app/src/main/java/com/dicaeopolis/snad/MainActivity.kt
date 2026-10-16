@@ -39,6 +39,14 @@ class MainActivity : AppCompatActivity() {
     private lateinit var startBtn: Button
     private lateinit var stopBtn: Button
 
+    /** 自动发现结果的展示位。正常路径下这是用户唯一需要看的地方。 */
+    private lateinit var discoveryView: TextView
+    private lateinit var discoveryHintView: TextView
+
+    /** 手填地址的折叠区：只在广播不可达的网络才需要展开。 */
+    private lateinit var manualToggle: Button
+    private lateinit var manualPanel: LinearLayout
+
     private var streaming = false
 
     /** 信标监听：自动发现电脑端。密钥在构建时注入，因此无需配对步骤。 */
@@ -107,11 +115,22 @@ class MainActivity : AppCompatActivity() {
         val addrChanged = hostField.text.toString().trim() != peer.address
         hostField.setText(peer.address)
         portField.setText(peer.port.toString())
+
+        // 未在串流时允许点击开始；串流中保持原状态
+        if (!streaming) startBtn.isEnabled = true
+        discoveryView.text = getString(R.string.pc_found) + "：" + peer.address + ":" + peer.port
+        discoveryHintView.text = peer.deviceId
+
         if (addrChanged || !discoveredOnce) {
             discoveredOnce = true
             SnadLog.info("UI", "已发现电脑 ${peer.deviceId} @ ${peer.address}:${peer.port}，已自动填入")
-            setStatus("idle", "已发现电脑 ${peer.address}:${peer.port}")
         }
+    }
+
+    private fun toggleManual() {
+        val show = manualPanel.visibility != android.view.View.VISIBLE
+        manualPanel.visibility = if (show) android.view.View.VISIBLE else android.view.View.GONE
+        manualToggle.text = getString(if (show) R.string.btn_manual_hide else R.string.btn_manual)
     }
 
     override fun onStart() {
@@ -179,24 +198,30 @@ class MainActivity : AppCompatActivity() {
             setPadding(0, 4, 0, pad)
         })
 
-        root.addView(label(R.string.label_target))
-        hostField = EditText(this).apply {
-            hint = getString(R.string.hint_host)
-            inputType = InputType.TYPE_CLASS_TEXT
-            setTextColor(ContextCompat.getColor(context, R.color.fg))
+        // ---- 自动发现结果 ----
+        // 正常路径下用户不需要输入任何地址：电脑端广播信标，手机收到即用。
+        // 因此这里把"找到的电脑"作为一等公民展示，手填入口退到折叠区，
+        // 只在广播不可达的网络（如校园网客户端隔离）才需要展开。
+        discoveryView = TextView(this).apply {
+            text = getString(R.string.finding_pc)
+            textSize = 16f
+            setTextColor(ContextCompat.getColor(context, R.color.accent))
+            setPadding(0, 0, 0, 4)
         }
-        root.addView(hostField, wide())
+        root.addView(discoveryView)
 
-        root.addView(label(R.string.label_port))
-        portField = EditText(this).apply {
-            hint = SnadProtocol.DEFAULT_PORT.toString()
-            inputType = InputType.TYPE_CLASS_NUMBER
-            setTextColor(ContextCompat.getColor(context, R.color.fg))
+        discoveryHintView = TextView(this).apply {
+            text = getString(R.string.finding_pc_hint)
+            textSize = 12f
+            setTextColor(ContextCompat.getColor(context, R.color.muted))
+            setPadding(0, 0, 0, pad)
         }
-        root.addView(portField, wide())
+        root.addView(discoveryHintView)
 
         startBtn = Button(this).apply {
             text = getString(R.string.btn_start)
+            // 未发现电脑前禁用，避免用户点了才开始想"地址填什么"
+            isEnabled = false
             setOnClickListener { onStartClicked() }
         }
         root.addView(startBtn, wide())
@@ -211,6 +236,33 @@ class MainActivity : AppCompatActivity() {
             }
         }
         root.addView(stopBtn, wide())
+
+        // ---- 手动指定（折叠）----
+        manualToggle = Button(this).apply {
+            text = getString(R.string.btn_manual)
+            setOnClickListener { toggleManual() }
+        }
+        root.addView(manualToggle, wide())
+
+        manualPanel = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            visibility = android.view.View.GONE
+        }
+        manualPanel.addView(label(R.string.label_target))
+        hostField = EditText(this).apply {
+            hint = getString(R.string.hint_host)
+            inputType = InputType.TYPE_CLASS_TEXT
+            setTextColor(ContextCompat.getColor(context, R.color.fg))
+        }
+        manualPanel.addView(hostField, wide())
+        manualPanel.addView(label(R.string.label_port))
+        portField = EditText(this).apply {
+            hint = SnadProtocol.DEFAULT_PORT.toString()
+            inputType = InputType.TYPE_CLASS_NUMBER
+            setTextColor(ContextCompat.getColor(context, R.color.fg))
+        }
+        manualPanel.addView(portField, wide())
+        root.addView(manualPanel)
 
         statusView = TextView(this).apply {
             textSize = 16f
@@ -283,15 +335,18 @@ class MainActivity : AppCompatActivity() {
     // ---------------------------------------------------------------- 流程
 
     private fun onStartClicked() {
-        val host = hostField.text.toString().trim().ifEmpty { getString(R.string.hint_host) }
-        val port = portField.text.toString().trim().ifEmpty { SnadProtocol.DEFAULT_PORT.toString() }
+        // 正常路径下地址由信标自动填入。若为空说明既没发现电脑、也没手填，
+        // 此时必须明确报错，而不是回退到某个占位常量（那会悄悄连到错误的地址）。
+        val host = hostField.text.toString().trim()
+        val port = portField.text.toString().trim()
             .toIntOrNull() ?: SnadProtocol.DEFAULT_PORT
 
         SnadLog.info("UI", "点击开始 host=$host port=$port")
 
         if (host.isBlank()) {
-            SnadLog.err("UI", "地址为空，中止")
-            setStatus("error", "请先填电脑地址")
+            SnadLog.err("UI", "尚未发现电脑且未手填地址，中止")
+            setStatus("error", "还没找到电脑：请确认电脑端已启动接收器；" +
+                    "若网络不支持广播，展开「手动指定地址」填写")
             return
         }
 
@@ -322,9 +377,17 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun launchService(resultCode: Int, data: Intent) {
-        val host = hostField.text.toString().trim().ifEmpty { getString(R.string.hint_host) }
-        val port = portField.text.toString().trim().ifEmpty { SnadProtocol.DEFAULT_PORT.toString() }
+        // 与 onStartClicked 保持同一策略：不回退占位地址。
+        // 能走到这里说明 onStartClicked 已校验过 host 非空，但仍显式检查，
+        // 避免以后改动流程时又出现"悄悄连到错误地址"。
+        val host = hostField.text.toString().trim()
+        val port = portField.text.toString().trim()
             .toIntOrNull() ?: SnadProtocol.DEFAULT_PORT
+        if (host.isBlank()) {
+            SnadLog.err("UI", "启动服务时地址为空，中止（不应发生：onStartClicked 已校验）")
+            setStatus("error", "电脑地址为空，无法启动")
+            return
+        }
         try {
             ContextCompat.startForegroundService(
                 this, AudioCaptureService.startIntent(this, resultCode, data, host, port)

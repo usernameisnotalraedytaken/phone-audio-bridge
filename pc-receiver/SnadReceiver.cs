@@ -135,6 +135,30 @@ namespace Snad
         /// </summary>
         internal const int QueueCapacity = 8;
 
+        /// <summary>
+        /// 信标里使用的本机标识。用途仅是让手机区分"是哪台电脑"，
+        /// 不承担授权职责（授权完全由 HMAC 保证），因此可以稳定公开。
+        /// 用机器名 + 密钥指纹前 4 位：换机器或换密钥时标识随之变化，便于识别。
+        /// </summary>
+        internal static readonly string MachineDeviceId = BuildMachineDeviceId();
+
+        private static string BuildMachineDeviceId()
+        {
+            string name;
+            try { name = Environment.MachineName; }
+            catch (Exception) { name = "pc"; }
+            if (string.IsNullOrEmpty(name)) name = "pc";
+            // 去掉可能干扰显示的字符，保留可读性
+            var sb = new StringBuilder();
+            foreach (char c in name)
+                if (char.IsLetterOrDigit(c) || c == '-' || c == '_') sb.Append(c);
+            string clean = sb.Length > 0 ? sb.ToString() : "pc";
+
+            string kid = SnadSecret.KeyId;
+            string suffix = string.IsNullOrEmpty(kid) ? "nokey" : kid.Substring(0, Math.Min(4, kid.Length));
+            return "snad-" + clean + "-" + suffix;
+        }
+
         // ---- 系统计时器精度 ----
         // 本机实测：Stopwatch 计时的 Thread.Sleep(100) 实际睡了 223 ms，
         // DateTime.UtcNow 的粒度是 13.4 ms —— 系统计时器处于默认的 15.6 ms 档。
@@ -314,11 +338,31 @@ namespace Snad
             Console.WriteLine("按 Ctrl+C 退出。");
             Console.WriteLine();
 
+            // 启动信标广播：手机端据此自动发现本机，无需手填地址。
+            // 密钥来自构建时注入的 SnadSecret；缺失时明确报错，不静默跳过广播
+            // （否则表现为"手机永远找不到电脑"，很难排查）。
+            BeaconBroadcaster beacon = null;
+            try
+            {
+                byte[] beaconKey = SnadBeacon.DeriveKey(SnadSecret.Psk);
+                beacon = new BeaconBroadcaster(MachineDeviceId, port, beaconKey, 2000,
+                    m => Logger.Warn("信标：" + m));
+                beacon.Start();
+                Logger.Info("信标广播已启动：device=" + MachineDeviceId + " 端口=" + port +
+                            " KeyId=" + SnadSecret.KeyId + "（手机端此值必须一致）");
+            }
+            catch (Exception ex)
+            {
+                Logger.Err("信标广播启动失败（手机端将无法自动发现本机，仍可手填地址）", ex);
+            }
+
             using (var receiver = new SnadReceiver(deviceIndex, port, active))
             {
                 Console.CancelKeyPress += (s, e) => { e.Cancel = true; receiver.Stop(); };
                 receiver.Run();
             }
+
+            if (beacon != null) { beacon.Dispose(); Logger.Info("信标广播已停止"); }
 
             // 恢复系统计时器精度，避免影响其它程序
             uint tResEnd = TimeEndPeriod(TimerResolutionMs);

@@ -53,6 +53,9 @@ namespace Snad
         private CancellationTokenSource _runCts;
         private Profile _active;
 
+        /// <summary>信标广播器。手机端据此自动发现本机，无需手填地址。</summary>
+        private BeaconBroadcaster _beacon;
+
         private readonly SpectrumAnalyzer _analyzer = new SpectrumAnalyzer();
         private readonly object _audioGate = new object();
         private byte[] _pendingAudio;
@@ -399,6 +402,24 @@ namespace Snad
             };
             _rxThread.Start();
 
+            // 启动信标广播：手机端据此自动发现本机，用户无需知道 IP。
+            // 失败不阻断接收（仍可手填地址），但必须明确报出来，否则表现为
+            // "手机永远找不到电脑"，很难排查。
+            try
+            {
+                var key = SnadBeacon.DeriveKey(SnadSecret.Psk);
+                _beacon = new BeaconBroadcaster(Program.MachineDeviceId, Program.DefaultPort, key, 2000,
+                    m => AppendStatsLine("信标：" + m));
+                _beacon.Start();
+                AppendStatsLine("信标广播已启动：device=" + Program.MachineDeviceId +
+                                "，KeyId=" + SnadSecret.KeyId + "（手机端此值必须一致）");
+            }
+            catch (Exception ex)
+            {
+                AppendStatsLine("信标广播启动失败：" + ex.GetType().Name + ": " + ex.Message +
+                                "（手机端需手填地址）");
+            }
+
             _startBtn.Text = "停止";
             _startBtn.FlatAppearance.BorderColor = Warn;
             _statusLabel.Text = "运行中 · 档位 " + _active.Name;
@@ -415,6 +436,13 @@ namespace Snad
             catch (Exception ex) { AppendStatsLine("等待线程退出异常：" + ex.Message); }
             try { if (_receiver != null) _receiver.Dispose(); }
             catch (Exception ex) { AppendStatsLine("释放接收器异常：" + ex.Message); }
+
+            // 停止信标广播，避免接收停止后手机仍能"发现"一个不再工作的电脑
+            try
+            {
+                if (_beacon != null) { _beacon.Dispose(); _beacon = null; }
+            }
+            catch (Exception ex) { AppendStatsLine("停止信标广播异常：" + ex.Message); }
 
             _receiver = null;
             _rxThread = null;
