@@ -130,18 +130,47 @@ $consoleArgs += $consoleSources
 if ($LASTEXITCODE -ne 0) { throw "控制台版编译失败，csc 退出码 $LASTEXITCODE" }
 Install-Binary 'SnadReceiver.new.exe' 'SnadReceiver.exe'
 
-# ---- 1b) 音频设备能力探测工具 ----
+# ---- 1b) 音频设备能力探测与后端延迟测量工具 ----
 #
 # 编辑器只允许用户选择"实际可用"的后端与周期组合，因此能力探测必须先行，
-# 且要是可信的工具而不是一次性脚本。它探明的事实记录在 AUDIO-CAPABILITIES.md。
-if (Test-Path 'SnadAudioProbe.cs') {
-    $probeArgs = @('/nologo', '/target:exe', '/platform:x64', '/optimize+',
-                   '/main:Snad.AudioProbe', '/out:SnadAudioProbe.new.exe')
-    foreach ($a in $coreRefs) { $probeArgs += ("/r:" + (Join-Path $fw $a)) }
-    $probeArgs += 'SnadAudioProbe.cs'
-    & $csc @probeArgs
-    if ($LASTEXITCODE -ne 0) { throw "音频能力探测工具编译失败，csc 退出码 $LASTEXITCODE" }
-    Install-Binary 'SnadAudioProbe.new.exe' 'SnadAudioProbe.exe'
+# 且要是可信的工具而不是一次性脚本。探明的事实记录在
+# AUDIO-CAPABILITIES.md（设备能力）与 LATENCY-MEASURED.md（实测延迟）。
+#
+# 这四个工具共用 SnadAudioSink/Codec/Devices/Wasapi：
+#   SnadAudioProbe      设备能力枚举
+#   SnadWasapiTest      WASAPI 播放与延迟测量
+#   SnadWaveOutTest     waveOut 基线测量（对比用）
+#   SnadExclusiveProbe  独占模式可用组合穷举
+$audioCore = @('SnadAudioSink.cs', 'SnadAudioCodec.cs', 'SnadAudioDevices.cs', 'SnadWasapi.cs')
+
+if ((Test-Path 'SnadAudioProbe.cs') -and ($audioCore | Where-Object { Test-Path $_ } | Measure-Object).Count -eq $audioCore.Count) {
+    $audioTools = @(
+        @{ Main = 'Snad.AudioProbe';     Out = 'SnadAudioProbe';     Src = @('SnadAudioProbe.cs') },
+        @{ Main = 'Snad.WasapiTest';     Out = 'SnadWasapiTest';     Src = @('SnadWasapiTest.cs') },
+        @{ Main = 'Snad.ExclusiveProbe'; Out = 'SnadExclusiveProbe'; Src = @('SnadExclusiveProbe.cs') },
+        @{ Main = 'Snad.AudioCodecTest'; Out = 'SnadAudioCodecTest'; Src = @('SnadAudioCodecTest.cs') }
+    )
+    foreach ($t in $audioTools) {
+        if (-not (Test-Path $t.Src[0])) { continue }
+        $a = @('/nologo', '/target:exe', '/platform:x64', '/optimize+',
+               ('/main:' + $t.Main), ('/out:' + $t.Out + '.new.exe'))
+        foreach ($r in $coreRefs) { $a += ("/r:" + (Join-Path $fw $r)) }
+        $a += $audioCore + $t.Src
+        & $csc @a
+        if ($LASTEXITCODE -ne 0) { throw ($t.Out + " 编译失败，csc 退出码 $LASTEXITCODE") }
+        Install-Binary ($t.Out + '.new.exe') ($t.Out + '.exe')
+    }
+}
+
+# waveOut 基线测量不依赖上面的共用代码，单独编译
+if (Test-Path 'SnadWaveOutTest.cs') {
+    $woArgs = @('/nologo', '/target:exe', '/platform:x64', '/optimize+',
+                '/main:Snad.WaveOutTest', '/out:SnadWaveOutTest.new.exe')
+    foreach ($a in $coreRefs) { $woArgs += ("/r:" + (Join-Path $fw $a)) }
+    $woArgs += 'SnadWaveOutTest.cs'
+    & $csc @woArgs
+    if ($LASTEXITCODE -ne 0) { throw "waveOut 基线测量工具编译失败，csc 退出码 $LASTEXITCODE" }
+    Install-Binary 'SnadWaveOutTest.new.exe' 'SnadWaveOutTest.exe'
 }
 
 # ---- 1c) 信标协议验证工具（独立入口，用于在手机端实现前先证明协议可用）----
