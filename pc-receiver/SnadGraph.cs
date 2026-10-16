@@ -176,6 +176,12 @@ namespace Snad
         private RectangleF _plot;
         private bool _plotValid;
 
+        /// <summary>
+        /// 图区矩形（控件坐标）。外部需要与图上刻度对齐时用它，
+        /// 例如均衡器窗口把 PREAMP 推子的 0dB 对齐到 0 线。
+        /// </summary>
+        internal RectangleF PlotRectangle { get { return PlotRect(); } }
+
         private RectangleF PlotRect()
         {
             if (_plotValid) return _plot;

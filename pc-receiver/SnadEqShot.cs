@@ -99,6 +99,14 @@ namespace Snad
                             }
                             Console.WriteLine("  曲线图单独渲染 -> " + gpath);
 
+                            // ---- 断言：PREAMP 推子的 0dB 必须与图区 0 线齐平 ----
+                            failures += CheckPreampAlignment(f, eq);
+
+                            // 把图区连同右侧推子一起渲染，便于肉眼确认对齐
+                            failures += RenderGraphArea(f, Path.Combine(
+                                Path.GetDirectoryName(Path.GetFullPath(outPath)) ?? ".",
+                                "eq-grapharea.png"));
+
                             // ---- 断言：曲线必须真的跟着数据弯 ----
                             // 用户反馈"不管推子怎么动，UI 上显示还是一条直线"。
                             // 数据对不对是另一回事——这里直接看渲染结果：
@@ -408,6 +416,151 @@ namespace Snad
                 }
             }
             return -1;
+        }
+
+        /// <summary>
+        /// 断言 PREAMP 推子的 0dB 位置与曲线图的 0dB 虚线齐平。
+        ///
+        /// 这是设计意图：PREAMP 语义就是"整条曲线上下平移"，
+        /// 因此推子位置必须能直接读出平移量。两者若不对齐，拖推子时
+        /// 虚线与推子会各在一处，观感就是"没对上"。
+        /// </summary>
+        private static int CheckPreampAlignment(EqForm f, Equalizer eq)
+        {
+            int bad = 0;
+            Console.WriteLine();
+            Console.WriteLine("--- PREAMP 推子与 0dB 虚线是否齐平 ---");
+
+            var fader = FindFirst<EqFader>(f);
+            if (f.Graph == null || fader == null)
+            {
+                Console.WriteLine("  [跳过] 取不到图区或推子");
+                return 0;
+            }
+
+            // ---- 推子量程必须与 Equalizer 的可设范围一致 ----
+            // 曾经推子是 ±18 而 Equalizer 把 preamp 钳到 [-24,+12]：
+            // 推到 +18 时读数写 +18、实际只取到 +12，曲线到顶就不动了。
+            var eqProbe = new Equalizer();
+            eqProbe.PreampDb = -999; double eqLow = eqProbe.PreampDb;
+            eqProbe.PreampDb = 999; double eqHigh = eqProbe.PreampDb;
+
+            double savedGain = fader.GainDb;
+            fader.GainDb = -999; double faderLow = fader.GainDb;
+            fader.GainDb = 999; double faderHigh = fader.GainDb;
+            fader.GainDb = savedGain;
+
+            Console.WriteLine("  推子量程 [" + faderLow.ToString("F0") + ", " + faderHigh.ToString("F0") + "]" +
+                              "   EQ 可设范围 [" + eqLow.ToString("F0") + ", " + eqHigh.ToString("F0") + "]");
+            if (Math.Abs(faderLow - eqLow) > 0.05 || Math.Abs(faderHigh - eqHigh) > 0.05)
+            {
+                Console.WriteLine("  [失败] 推子量程与 EQ 可设范围不一致——" +
+                                  "推到底会出现读数与实际不符、曲线到顶不动");
+                bad++;
+            }
+            else Console.WriteLine("  [通过] 推子量程与 EQ 可设范围一致");
+
+            // 图区 0dB 在窗体坐标下的 y
+            var plot = f.Graph.PlotRectangle;
+            double span = f.Graph.DbAxisTop - f.Graph.DbAxisBottom;
+            double t = (0 - f.Graph.DbAxisBottom) / span;
+            double graphTopInForm = f.PointToClient(f.Graph.PointToScreen(Point.Empty)).Y;
+            double zeroInForm = graphTopInForm + plot.Bottom - t * plot.Height;
+
+            // 推子的 0dB 在窗体坐标下的 y
+            double faderTopInForm = f.PointToClient(fader.PointToScreen(Point.Empty)).Y;
+            double old = fader.GainDb;
+            fader.GainDb = 0;
+            double faderZeroInForm = faderTopInForm + FaderZeroOffset(fader);
+            fader.GainDb = old;
+
+            double diff = Math.Abs(faderZeroInForm - zeroInForm);
+            Console.WriteLine("  图区 0dB 线 y=" + zeroInForm.ToString("F1") +
+                              "   推子 0dB y=" + faderZeroInForm.ToString("F1") +
+                              "   差 " + diff.ToString("F1") + "px");
+
+            // 灵敏度判据：拖满控件高度应恰好走完整个量程。
+            // 这样"鼠标移动多少像素、推子就移动多少像素"，符合直觉。
+            // 判据不看"每像素多少 dB"——那个值随量程与高度变化，
+            // 比值本身说明不了手感。
+            double fullRangeDb = 36.0;
+            double expectPxPerDb = Math.Max(1, fader.Height) / fullRangeDb;
+            Console.WriteLine("  推子尺寸 " + fader.Width + "x" + fader.Height +
+                              "  量程 " + fullRangeDb.ToString("F0") + "dB" +
+                              "  ->  每 dB 需 " + expectPxPerDb.ToString("F1") + "px" +
+                              "（每像素 " + (fullRangeDb / Math.Max(1, fader.Height)).ToString("F3") + " dB）");
+
+            // 用实际拖动验证：拖满高度应恰好到量程端点
+            double saved = fader.GainDb;
+            fader.GainDb = 0;
+            int half = fader.Height / 2 - 4;
+            var mi = fader.GetType().GetMethod("OnMouseDown",
+                System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic);
+            var mm = fader.GetType().GetMethod("OnMouseMove",
+                System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic);
+            if (mi != null && mm != null)
+            {
+                mi.Invoke(fader, new object[] { new MouseEventArgs(MouseButtons.Left, 1, fader.Width / 2, half, 0) });
+                mm.Invoke(fader, new object[] { new MouseEventArgs(MouseButtons.Left, 1, fader.Width / 2, half - (fader.Height / 2 - 4), 0) });
+                double moved = fader.GainDb;
+                Console.WriteLine("  实测：从 0 向上拖 " + (fader.Height / 2 - 4) + "px -> " +
+                                  moved.ToString("F1") + " dB（预期约 +15 ~ +18）");
+                if (moved < 9)
+                {
+                    Console.WriteLine("  [失败] 拖了大半高度才改 " + moved.ToString("F1") +
+                                      " dB，过于迟钝");
+                    bad++;
+                }
+                else if (moved > 20)
+                {
+                    Console.WriteLine("  [失败] 拖了大半高度就改 " + moved.ToString("F1") +
+                                      " dB，过于灵敏");
+                    bad++;
+                }
+                else Console.WriteLine("  [通过] 拖动行程与量程匹配");
+            }
+            fader.GainDb = saved;
+
+            if (diff > 4.0)
+            {
+                Console.WriteLine("  [失败] 推子与 0dB 虚线未对齐（差 " + diff.ToString("F1") + "px）");
+                bad++;
+            }
+            else Console.WriteLine("  [通过] 推子与 0dB 虚线齐平");
+
+            return bad;
+        }
+
+        /// <summary>按推子的映射算出 0dB 相对控件顶部的偏移。</summary>
+        private static double FaderZeroOffset(EqFader fader)
+        {
+            var m = fader.GetType().GetMethod("ValueToY",
+                System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic);
+            if (m == null) return fader.Height / 2.0;
+            var v = m.Invoke(fader, new object[] { 0 });
+            return v == null ? fader.Height / 2.0 : Convert.ToDouble(v);
+        }
+
+        /// <summary>把图区（含右侧推子）整块渲染出来，便于肉眼确认。</summary>
+        private static int RenderGraphArea(EqForm f, string path)
+        {
+            var host = f.Graph != null ? f.Graph.Parent : null;
+            if (host == null) return 0;
+            try
+            {
+                using (var bmp = new Bitmap(host.Width, host.Height))
+                {
+                    host.DrawToBitmap(bmp, new Rectangle(0, 0, host.Width, host.Height));
+                    bmp.Save(path, ImageFormat.Png);
+                }
+                Console.WriteLine("  图区含推子 -> " + path + "  (" + host.Width + "x" + host.Height + ")");
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine("  图区渲染失败：" + ex.Message);
+                return 1;
+            }
+            return 0;
         }
 
         private static T FindFirst<T>(Control root) where T : Control        {

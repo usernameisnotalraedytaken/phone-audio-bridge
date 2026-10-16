@@ -23,10 +23,44 @@ namespace Snad
         private SpectrumGraph _graph;
         private FlatToggle _enable;
         private FlatToggle _couple;
-        private FlatStepper _preamp;
         private Label _hint;
         private EqFader[] _faders;
         private Label[] _valueLabels;
+        private EqFader _preampFader;
+        private Label _preampLabel;
+
+        /// <summary>
+        /// 把 PREAMP 推子与图区的**绘图矩形**对齐——不是与图区控件对齐。
+        ///
+        /// 图区控件里包含上下留白：顶部是 dB 刻度文字区，底部是频率刻度文字区，
+        /// 这两段**没有图线**。若把推子的全高对到控件全高，推子顶部与底部
+        /// 就落在空白区里，滑到那里无法与虚线对应（用户实测发现的）。
+        ///
+        /// 因此改为：推子的矩形与 PlotRectangle 完全重合——
+        /// 相同的高度、相同的 0dB 位置。这样推子行程的每一处都对应图上有线的位置。
+        /// </summary>
+        private void AlignPreampFader()
+        {
+            if (_graph == null || _preampFader == null || _graph.Height <= 0) return;
+
+            var plot = _graph.PlotRectangle;
+            if (plot.Height <= 1) return;
+
+            // 推子在容器坐标下的矩形 = 图区绘图矩形的位置与高度。
+            // 横向仍按 Resize 里算好的位置（faderX），这里只改纵向。
+            var want = new Rectangle(
+                _preampFader.Left,
+                _graph.Top + (int)Math.Round(plot.Top),
+                _preampFader.Width,
+                Math.Max(20, (int)Math.Round(plot.Height)));
+
+            if (_preampFader.Bounds != want) _preampFader.Bounds = want;
+
+            // 量程铺满自身高度，因此几何中心即 0dB，与绘图区 0 线重合。
+            // 范围直接引用 Equalizer 的常量，两边不可能再不一致
+            // （曾经推子 ±18 而 EQ 内部钳到 [-24,+12]，推到底曲线却不动）。
+            _preampFader.SetFullRange(Equalizer.PreampMinDb, Equalizer.PreampMaxDb);
+        }
 
         /// <summary>曲线图。检查工具用它模拟拖动节点，验证与推子的联动。</summary>
         internal SpectrumGraph Graph { get { return _graph; } }
@@ -161,14 +195,47 @@ namespace Snad
                 Padding = new Padding(10, 10, 10, 4)
             };
             graphHost.Controls.Add(_graph);
+
+            // ---- 图区右侧的 PREAMP 推子 ----
+            // 它表达的是"整条曲线上下平移"，因此必须与图区的 0dB 虚线严格对齐：
+            // 推子的 0dB 位置 = 图区 0 线的像素位置。
+            // 这靠 SetPositionalScale 指定绝对位置实现——
+            // 若让推子把自己的量程铺满整高，两者永远对不齐。
+            _preampFader = new EqFader
+            {
+                Width = 56,
+                BackColor = Theme.BgBase
+            };
+            _preampFader.SetRange(-18, 18);
+            _preampFader.GainDb = _eq.PreampDb;
+            _preampFader.ValueChanged += (s, e) =>
+            {
+                _eq.PreampDb = _preampFader.GainDb;
+                _preampLabel.Text = "PREAMP  " + _preampFader.GainDb.ToString("+0.0;-0.0;0.0") + " dB";
+                _graph.Invalidate();
+                UpdateHint();
+            };
+            graphHost.Controls.Add(_preampFader);
+
             // 不依赖 Dock=Fill：嵌套容器里的 Fill 子控件实测拿不到尺寸（0x0），
             // 因此显式按宿主客户区摆放。这与主界面日志区用的是同一套办法。
             graphHost.Resize += (s, e) =>
             {
-                _graph.Bounds = new Rectangle(
-                    graphHost.Padding.Left, graphHost.Padding.Top,
-                    Math.Max(10, graphHost.ClientSize.Width - graphHost.Padding.Horizontal),
-                    Math.Max(10, graphHost.ClientSize.Height - graphHost.Padding.Vertical));
+                int padL = graphHost.Padding.Left;
+                int padT = graphHost.Padding.Top;
+                int padR = graphHost.Padding.Right;
+                int padB = graphHost.Padding.Bottom;
+                int innerH = Math.Max(10, graphHost.ClientSize.Height - padT - padB);
+
+                // 推子占右侧固定宽度，图区吃掉其余
+                const int faderW = 56, gap = 10;
+                int faderX = graphHost.ClientSize.Width - padR - faderW;
+                _preampFader.Bounds = new Rectangle(faderX, padT, faderW, innerH);
+
+                _graph.Bounds = new Rectangle(padL, padT,
+                    Math.Max(60, faderX - gap - padL), innerH);
+
+                AlignPreampFader();
             };
 
             // ---- 控制条 1：开关 + 前置 ----
@@ -204,26 +271,19 @@ namespace Snad
                 _log("Linked drag " + (_couple.Checked ? "on" : "off"));
             bar1.Controls.Add(_couple);
 
-            var preLabel = new Label
+            // PREAMP 改为图区右侧的推子（见下方 "控制条 1b"）。
+            // 语义上它就是"整条曲线上下平移"，用推子直接表达位移，
+            // 而且可以和 0dB 虚线严格对齐——比填数字直观。
+            // 这里只留一个读数标签，数值随推子更新。
+            _preampLabel = new Label
             {
-                Text = "PREAMP",
+                Text = "PREAMP  0.0 dB",
                 ForeColor = Theme.TextTertiary,
                 Font = Theme.Label(8f),
                 AutoSize = true,
-                Margin = new Padding(30, 6, 10, 0)   // 与左侧开关拉开，与右侧数值留白
+                Margin = new Padding(30, 6, 0, 0)
             };
-            bar1.Controls.Add(preLabel);
-
-            _preamp = new FlatStepper { Width = 104, Height = 26, Margin = new Padding(0) };
-            _preamp.Configure(-24, 12, 0.5, 1, "dB");
-            _preamp.Value = _eq.PreampDb;
-            _preamp.ValueChanged += (s, e) =>
-            {
-                _eq.PreampDb = _preamp.Value;
-                _graph.Invalidate();
-                UpdateHint();
-            };
-            bar1.Controls.Add(_preamp);
+            bar1.Controls.Add(_preampLabel);
 
             // ---- 控制条 2：预设（等宽平铺，不留缺口）----
             var presets = new (string Name, double[] Gains)[]
@@ -421,6 +481,10 @@ namespace Snad
         private void SyncFromEq()
         {
             SyncFadersFromEq();
+            if (_preampFader != null && Math.Abs(_preampFader.GainDb - _eq.PreampDb) > 1e-9)
+                _preampFader.GainDb = _eq.PreampDb;
+            if (_preampLabel != null)
+                _preampLabel.Text = "PREAMP  " + _eq.PreampDb.ToString("+0.0;-0.0;0.0") + " dB";
             _enable.Checked = _eq.Enabled;
             UpdateReadouts();
             _graph.Invalidate();

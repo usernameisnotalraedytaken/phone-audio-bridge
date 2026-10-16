@@ -63,6 +63,38 @@ namespace Snad
             GainDb = GainDb;   // 重新钳位
         }
 
+        /// <summary>
+        /// 量程铺满自身高度的模式。
+        /// 与 SetRange 的区别只是语义更明确：把整段量程映射到控件全高，
+        /// 0dB 落在几何中心。对齐外部刻度时用它会比手算参数清楚。
+        /// </summary>
+        public void SetFullRange(double minDb, double maxDb)
+        {
+            _posZeroY = float.NaN;     // 关掉位置映射，回到铺满模式
+            SetRange(minDb, maxDb);
+            Invalidate();
+        }
+
+        /// <summary>
+        /// 按"控件内的绝对位置"设置刻度映射，而不是按数值范围铺满。
+        ///
+        /// 用途：前置增益推子要和曲线图的 0dB 虚线严格对齐。
+        /// 曲线图的纵轴是 ±18dB 且 0dB 未必在正中（上下留白不同），
+        /// 若让推子把自己的量程铺满整高，两者就永远对不齐。
+        /// 这里直接指定"0dB 对应控件内哪个 y、整高对应多少 dB"，位置因此精确。
+        /// </summary>
+        public void SetPositionalScale(float zeroAtY, float height, float dbPerHeight)
+        {
+            _posZeroY = zeroAtY;
+            _posHeight = height;
+            _posDbPerHeight = dbPerHeight;
+            Invalidate();
+        }
+
+        private float _posZeroY = float.NaN;
+        private float _posHeight;
+        private float _posDbPerHeight;
+
         private const int TrackW = 4;
         private const int ThumbH = 9;
 
@@ -73,8 +105,14 @@ namespace Snad
             bottom = ClientSize.Height - ThumbH / 2f - 1;
         }
 
+        /// <summary>是否使用"按控件内位置"的映射（见 SetPositionalScale）。</summary>
+        private bool Positional { get { return !float.IsNaN(_posZeroY) && _posDbPerHeight > 0; } }
+
         private float ValueToY(int v)
         {
+            if (Positional)
+                return (float)(_posZeroY - (v / 10.0) * _posDbPerHeight);
+
             float top, bottom;
             TrackBounds(out top, out bottom);
             double t = (double)(v - _min) / Math.Max(1, _max - _min);
@@ -83,12 +121,21 @@ namespace Snad
 
         private int YToValue(int y)
         {
+            if (Positional)
+            {
+                double db = (_posZeroY - y) / _posDbPerHeight;
+                return (int)Math.Round(Math.Max(_min / 10.0, Math.Min(_max / 10.0, db)) * 10);
+            }
+
             float top, bottom;
             TrackBounds(out top, out bottom);
             double t = (bottom - y) / Math.Max(1f, bottom - top);
             if (t < 0) t = 0; if (t > 1) t = 1;
             return _min + (int)Math.Round(t * (_max - _min));
         }
+
+        /// <summary>按映射算出 0dB 在控件内的 y。绘制中线与拖动范围都以此为准。</summary>
+        private float ZeroY { get { return ValueToY(0); } }
 
         protected override void OnPaint(PaintEventArgs e)
         {
@@ -142,32 +189,105 @@ namespace Snad
         protected override void OnMouseEnter(EventArgs e) { base.OnMouseEnter(e); _hover = true; Invalidate(); }
         protected override void OnMouseLeave(EventArgs e) { base.OnMouseLeave(e); _hover = false; Invalidate(); }
 
+        /// <summary>
+        /// 拖动改用"相对位移"，而不是把值直接映射到鼠标的绝对位置。
+        ///
+        /// 两处手感问题都出在原来的写法：
+        ///   1) 按下即 GainDb = YToValue(e.Y) —— 点哪儿值就跳到哪儿，
+        ///      想微调反而先来一次大跳。
+        ///   2) 每像素直接换算 dB —— 鼠标抖 1px 就改 0.24dB，过于灵敏。
+        ///
+        /// 现在：按下只记录起点，值等鼠标离开起点超过阈值才跟手，
+        /// 移动量按"起点值 + 像素位移 × 每像素 dB"计算，手感线性可控。
+        /// </summary>
+        private const int DragThresholdPx = 3;
+        private int _dragStartY;
+        private int _dragStartValue;
+        private bool _dragArmed;
+
         protected override void OnMouseDown(MouseEventArgs e)
         {
             base.OnMouseDown(e);
             _dragging = true;
+            _dragArmed = false;
+            _dragStartY = e.Y;
+            _dragStartValue = _value;
             Capture = true;
-            GainDb = YToValue(e.Y) / 10.0;
+            Invalidate();
         }
 
         protected override void OnMouseMove(MouseEventArgs e)
         {
             base.OnMouseMove(e);
-            if (_dragging) GainDb = YToValue(e.Y) / 10.0;
+            if (!_dragging) return;
+
+            _fineMode = (ModifierKeys & Keys.Shift) == Keys.Shift;
+
+            int dy = e.Y - _dragStartY;
+            if (!_dragArmed)
+            {
+                // 起拖阈值：不设的话单击也会改值，等于"点哪跳哪"
+                if (Math.Abs(dy) < DragThresholdPx) return;
+                _dragArmed = true;
+            }
+
+            // 向上拖动 = 增大，与推子的物理直觉一致
+            int delta = ValueDeltaForPixels(-dy);
+            _value = ClampValue(_dragStartValue + delta);
+            Invalidate();
+            RaiseValueChanged();
+        }
+
+        /// <summary>滚轮也走同一套灵敏度：一格 0.5dB，Shift 时 0.1dB。</summary>
+        protected override void OnMouseWheel(MouseEventArgs e)
+        {
+            base.OnMouseWheel(e);
+            bool fine = (ModifierKeys & Keys.Shift) == Keys.Shift;
+            GainDb = GainDb + (e.Delta > 0 ? (fine ? 0.1 : 0.5) : (fine ? -0.1 : -0.5));
+        }
+
+        /// <summary>
+        /// 像素位移对应的值增量（以 0.1dB 为单位）。
+        ///
+        /// 手感基准：**拖满控件高度 = 走完整个量程**。
+        /// 这样"鼠标移动多少像素、推子就移动多少像素"，符合直觉。
+        ///
+        /// 早先是按刻度映射反推（pixels × dbPerHeight），那样灵敏度取决于
+        /// 量程与高度的比值：推子 286px 覆盖 ±18dB 时每像素仅 0.13dB，
+        /// 鼠标移动 7px 就改 1dB，微调时几乎无法停住（用户反馈"太灵敏"）。
+        /// </summary>
+        private int ValueDeltaForPixels(int pixels)
+        {
+            float top, bottom;
+            TrackBounds(out top, out bottom);
+            double perPx = (double)(_max - _min) / Math.Max(1f, bottom - top);
+            double d = pixels * perPx;
+            if (_fineMode) d *= 0.2;      // 按住 Shift 精调
+            return (int)Math.Round(d);
+        }
+
+        /// <summary>按住 Shift 进入精调（灵敏度降到 1/5）。</summary>
+        private bool _fineMode;
+
+        private int ClampValue(int v)
+        {
+            if (v < _min) return _min;
+            if (v > _max) return _max;
+            return v;
+        }
+
+        private void RaiseValueChanged()
+        {
+            if (ValueChanged != null) ValueChanged(this, EventArgs.Empty);
         }
 
         protected override void OnMouseUp(MouseEventArgs e)
         {
             base.OnMouseUp(e);
             _dragging = false;
+            _dragArmed = false;
             Capture = false;
             Invalidate();
-        }
-
-        protected override void OnMouseWheel(MouseEventArgs e)
-        {
-            base.OnMouseWheel(e);
-            GainDb = GainDb + (e.Delta > 0 ? 0.5 : -0.5);
         }
 
         /// <summary>双击归零。</summary>

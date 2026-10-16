@@ -172,13 +172,23 @@ namespace Snad
 
         public IList<EqBand> Bands { get { return _bands; } }
 
+        /// <summary>
+        /// 前置增益的可设范围。
+        ///
+        /// 必须与推子量程一致，否则会出现"推到底但曲线不动"且读数与实际不符。
+        /// 原先这里钳到 [-24, +12]，而推子是 ±18：推到 +18 时显示写 +18、
+        /// 实际只取到 +12，曲线到顶就不再上移（用户实测发现）。
+        /// </summary>
+        public const double PreampMinDb = -18.0;
+        public const double PreampMaxDb = 18.0;
+
         /// <summary>前置增益，用于补偿整体提升导致的削波。</summary>
         public double PreampDb
         {
             get { return _preampDb; }
             set
             {
-                _preampDb = Math.Max(-24.0, Math.Min(12.0, value));
+                _preampDb = Math.Max(PreampMinDb, Math.Min(PreampMaxDb, value));
                 _preampLinear = Math.Pow(10.0, _preampDb / 20.0);
             }
         }

@@ -15,38 +15,17 @@ $OutputEncoding = [Console]::OutputEncoding = New-Object System.Text.UTF8Encodin
 $here = Split-Path -Parent $MyInvocation.MyCommand.Path
 Set-Location $here
 
-# 正在运行的进程会锁住 exe，导致 csc 报 CS2012 无法写入。
+# 关于"程序正在运行时编译"：
 #
-# 需要停的不止两个产物：检查工具（SnadShot / SnadPreview / SnadEqShot /
-# SnadWordShot）也各自是独立 exe，同名进程若在运行同样会锁住目标文件。
-# 这里统一停掉所有本项目的可执行文件，并等待句柄真正释放——
-# Stop-Process 返回后文件锁可能还残留一小段时间，实测 800ms 不够稳。
-$ourExes = @('SnadReceiver', 'SnadGui', 'SnadShot', 'SnadPreview', 'SnadEqShot', 'SnadWordShot')
-foreach ($name in $ourExes) {
-    $running = Get-Process $name -ErrorAction SilentlyContinue
-    if ($running) {
-        Write-Host ("停止正在运行的 " + $name + " pid=" + (($running | ForEach-Object { $_.Id }) -join ','))
-        $running | Stop-Process -Force
-    }
-}
-
-# 等待目标文件可写。逐个尝试打开独占句柄，成功即说明锁已释放。
-$targets = @('SnadReceiver.exe', 'SnadGui.exe')
-for ($i = 0; $i -lt 40; $i++) {
-    $busy = $false
-    foreach ($t in $targets) {
-        if (-not (Test-Path $t)) { continue }
-        try {
-            $fs = [System.IO.File]::Open((Join-Path (Get-Location) $t), 'Open', 'ReadWrite', 'None')
-            $fs.Close(); $fs.Dispose()
-        } catch { $busy = $true }
-    }
-    if (-not $busy) { break }
-    if ($i -eq 39) {
-        Write-Host "警告：仍有目标文件被占用，编译可能失败" -ForegroundColor Yellow
-    }
-    Start-Sleep -Milliseconds 200
-}
+# 之前这里会无差别停掉本项目的所有进程，但那是在替使用者做决定——
+# 正在用界面的人会突然被关掉程序。改为**不主动杀进程**：
+# 所有产物都先编译到 .new.exe，最后一步才替换目标文件
+# （见 Install-Binary）。编译阶段完全不碰目标文件，因此运行中的程序不受影响。
+# 只有替换那一瞬间需要文件空闲；若被占用，脚本会明确提示关闭后重试，
+# 而不是把使用者的程序杀掉。
+#
+# 产物若处于"文件已删除但进程仍持有句柄"的僵局（历史上因先杀进程再重建造成），
+# 换名编译也能绕开：csc 写的是 .new.exe，不会与那个残留句柄冲突。
 
 $csc = 'C:\Program Files (x86)\Microsoft Visual Studio\18\BuildTools\MSBuild\Current\Bin\Roslyn\csc.exe'
 if (-not (Test-Path $csc)) {
@@ -111,15 +90,40 @@ foreach ($asm in $coreRefs) {
 Write-Host "csc : $csc"
 Write-Host "refs: $fw"
 
+# ---- 编译产物落地的公共处理 ----
+#
+# 先编译到临时名，再替换目标文件。
+#
+# 原因：曾出现"目标文件不存在、但某进程的 Path 仍指向它"的僵局——
+# 进程运行时文件被删，句柄留在已删除的 inode 上，于是 csc 无法创建同名文件，
+# 而那个进程也不会自己退出，构建永久失败。
+# 先编到 .new 再替换，可保证：编译阶段不碰目标文件，
+# 只有替换那一瞬间需要文件未被占用。
+function Install-Binary {
+    param([string]$Temp, [string]$Target)
+    if (-not (Test-Path $Temp)) { throw ("编译产物缺失：" + $Temp) }
+    for ($i = 0; $i -lt 30; $i++) {
+        try {
+            if (Test-Path $Target) { Remove-Item $Target -Force -ErrorAction Stop }
+            Move-Item $Temp $Target -Force -ErrorAction Stop
+            return
+        } catch {
+            Start-Sleep -Milliseconds 200
+        }
+    }
+    throw ("无法替换 " + $Target + "：文件被占用。请关闭正在运行的本程序后重试。")
+}
+
 # ---- 1) 控制台版（无 GUI，便于在无桌面环境或脚本中运行）----
 $consoleSources = @('SnadReceiver.cs', 'SnadProfile.cs', 'SnadBeacon.cs', 'SnadBeaconService.cs',
                     'SnadEq.cs', 'SnadSecret.cs')
 $consoleArgs = @('/nologo', '/target:exe', '/platform:x64', '/optimize+',
-                 '/out:SnadReceiver.exe', '/define:CONSOLE_BUILD')
+                 '/out:SnadReceiver.new.exe', '/define:CONSOLE_BUILD')
 foreach ($a in $coreRefs) { $consoleArgs += ("/r:" + (Join-Path $fw $a)) }
 $consoleArgs += $consoleSources
 & $csc @consoleArgs
 if ($LASTEXITCODE -ne 0) { throw "控制台版编译失败，csc 退出码 $LASTEXITCODE" }
+Install-Binary 'SnadReceiver.new.exe' 'SnadReceiver.exe'
 
 # ---- 1b) 信标协议验证工具（独立入口，用于在手机端实现前先证明协议可用）----
 if (Test-Path 'SnadBeaconTest.cs') {
@@ -209,13 +213,14 @@ if ($buildGui) {
     $missing = $guiSources | Where-Object { -not (Test-Path $_) }
     if ($missing.Count -eq 0) {
         $guiArgs = @('/nologo', '/target:winexe', '/platform:x64', '/optimize+',
-                     '/main:Snad.GuiEntry', '/out:SnadGui.exe')
+                     '/main:Snad.GuiEntry', '/out:SnadGui.new.exe')
         # 嵌入应用图标：双击时不再显示 .NET 默认图标
         if (Test-Path 'app.ico') { $guiArgs += '/win32icon:app.ico' }
         foreach ($a in $guiRefs) { $guiArgs += ("/r:" + (Join-Path $fw $a)) }
         $guiArgs += $guiSources
         & $csc @guiArgs
         if ($LASTEXITCODE -ne 0) { throw "GUI 版编译失败，csc 退出码 $LASTEXITCODE" }
+        Install-Binary 'SnadGui.new.exe' 'SnadGui.exe'
     } else {
         Write-Host ("跳过 GUI 版，缺少源文件: " + ($missing -join ', '))
     }
