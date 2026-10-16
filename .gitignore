@@ -27,3 +27,12 @@ pc-receiver/shot-gui.ps1
 # 系统
 .DS_Store
 Thumbs.db
+
+# 预共享密钥（构建时注入，绝不入库）
+.snad-key
+
+# 构建期由 build.ps1 从 .snad-key 生成，内含真实密钥，绝不入库
+pc-receiver/SnadSecret.cs
+
+# 注意：app/.../SnadSecret.kt 是空密钥占位版，必须入库否则编译失败，
+# CI 会在构建时覆盖它（覆盖发生在工作区，不影响仓库内容）。

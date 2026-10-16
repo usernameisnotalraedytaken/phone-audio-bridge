@@ -15,13 +15,16 @@ $OutputEncoding = [Console]::OutputEncoding = New-Object System.Text.UTF8Encodin
 $here = Split-Path -Parent $MyInvocation.MyCommand.Path
 Set-Location $here
 
-# 若接收器正在运行，它会锁住 exe，导致 csc 报 CS2012 无法写入。
-# 先停掉再编译；编译后不自动重启（由调用方决定用什么参数启动）。
-$running = Get-Process SnadReceiver -ErrorAction SilentlyContinue
-if ($running) {
-    Write-Host ("停止正在运行的接收器 pid=" + (($running | ForEach-Object { $_.Id }) -join ','))
-    $running | Stop-Process -Force
-    Start-Sleep -Milliseconds 800
+# 正在运行的进程会锁住 exe，导致 csc 报 CS2012 无法写入。
+# 注意两个产物都要停：只停 SnadReceiver 会让 GUI 版编译失败（踩过一次）。
+# 编译后不自动重启，由调用方决定用什么参数启动。
+foreach ($name in @('SnadReceiver', 'SnadGui')) {
+    $running = Get-Process $name -ErrorAction SilentlyContinue
+    if ($running) {
+        Write-Host ("停止正在运行的 " + $name + " pid=" + (($running | ForEach-Object { $_.Id }) -join ','))
+        $running | Stop-Process -Force
+        Start-Sleep -Milliseconds 800
+    }
 }
 
 $csc = 'C:\Program Files (x86)\Microsoft Visual Studio\18\BuildTools\MSBuild\Current\Bin\Roslyn\csc.exe'
@@ -34,6 +37,42 @@ if (-not (Test-Path $csc)) {
 }
 
 $fw = 'C:\Windows\Microsoft.NET\Framework64\v4.0.30319'
+
+# ---- 预共享密钥注入 ----
+# 密钥不存放在源码里，构建时从仓库外的 .snad-key 读入并生成一个编译单元。
+# 缺密钥直接报错停止：绝不能回退到某个默认密钥，那等于没有保护。
+$keyFile = Join-Path (Split-Path -Parent $here) '.snad-key'
+if (-not (Test-Path $keyFile)) {
+    throw ("缺少预共享密钥文件：" + $keyFile + "`n" +
+           "该文件由仓库根目录的 .snad-key 提供（已 gitignore）。`n" +
+           "生成方式：python3 -c `"import os,base64;print(base64.b32encode(os.urandom(32)).decode())`"")
+}
+$psk = (Get-Content -LiteralPath $keyFile -Raw).Trim()
+if ($psk.Length -lt 16) { throw ("密钥文件内容过短（" + $psk.Length + " 字符），疑似损坏：" + $keyFile) }
+
+# KeyId 用于确认两端是否使用同一份密钥。规则必须与 Android 端一致：
+#   KeyId = SHA256(PSK) 前 8 字节的大写十六进制
+$sha = [System.Security.Cryptography.SHA256]::Create()
+$hash = $sha.ComputeHash([System.Text.Encoding]::ASCII.GetBytes($psk))
+$sha.Dispose()
+$keyId = -join ($hash[0..7] | ForEach-Object { $_.ToString('X2') })
+
+$secretCs = @"
+// 本文件由 build.ps1 生成，请勿手工编辑，也不要提交到版本库。
+// 内容来自仓库根目录的 .snad-key（预共享密钥）。
+namespace Snad
+{
+    internal static class SnadSecret
+    {
+        internal const string KeyId = "$keyId";
+        internal const string Psk = "$psk";
+    }
+}
+"@
+# 用 UTF8 无 BOM 写出，避免 csc 把 BOM 当成源码内容
+[System.IO.File]::WriteAllText((Join-Path $here 'SnadSecret.cs'), $secretCs, (New-Object System.Text.UTF8Encoding($false)))
+
+Write-Host ("密钥已注入：KeyId=" + $keyId + "（两端此值必须一致）")
 
 # WinForms 版（带 GUI）。缺 System.Windows.Forms 时退回控制台版。
 $guiRefs = @('mscorlib.dll', 'System.dll', 'System.Core.dll',
@@ -52,7 +91,7 @@ Write-Host "csc : $csc"
 Write-Host "refs: $fw"
 
 # ---- 1) 控制台版（无 GUI，便于在无桌面环境或脚本中运行）----
-$consoleSources = @('SnadReceiver.cs', 'SnadProfile.cs')
+$consoleSources = @('SnadReceiver.cs', 'SnadProfile.cs', 'SnadBeacon.cs', 'SnadBeaconService.cs', 'SnadSecret.cs')
 $consoleArgs = @('/nologo', '/target:exe', '/platform:x64', '/optimize+',
                  '/out:SnadReceiver.exe', '/define:CONSOLE_BUILD')
 foreach ($a in $coreRefs) { $consoleArgs += ("/r:" + (Join-Path $fw $a)) }
@@ -60,9 +99,21 @@ $consoleArgs += $consoleSources
 & $csc @consoleArgs
 if ($LASTEXITCODE -ne 0) { throw "控制台版编译失败，csc 退出码 $LASTEXITCODE" }
 
+# ---- 1b) 信标协议验证工具（独立入口，用于在手机端实现前先证明协议可用）----
+if (Test-Path 'SnadBeaconTest.cs') {
+    $testSources = @('SnadBeacon.cs', 'SnadBeaconService.cs', 'SnadSecret.cs', 'SnadBeaconTest.cs')
+    $testArgs = @('/nologo', '/target:exe', '/platform:x64', '/optimize+',
+                  '/main:Snad.BeaconTest', '/out:SnadBeaconTest.exe')
+    foreach ($a in $coreRefs) { $testArgs += ("/r:" + (Join-Path $fw $a)) }
+    $testArgs += $testSources
+    & $csc @testArgs
+    if ($LASTEXITCODE -ne 0) { throw "信标验证工具编译失败，csc 退出码 $LASTEXITCODE" }
+}
+
 # ---- 2) GUI 版 ----
 if ($buildGui) {
-    $guiSources = @('SnadReceiver.cs', 'SnadProfile.cs', 'SnadGui.cs', 'SnadSpectrum.cs')
+    $guiSources = @('SnadReceiver.cs', 'SnadProfile.cs', 'SnadBeacon.cs', 'SnadBeaconService.cs',
+                    'SnadSecret.cs', 'SnadGui.cs', 'SnadSpectrum.cs')
     $missing = $guiSources | Where-Object { -not (Test-Path $_) }
     if ($missing.Count -eq 0) {
         $guiArgs = @('/nologo', '/target:winexe', '/platform:x64', '/optimize+',

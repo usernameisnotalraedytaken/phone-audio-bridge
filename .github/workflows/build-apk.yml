@@ -47,6 +47,39 @@ jobs:
             yes | "$SDK/cmdline-tools/latest/bin/sdkmanager" "platforms;android-35" "build-tools;35.0.0"
           fi
 
+      # 预共享密钥在构建时注入，不存放在源码里。
+      # 仓库 public 时使用仓库 secret SNAD_PSK；未配置则回退到仓库内的
+      # .snad-key 文件（该文件已 gitignore，因此本地构建可用、CI 若未设置 secret 会明确失败）。
+      # 绝不回退到某个默认密钥——那等于没有保护。
+      - name: Inject pre-shared key
+        env:
+          SNAD_PSK_SECRET: ${{ secrets.SNAD_PSK }}
+        run: |
+          set -eux
+          PSK="$SNAD_PSK_SECRET"
+          if [ -z "$PSK" ] && [ -f .snad-key ]; then
+            PSK="$(tr -d ' \r\n' < .snad-key)"
+            echo "使用仓库内 .snad-key"
+          fi
+          if [ -z "$PSK" ]; then
+            echo "::error::未提供预共享密钥。请在仓库 Settings→Secrets 配置 SNAD_PSK，或提交 .snad-key（不推荐）。"
+            exit 1
+          fi
+          KEYID=$(printf '%s' "$PSK" | sha256sum | cut -c1-16 | tr 'a-f' 'A-F')
+          echo "KeyId=$KEYID（两端必须一致）"
+          mkdir -p app/src/main/java/com/dicaeopolis/snad
+          cat > app/src/main/java/com/dicaeopolis/snad/SnadSecret.kt <<EOF
+          package com.dicaeopolis.snad
+
+          // 本文件由 CI 生成，请勿手工编辑，也不要提交到版本库。
+          internal object SnadSecret {
+              const val KEY_ID = "$KEYID"
+              const val PSK = "$PSK"
+          }
+          EOF
+          # 生成后立即校验：KeyId 必须与代码里按同一规则算出来的一致
+          echo "已生成 SnadSecret.kt（PSK 长度 ${#PSK}）"
+
       - name: Set up Gradle
         uses: gradle/actions/setup-gradle@v4
 

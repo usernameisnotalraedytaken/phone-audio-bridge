@@ -40,6 +40,10 @@ class MainActivity : AppCompatActivity() {
     private lateinit var stopBtn: Button
 
     private var streaming = false
+
+    /** 信标监听：自动发现电脑端。密钥在构建时注入，因此无需配对步骤。 */
+    private var beacon: SnadBeaconListener? = null
+    private var discoveredOnce = false
     private val logLines = ArrayDeque<String>()
 
     private val projLauncher = registerForActivityResult(
@@ -82,6 +86,32 @@ class MainActivity : AppCompatActivity() {
         // 服务与界面同进程，直接挂回调即可拿到实时日志
         SnadLog.uiSink = { line -> runOnUiThread { appendLog(line) } }
         SnadLog.recent().forEach { appendLog(it) }
+
+        // 启动信标监听：自动发现电脑端地址，无需手填。
+        // 密钥在构建时注入，因此这里没有配对步骤——这正是"无感"的含义。
+        try {
+            beacon = SnadBeaconListener(
+                onPeer = { peer ->
+                    runOnUiThread { onPeerDiscovered(peer) }
+                },
+                onLog = { msg -> SnadLog.info("Beacon", msg) }
+            )
+            beacon?.start()
+        } catch (t: Throwable) {
+            SnadLog.err("UI", "启动信标监听失败（可手填地址继续使用）", t)
+        }
+    }
+
+    /** 收到合法信标：自动填入电脑地址与端口。 */
+    private fun onPeerDiscovered(peer: SnadBeacon.Peer) {
+        val addrChanged = hostField.text.toString().trim() != peer.address
+        hostField.setText(peer.address)
+        portField.setText(peer.port.toString())
+        if (addrChanged || !discoveredOnce) {
+            discoveredOnce = true
+            SnadLog.info("UI", "已发现电脑 ${peer.deviceId} @ ${peer.address}:${peer.port}，已自动填入")
+            setStatus("idle", "已发现电脑 ${peer.address}:${peer.port}")
+        }
     }
 
     override fun onStart() {
@@ -109,6 +139,13 @@ class MainActivity : AppCompatActivity() {
     }
 
     override fun onDestroy() {
+        // 停掉信标监听，避免 Activity 销毁后线程仍在收包
+        try {
+            beacon?.stop()
+        } catch (t: Throwable) {
+            SnadLog.soft("UI", "停止信标监听", t)
+        }
+        beacon = null
         SnadLog.uiSink = null
         super.onDestroy()
     }
