@@ -331,21 +331,27 @@ namespace Snad
             // 注意：Theme 返回的是缓存字体，不能放进 using（会被 Dispose 掉，
             // 之后同尺寸字体再绘制就报"参数无效"）。只有 Brush/Pen 这类新建对象才用 using。
             var fDb = Theme.Metric(8.5f);
-            var fUnit = Theme.Metric(7.5f);
             var fFreq = Theme.Metric(8.5f);
 
             using (var br = new SolidBrush(Theme.TextTertiary))
             {
+                // 单位并入最顶端那个刻度标签，写成 "0 dB"。
+                //
+                // 之前把 "dB" 单独画在图区左上方（p.Top - 13），而顶部刻度 "0"
+                // 画在 DbToY(0) - 字号/2，两者在 p.Top≈14 时都落到 y≈1~8，
+                // 叠在一起成了乱码（实测 "dB" 与 "0" 重叠）。
+                // 合成一个标签后位置天然不冲突，也省一处独立定位。
+                double topTick = double.MinValue;
+                foreach (double db in CurrentDbTicks)
+                    if (db > topTick) topTick = db;
+
                 foreach (double db in CurrentDbTicks)
                 {
                     string s = db == 0 ? "0" : db.ToString("0");
+                    if (Math.Abs(db - topTick) < 0.001) s += " dB";
                     var sz = g.MeasureString(s, fDb);
                     g.DrawString(s, fDb, br, p.Left - 8 - sz.Width, DbToY(db) - sz.Height / 2);
                 }
-
-                // 单位放在图区左外侧上方，与顶部刻度留出距离
-                var u = g.MeasureString("dB", fUnit);
-                g.DrawString("dB", fUnit, br, p.Left - 8 - u.Width, p.Top - 13);
 
                 for (int i = 0; i < FreqTicks.Length; i++)
                 {
