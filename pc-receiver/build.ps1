@@ -119,9 +119,19 @@ function Install-Binary {
     throw ("无法替换 " + $Target + "：文件被占用。请关闭正在运行的本程序后重试。")
 }
 
+# ---- 共用源文件列表 ----
+#
+# 接收器现在可切换输出后端，因此凡是编译 SnadReceiver.cs 的目标都必须
+# 一并带上 WASAPI 那四个文件。这里集中定义，避免每加一个文件就去改多处
+# ——先前正是因为漏改而连续编译失败。
+$audioCoreSources = @('SnadAudioSink.cs', 'SnadAudioCodec.cs', 'SnadAudioDevices.cs', 'SnadWasapi.cs')
+
+# 接收器核心（Logger、接收循环、播放路径）。绝大多数工具都需要它。
+$receiverCoreSources = @('SnadReceiver.cs', 'SnadProfile.cs', 'SnadBeacon.cs', 'SnadBeaconService.cs',
+                         'SnadEq.cs', 'SnadSecret.cs') + $audioCoreSources
+
 # ---- 1) 控制台版（无 GUI，便于在无桌面环境或脚本中运行）----
-$consoleSources = @('SnadReceiver.cs', 'SnadProfile.cs', 'SnadBeacon.cs', 'SnadBeaconService.cs',
-                    'SnadEq.cs', 'SnadSecret.cs')
+$consoleSources = $receiverCoreSources
 $consoleArgs = @('/nologo', '/target:exe', '/platform:x64', '/optimize+',
                  '/out:SnadReceiver.new.exe', '/define:CONSOLE_BUILD')
 foreach ($a in $coreRefs) { $consoleArgs += ("/r:" + (Join-Path $fw $a)) }
@@ -173,6 +183,20 @@ if (Test-Path 'SnadWaveOutTest.cs') {
     Install-Binary 'SnadWaveOutTest.new.exe' 'SnadWaveOutTest.exe'
 }
 
+# ---- 发包器 ----
+#
+# 把"手机"变成本地一个进程：按相同协议送音频，并可注入丢包/抖动/乱序。
+# 在此之前，接收器的行为只能拿真手机试，无法自动回归。
+if (Test-Path 'SnadSender.cs') {
+    $sndArgs = @('/nologo', '/target:exe', '/platform:x64', '/optimize+',
+                 '/main:Snad.Sender', '/out:SnadSender.new.exe')
+    foreach ($a in $coreRefs) { $sndArgs += ("/r:" + (Join-Path $fw $a)) }
+    $sndArgs += 'SnadSender.cs'
+    & $csc @sndArgs
+    if ($LASTEXITCODE -ne 0) { throw "发包器编译失败，csc 退出码 $LASTEXITCODE" }
+    Install-Binary 'SnadSender.new.exe' 'SnadSender.exe'
+}
+
 # ---- 1c) 信标协议验证工具（独立入口，用于在手机端实现前先证明协议可用）----
 if (Test-Path 'SnadBeaconTest.cs') {
     $testSources = @('SnadBeacon.cs', 'SnadBeaconService.cs', 'SnadSecret.cs', 'SnadBeaconTest.cs')
@@ -212,8 +236,8 @@ if (Test-Path 'SnadConfigTest.cs') {
                      '/main:Snad.ConfigTest', '/out:SnadConfigTest.exe')
     foreach ($a in $coreRefs) { $cfgTestArgs += ("/r:" + (Join-Path $fw $a)) }
     # 需要 SnadReceiver.cs 是因为 Logger 定义在其中；而它又引用 SnadSecret，
-    # 因此密钥单元也必须一起编译。
-    $cfgTestArgs += @('SnadReceiver.cs', 'SnadProfile.cs', 'SnadEq.cs', 'SnadSecret.cs', 'SnadConfigTest.cs')
+    # 因此密钥单元也必须一起编译。接收器现在可切换后端，故还需 WASAPI 那四个文件。
+    $cfgTestArgs += $receiverCoreSources + @('SnadConfigTest.cs')
     & $csc @cfgTestArgs
     if ($LASTEXITCODE -ne 0) { throw "配置验证工具编译失败，csc 退出码 $LASTEXITCODE" }
 }
@@ -223,10 +247,10 @@ if (Test-Path 'SnadShot.cs') {
     $shotArgs = @('/nologo', '/target:winexe', '/platform:x64', '/optimize+',
                   '/main:Snad.Shot', '/out:SnadShot.exe')
     foreach ($a in $guiRefs) { $shotArgs += ("/r:" + (Join-Path $fw $a)) }
-    $shotArgs += @('SnadReceiver.cs', 'SnadProfile.cs', 'SnadBeacon.cs', 'SnadBeaconService.cs',
-                   'SnadEq.cs', 'SnadEqForm.cs', 'SnadSpectrum.cs', 'SnadGui.cs',
-                   'SnadTheme.cs', 'SnadControls.cs', 'SnadWidgets.cs', 'SnadWordmark.cs', 'SnadChannelStrip.cs', 'SnadLogView.cs', 'SnadStereo.cs', 'SnadLogForm.cs', 'SnadGraph.cs', 'SnadMetricStrip.cs',
-                   'SnadSecret.cs', 'SnadShot.cs')
+    $shotArgs += $receiverCoreSources + @('SnadEqForm.cs', 'SnadSpectrum.cs', 'SnadGui.cs',
+                   'SnadTheme.cs', 'SnadControls.cs', 'SnadWidgets.cs', 'SnadWordmark.cs',
+                   'SnadChannelStrip.cs', 'SnadLogView.cs', 'SnadStereo.cs', 'SnadLogForm.cs',
+                   'SnadGraph.cs', 'SnadMetricStrip.cs', 'SnadShot.cs')
     & $csc @shotArgs
     if ($LASTEXITCODE -ne 0) { throw "界面检查工具编译失败，csc 退出码 $LASTEXITCODE" }
 }
@@ -254,8 +278,7 @@ if (Test-Path 'SnadPreview.cs') {
 
 # ---- 2) GUI 版 ----
 if ($buildGui) {
-    $guiSources = @('SnadReceiver.cs', 'SnadProfile.cs', 'SnadBeacon.cs', 'SnadBeaconService.cs',
-                    'SnadSecret.cs', 'SnadEq.cs', 'SnadEqForm.cs',
+    $guiSources = $receiverCoreSources + @('SnadEqForm.cs',
                     'SnadTheme.cs', 'SnadControls.cs', 'SnadWidgets.cs', 'SnadWordmark.cs', 'SnadChannelStrip.cs', 'SnadLogView.cs', 'SnadStereo.cs', 'SnadLogForm.cs', 'SnadGraph.cs', 'SnadMetricStrip.cs',
                     'SnadGui.cs', 'SnadSpectrum.cs')
     $missing = $guiSources | Where-Object { -not (Test-Path $_) }

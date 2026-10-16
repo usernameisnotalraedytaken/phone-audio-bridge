@@ -676,6 +676,223 @@ namespace Snad
         private static extern int PropVariantClear(ref PROPVARIANT pvar);
 
         /// <summary>
+        /// 按 profile 选定的后端播放。这是对外的统一入口。
+        ///
+        /// 后端选择由档位决定，而不是写死：
+        ///   waveout           现有实现（已充分验证，作为退路）
+        ///   wasapi_shared     经过系统混音器，实测声卡侧约 10ms（LATENCY-MEASURED.md）
+        ///   wasapi_exclusive  绕开混音器，会占住设备；独占的是路由能力而非延迟
+        ///
+        /// 失败时**不回退到其他后端**：换了后端声音会从别的设备出来，
+        /// 那是比报错更难排查的行为。如实抛出，由界面显示原因。
+        /// </summary>
+        public static void Play(int deviceIndex, Func<int> getSampleRate, Func<int> getChannels,
+                                Func<byte[]> pull, CancellationToken token, Profile profile,
+                                Action<byte[], int, int> onBlock = null, Equalizer eq = null)
+        {
+            string backend = profile != null && !string.IsNullOrEmpty(profile.Backend)
+                ? profile.Backend.Trim().ToLowerInvariant() : "waveout";
+
+            if (backend == "waveout")
+            {
+                PlayWaveOut(deviceIndex, getSampleRate, getChannels, pull, token, profile, onBlock, eq);
+                return;
+            }
+
+            PlayWasapi(getSampleRate, getChannels, pull, token, profile, onBlock, eq);
+        }
+
+        /// <summary>
+        /// WASAPI 播放路径（共享或独占）。
+        ///
+        /// 与 waveOut 路径的差别在于驱动的方向：
+        ///   waveOut 我们主动填池，池深度就是我们能控制的在飞量；
+        ///   WASAPI 由 AudioSink 内部按设备节奏取数据，我们只管往它的
+        ///   环形缓冲里写——因此"在飞量"由 sink 的队列而不是池深度决定。
+        ///
+        /// 均衡器与可视回调放在写入之前，保证频谱画的是实际听到的声音。
+        /// </summary>
+        private static void PlayWasapi(Func<int> getSampleRate, Func<int> getChannels,
+                                       Func<byte[]> pull, CancellationToken token, Profile profile,
+                                       Action<byte[], int, int> onBlock, Equalizer eq)
+        {
+            int sampleRate = getSampleRate();
+            int channels = getChannels();
+            if (eq != null) eq.Configure(sampleRate, channels);
+
+            bool exclusive = profile.Backend.Trim().ToLowerInvariant() == "wasapi_exclusive";
+            SampleFormat fmt = ParseFormat(profile.Format);
+
+            // 选设备：档位里填了 device 就用它，否则跟随系统默认
+            DeviceCapability dev = null;
+            var all = DeviceEnumerator.Probe();
+            if (!string.IsNullOrEmpty(profile.DeviceId))
+            {
+                foreach (var d in all) if (string.Equals(d.Id, profile.DeviceId, StringComparison.OrdinalIgnoreCase)) { dev = d; break; }
+                if (dev == null)
+                    throw new InvalidOperationException(
+                        "档位指定的输出设备不存在（id=" + profile.DeviceId + "）。" +
+                        "设备可能已拔出或被禁用，请在界面里重新选择。");
+            }
+            else
+            {
+                dev = DeviceEnumerator.Default();
+                if (dev == null) throw new InvalidOperationException("找不到可用的输出设备");
+            }
+
+            // waveOut 只支持 pcm16；选了其他位深必须明确告诉用户，
+            // 而不是悄悄按 pcm16 播（那会让"选了 24bit"变成一句空话）
+            if (!exclusive && fmt != dev.MixSampleFormat)
+            {
+                Logger.Info("共享模式下实际格式由设备混音格式决定：" +
+                            AudioCodec.Name(dev.MixSampleFormat) + "（档位里写的 " +
+                            AudioCodec.Name(fmt) + " 不生效）");
+            }
+
+            int periodMs = profile.WasapiPeriodMs;
+            using (var sink = new WasapiSink())
+            {
+                // 把渲染侧的内部计数也写进接收器日志——
+                // "队列贴上限"这类异常的成因在渲染线程里，只有两边数据放一起才看得出
+                sink.SetVerbose(m => Logger.Info(m));
+
+                sink.Open(dev, fmt, sampleRate, channels, periodMs, exclusive);
+                Logger.Info("WASAPI 已打开：" + sink.Name +
+                            "  设备=" + dev.Name +
+                            "  设备缓冲=" + sink.DeviceBufferMs.ToString("F1") + "ms" +
+                            "  流延迟=" + sink.StreamLatencyMs.ToString("F1") + "ms" +
+                            "  待播队列上限=" + sink.CapacityMs.ToString("F1") + "ms");
+
+                sink.Start();
+
+                long writes = 0, starved = 0, nullPulls = 0, fullWaits = 0;
+                long pullCalls = 0, pullFrames = 0, writeAttempts = 0, bytesAccepted = 0;
+                var lastStat = DateTime.UtcNow;
+                double queueSum = 0; long queueN = 0;
+                double minQueue = double.MaxValue, maxQueue = 0;
+                long bytesWritten = 0;
+
+                while (!token.IsCancellationRequested)
+                {
+                    var data = pull();
+                    pullCalls++;
+                    if (data == null)
+                    {
+                        // 没有数据可写：稍等，但记录"队列见底"的次数——
+                        // 那是欠载的前兆，比事后听出爆音更早暴露问题
+                        nullPulls++;
+                        if (sink.QueuedMs < 1.0) starved++;
+                        Thread.Sleep(1);
+                        continue;
+                    }
+                    pullFrames += data.Length / 4;
+
+                    if (eq != null && eq.Enabled)
+                    {
+                        try { eq.Process(data, data.Length); }
+                        catch (Exception ex)
+                        {
+                            eq.Enabled = false;
+                            Logger.Err("均衡器处理异常，已自动关闭", ex);
+                        }
+                    }
+
+                    // 写不进去说明 sink 的环形缓冲满了，退让后重试同一块，
+                    // 不能丢——丢了就是音频空洞
+                    //
+                    // 注意统计口径：off 是"本次累计已写入"，循环里不能用它累加，
+                    // 否则重试 N 次就把同一批数据加了 N 遍（先前正是这样算出
+                    // 虚高一倍的"接受帧率"，浪费了几轮排查）。要累加的是每次
+                    // 实际写入的增量 n。
+                    int off = 0;
+                    int attempts = 0;
+                    while (off < data.Length && !token.IsCancellationRequested)
+                    {
+                        int n = sink.Write(data, off, data.Length - off);
+                        attempts++;
+                        if (n <= 0) { fullWaits++; Thread.Sleep(1); continue; }
+                        off += n;
+                        bytesAccepted += n;
+                    }
+                    writeAttempts += attempts;
+
+                    double q = sink.QueuedMs;
+                    queueSum += q; queueN++;
+                    if (q < minQueue) minQueue = q;
+                    if (q > maxQueue) maxQueue = q;
+                    bytesWritten += data.Length;
+                    writes++;
+
+                    if (onBlock != null)
+                    {
+                        try { onBlock(data, sampleRate, channels); }
+                        catch (Exception ex)
+                        {
+                            if (_blockCbErrors++ < 3)
+                                Logger.Warn("音频块回调异常（第 " + _blockCbErrors + " 次）：" + ex.Message);
+                        }
+                    }
+
+                    var now = DateTime.UtcNow;
+                    if ((now - lastStat).TotalSeconds >= 10)
+                    {
+                        double secs = (now - lastStat).TotalSeconds;
+                        Logger.Info(string.Format(CultureInfo.InvariantCulture,
+                            "[WASAPI 状态] 队列 均{0:F1} 低{1:F1} 高{2:F1} ms（上限 {3:F1}），" +
+                            "无数据 {4}，见底 {5}，写满等待 {6}" +
+                            "  |  实际接受 {7:F0} 帧/秒（实时 {8}），每块试 {9:F2} 次",
+                            queueN > 0 ? queueSum / queueN : 0,
+                            minQueue == double.MaxValue ? 0 : minQueue, maxQueue, sink.CapacityMs,
+                            nullPulls, starved, fullWaits,
+                            bytesAccepted / 4.0 / secs, sampleRate,
+                            writes > 0 ? (double)writeAttempts / writes : 0));
+
+                        // 累计值对比：写入侧与渲染侧的差额就是"写进去但还没播出"的量。
+                        // 若它远超队列容量，说明有帧既不在队列也没被播出——那才是真问题。
+                        Logger.Info(string.Format(CultureInfo.InvariantCulture,
+                            "[累计] 写入 {0} 帧，渲染 {1} 帧，差额 {2} 帧（{3:F0} ms，" +
+                            "队列容量 {4:F0} ms）",
+                            sink.WrittenFrames, sink.RenderedFrames,
+                            sink.WrittenFrames - sink.RenderedFrames,
+                            (sink.WrittenFrames - sink.RenderedFrames) * 1000.0 / sampleRate,
+                            sink.CapacityMs));
+
+                        // 每个统计窗口内重置计数：这些"每秒速率"必须用窗口内增量算，
+                        // 用累计值配窗口分母会得到虚高的数（先前正是这样算出 1.5 倍，
+                        // 把正常的写入侧误报成"供过于求"）。
+                        writeAttempts = 0; bytesAccepted = 0; pullCalls = 0; pullFrames = 0;
+                        writes = 0; nullPulls = 0; starved = 0; fullWaits = 0;
+                        queueSum = 0; queueN = 0; minQueue = double.MaxValue; maxQueue = 0;
+                        lastStat = now;
+                    }
+                }
+
+                sink.Stop();
+                Logger.Info(string.Format(CultureInfo.InvariantCulture,
+                    "WASAPI 播放结束：写入 {0} 块 {1} 字节，队列 均{2:F1} 低{3:F1} 高{4:F1} ms" +
+                    "，无数据 {5} 次，见底 {6} 次，写满等待 {7} 次",
+                    writes, bytesWritten, queueN > 0 ? queueSum / queueN : 0,
+                    minQueue == double.MaxValue ? 0 : minQueue, maxQueue,
+                    nullPulls, starved, fullWaits));
+            }
+        }
+
+        /// <summary>把档位里的格式名解析为枚举。无法识别时明确报错而不静默取默认。</summary>
+        private static SampleFormat ParseFormat(string name)
+        {
+            switch ((name ?? "pcm16").Trim().ToLowerInvariant())
+            {
+                case "pcm16": return SampleFormat.Pcm16;
+                case "pcm24": return SampleFormat.Pcm24;
+                case "pcm32": return SampleFormat.Pcm32;
+                case "float32": return SampleFormat.Float32;
+                default:
+                    throw new InvalidOperationException(
+                        "档位里的 format 取值无效：" + name + "（应为 pcm16/pcm24/pcm32/float32）");
+            }
+        }
+
+        /// <summary>
         /// 打开设备并持续播放。
         /// 实现要点（经实测验证，74 次连续写入零失败）：
         ///   1. 预先分配并准备好所有缓冲，全部写入建立初始队列；
@@ -683,9 +900,9 @@ namespace Snad
         ///      手工清位会在缓冲仍被驱动持有时破坏状态机，导致 MMSYSERR_INVALPARAM(34)。
         ///   3. pull 返回 null 表示暂无数据，本轮跳过而不是灌静音，避免欠载爆音。
         /// </summary>
-        public static void Play(int deviceIndex, Func<int> getSampleRate, Func<int> getChannels,
-                                Func<byte[]> pull, CancellationToken token, Profile profile,
-                                Action<byte[], int, int> onBlock = null, Equalizer eq = null)
+        public static void PlayWaveOut(int deviceIndex, Func<int> getSampleRate, Func<int> getChannels,
+                                       Func<byte[]> pull, CancellationToken token, Profile profile,
+                                       Action<byte[], int, int> onBlock = null, Equalizer eq = null)
         {
             int sampleRate = getSampleRate();
             int channels = getChannels();

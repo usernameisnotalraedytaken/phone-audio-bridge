@@ -38,6 +38,34 @@ namespace Snad
         /// <summary>轮询间隔（毫秒）。</summary>
         public int PollMs = 1;
 
+        // ---- 输出后端 ----
+        //
+        // 后端与设备、格式、周期是**正交的四个维度**，各自可配：
+        //   同一台设备既能用 waveOut 也能用 WASAPI，
+        //   WASAPI 既能共享也能独占，独占可选位深。
+        // 实测结论（见 LATENCY-MEASURED.md）：
+        //   waveOut 把块与池调小也能到 16ms；WASAPI 共享约 10ms；
+        //   独占约 13ms（不比共享快，价值在绕开系统混音器）。
+        //
+        // 默认值取 waveout + 现参数，保证与 v2.0 行为一致——
+        // 换后端是有风险的选择，不该由升级擅自替用户决定。
+
+        /// <summary>输出后端：waveout / wasapi_shared / wasapi_exclusive。</summary>
+        public string Backend = "waveout";
+
+        /// <summary>
+        /// 输出设备 ID（WASAPI 的设备 ID 字符串）。
+        /// 空表示跟随系统默认。放进档位而不是全局，是为了让
+        /// "直连声卡求低延迟"与"经 Voicemeeter 便于录制"两套方案并存可切换。
+        /// </summary>
+        public string DeviceId = "";
+
+        /// <summary>输出位深：pcm16 / pcm24 / pcm32 / float32。waveOut 只支持 pcm16。</summary>
+        public string Format = "pcm16";
+
+        /// <summary>WASAPI 周期（毫秒）。0 表示由设备自适应（独占模式推荐）。</summary>
+        public int WasapiPeriodMs = 3;
+
         // ---- 音质/稳定性相关 ----
         /// <summary>waveOut 缓冲个数。越多越抗调度抖动，内存占用与在飞时延越高。</summary>
         public int WaveOutBuffers = 16;
@@ -296,6 +324,36 @@ namespace Snad
             {
                 case "name": p.Name = val; break;
                 case "description": p.Description = val; break;
+
+                // ---- 输出后端 ----
+                case "backend":
+                    {
+                        string b = val.Trim().ToLowerInvariant();
+                        if (b == "waveout" || b == "wasapi_shared" || b == "wasapi_exclusive")
+                            p.Backend = b;
+                        else
+                            Logger.Warn("第 " + lineNo + " 行 backend 取值无效：" + val +
+                                        "（应为 waveout / wasapi_shared / wasapi_exclusive），已忽略");
+                        break;
+                    }
+                case "device":
+                case "deviceid":
+                    p.DeviceId = val.Trim();
+                    break;
+                case "format":
+                    {
+                        string f = val.Trim().ToLowerInvariant();
+                        if (f == "pcm16" || f == "pcm24" || f == "pcm32" || f == "float32")
+                            p.Format = f;
+                        else
+                            Logger.Warn("第 " + lineNo + " 行 format 取值无效：" + val +
+                                        "（应为 pcm16/pcm24/pcm32/float32），已忽略");
+                        break;
+                    }
+                case "wasapiperiod":
+                    if (int.TryParse(val, out iv)) p.WasapiPeriodMs = Math.Max(0, iv);
+                    else Logger.Warn("第 " + lineNo + " 行 wasapiperiod 不是整数：" + val);
+                    break;
 
                 case "targetbuffer":
                     if (int.TryParse(val, out iv)) p.TargetBufferMs = iv;

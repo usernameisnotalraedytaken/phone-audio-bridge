@@ -222,9 +222,17 @@ namespace Snad
             if (hr != 0) throw new InvalidOperationException("取得 IAudioRenderClient 失败 hr=0x" + hr.ToString("X8"));
             _render = (IAudioRenderClient)ro;
 
-            // 内部环形缓冲深度：决定 Write 能吞下多少突发，也是 QueuedMs 的上限。
-            // 它**不增加设备侧延迟**，只是把网络突发挡在应用内。
-            int ringMs = Math.Max(150, periodMs * 10);
+            // 内部环形缓冲深度。
+            //
+            // 关键认识：写入侧永远有数据（网络持续到达），因此这个环形缓冲
+            // **会稳定停在满的状态**。而"停在满"意味着每帧音频都要在里面等
+            // 整个容量的时间才轮到播放——**它直接等于该后端的稳态延迟**。
+            // 所以它不是"越大越安全"，而是"多大就加多少延迟"。
+            //
+            // 设备自身的缓冲（本机独占 42.7ms / 共享约 10ms）已经提供了
+            // 抗调度抖动的余量，环形缓冲只需覆盖"渲染线程两次取数之间"
+            // 写入侧的突发，不需要更深。取 2 倍设备缓冲与 40ms 的较大者。
+            int ringMs = Math.Max(40, (int)Math.Ceiling(_bufferFrames * 1000.0 / _rate) * 2);
             _ringFrames = Math.Max(_bufferFrames * 2, _rate * ringMs / 1000);
             _ring = new float[_ringFrames * _channels];
         }
@@ -270,9 +278,19 @@ namespace Snad
                     _ringWrite = (_ringWrite + 1) % _ringFrames;
                 }
                 _ringCount += taken;
+                _writtenFrames += taken;      // 累计写入帧（诊断用，不重置）
             }
             return taken * frameBytes;
         }
+
+        private long _writtenFrames;
+        private long _renderedFrames;
+
+        /// <summary>累计写入帧数。诊断用：与渲染侧累计值对比可发现"写进去了但没播出"的差额。</summary>
+        public long WrittenFrames { get { return Interlocked.Read(ref _writtenFrames); } }
+
+        /// <summary>累计渲染（真正提交给设备）帧数。</summary>
+        public long RenderedFrames { get { return Interlocked.Read(ref _renderedFrames); } }
 
         // ------------------------------------------------------------ 渲染线程
 
@@ -281,6 +299,11 @@ namespace Snad
             int frameBytes = _bytesPerSample * _channels;
             var scratch = new byte[Math.Max(1, _bufferFrames) * frameBytes];
 
+            // 诊断计数：接进接收器后出现"队列一直贴上限"的异常，
+            // 需要分清是渲染线程没取数据，还是取到了写不进去。
+            long iters = 0, wroteFrames = 0, zeroAvail = 0, zeroRing = 0;
+            var lastStat = DateTime.UtcNow;
+
             while (_running)
             {
                 // 共享模式等事件（超时兜底）；独占模式直接按短间隔轮询
@@ -288,16 +311,17 @@ namespace Snad
                 else _bufferEvent.WaitOne(_pollMs);
 
                 if (!_running) break;
+                iters++;
 
                 int padding;
                 if (_client.GetCurrentPadding(out padding) != 0) continue;
 
                 int avail = _bufferFrames - padding;
-                if (avail <= 0) continue;
+                if (avail <= 0) { zeroAvail++; continue; }
 
                 int frames;
                 lock (_ringGate) frames = Math.Min(avail, _ringCount);
-                if (frames <= 0) continue;
+                if (frames <= 0) { zeroRing++; continue; }
 
                 IntPtr data;
                 if (_render.GetBuffer(frames, out data) != 0) continue;
@@ -317,8 +341,34 @@ namespace Snad
                 }
                 Marshal.Copy(scratch, 0, data, bytes);
                 _render.ReleaseBuffer(frames, 0);
+                wroteFrames += frames;
+                Interlocked.Add(ref _renderedFrames, frames);
+
+                var now = DateTime.UtcNow;
+                if ((now - lastStat).TotalSeconds >= 10)
+                {
+                    System.Diagnostics.Debug.WriteLine(string.Format(
+                        "[渲染] 轮询 {0} 次，取出 {1} 帧（{2:F0} ms），缓冲满 {3}，环形空 {4}，设备缓冲 {5} 帧",
+                        iters, wroteFrames, wroteFrames * 1000.0 / _rate, zeroAvail, zeroRing, _bufferFrames));
+                    if (_verbose != null)
+                        _verbose(string.Format(
+                            "[渲染] 轮询 {0} 次，取出 {1} 帧（{2:F0} ms），缓冲满 {3} 次，环形空 {4} 次，设备缓冲 {5} 帧",
+                            iters, wroteFrames, wroteFrames * 1000.0 / _rate, zeroAvail, zeroRing, _bufferFrames));
+                    lastStat = now;
+                }
             }
+
+            if (_verbose != null)
+                _verbose(string.Format(
+                    "[渲染] 结束：轮询 {0} 次，取出 {1} 帧（{2:F0} ms），缓冲满 {3} 次，环形空 {4} 次",
+                    iters, wroteFrames, wroteFrames * 1000.0 / _rate, zeroAvail, zeroRing));
         }
+
+        /// <summary>诊断输出回调。设置后渲染线程会周期性报告内部计数。</summary>
+        private Action<string> _verbose;
+
+        /// <summary>打开诊断输出。仅在排查问题时使用，正常路径不设。</summary>
+        public void SetVerbose(Action<string> sink) { _verbose = sink; }
 
         public void Dispose()
         {
