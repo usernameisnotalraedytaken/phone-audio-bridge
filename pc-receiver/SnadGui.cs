@@ -30,7 +30,8 @@ namespace Snad
         private Panel _titleBar;
         private Panel _graphHost;
         private Panel _controlsRow;
-        private Label _titleMain, _titleSub, _stateLabel, _rateLabel;
+        private Wordmark _wordmark;
+        private Label _stateLabel, _rateLabel;
         private Panel _dot;
 
         // ---- 状态 ----
@@ -114,27 +115,15 @@ namespace Snad
 
             // ---- 标题条 ----
             _titleBar = new Panel { Dock = DockStyle.Top, Height = 40, BackColor = Theme.BgPanel };
-            _titleMain = new Label
+            // 标题字标。自绘控件，字距、字重对比与声波标记都在里面，
+            // 位置也由它自己按实测宽度排布——不再有写死坐标导致的遮挡。
+            _wordmark = new Wordmark
             {
-                Text = "SNAD",
-                ForeColor = Theme.TextPrimary,
-                Font = Theme.Ui(11f, FontStyle.Bold),
-                AutoSize = true,
-                BackColor = Color.Transparent,
-                Location = new Point(16, 10)
-            };
-            _titleSub = new Label
-            {
-                Text = "AUDIO BRIDGE",
-                ForeColor = Theme.TextTertiary,
-                Font = Theme.Ui(8f),
-                AutoSize = true,
-                BackColor = Color.Transparent,
-                // 位置在 LayoutTitleBar 里按 _titleMain 的实测宽度算。
-                // 这里曾写死 x=74，是按当时 Consolas 的 "SNAD" 宽度定的；
-                // 后来标题字体换成 UI 字体变宽，就把副标题首字母盖住了
-                // （"AUDIO" 显示成 "UDIO"）。写死的坐标经不起字体变动。
-                Location = new Point(0, 15)
+                MainText = "SNAD",
+                SubText = "AUDIO BRIDGE",
+                Location = new Point(14, 3),
+                Height = 34,
+                Width = 240
             };
             // 状态点：正常绿、异常橙，异常时闪烁
             _dot = new Panel { Size = new Size(7, 7), BackColor = Theme.TextTertiary, Location = new Point(0, 17) };
@@ -156,7 +145,7 @@ namespace Snad
                 BackColor = Color.Transparent,
                 Location = new Point(0, 11)
             };
-            _titleBar.Controls.AddRange(new Control[] { _titleMain, _titleSub, _dot, _stateLabel, _rateLabel });
+            _titleBar.Controls.AddRange(new Control[] { _wordmark, _dot, _stateLabel, _rateLabel });
             _titleBar.Resize += (s, e) => LayoutTitleBar();
 
             // ---- 频谱图 ----
@@ -327,16 +316,6 @@ namespace Snad
         private void LayoutTitleBar()
         {
             if (_titleBar == null || _dot == null) return;
-
-            // 副标题紧跟主标题。用 PreferredWidth 实测，不写死坐标——
-            // 字体一换宽度就变，写死的值会把副标题盖住。
-            if (_titleMain != null && _titleSub != null)
-            {
-                int mainRight = _titleMain.Left + Math.Max(_titleMain.Width, _titleMain.PreferredWidth);
-                _titleSub.Left = mainRight + 8;
-                // 两块文字基线对齐：副标题字号小，靠它自身高度定位
-                _titleSub.Top = _titleMain.Top + (_titleMain.Height - _titleSub.Height) / 2 + 1;
-            }
 
             int right = _titleBar.ClientSize.Width - 16;
             int rateW = _rateLabel.PreferredWidth > 0 ? _rateLabel.PreferredWidth : 70;
