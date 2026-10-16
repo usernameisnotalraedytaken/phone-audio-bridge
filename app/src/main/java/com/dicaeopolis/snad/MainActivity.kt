@@ -47,10 +47,10 @@ class MainActivity : AppCompatActivity() {
     ) { result ->
         val data = result.data
         if (result.resultCode == RESULT_OK && data != null) {
-            SnadLog.i("UI", "录屏授权通过 resultCode=${result.resultCode}，启动服务")
+            SnadLog.info("UI", "录屏授权通过 resultCode=${result.resultCode}，启动服务")
             launchService(result.resultCode, data)
         } else {
-            SnadLog.e("UI", "录屏授权被拒绝 resultCode=${result.resultCode} data=${data != null}")
+            SnadLog.err("UI", "录屏授权被拒绝 resultCode=${result.resultCode} data=${data != null}")
             setStatus("error", "用户拒绝了录屏授权")
         }
     }
@@ -58,7 +58,7 @@ class MainActivity : AppCompatActivity() {
     private val audioPermLauncher = registerForActivityResult(
         ActivityResultContracts.RequestPermission()
     ) { granted ->
-        SnadLog.i("UI", "录音权限结果 granted=$granted")
+        SnadLog.info("UI", "录音权限结果 granted=$granted")
         if (granted) requestProjection()
         else setStatus("error", "缺少录音权限，无法抓取内部音频")
     }
@@ -74,7 +74,7 @@ class MainActivity : AppCompatActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         SnadLog.init(this)
-        SnadLog.i("UI", "应用启动 version=${appVersion()} sdk=${Build.VERSION.SDK_INT} " +
+        SnadLog.info("UI", "应用启动 version=${appVersion()} sdk=${Build.VERSION.SDK_INT} " +
                 "device=${Build.MANUFACTURER} ${Build.MODEL}")
         setContentView(buildUi())
         setStatus("idle", getString(R.string.status_idle))
@@ -95,7 +95,7 @@ class MainActivity : AppCompatActivity() {
                 registerReceiver(statusReceiver, f)
             }
         } catch (t: Throwable) {
-            SnadLog.e("UI", "注册状态广播接收器失败", t)
+            SnadLog.err("UI", "注册状态广播接收器失败", t)
         }
     }
 
@@ -168,7 +168,7 @@ class MainActivity : AppCompatActivity() {
             text = getString(R.string.btn_stop)
             isEnabled = false
             setOnClickListener {
-                SnadLog.i("UI", "用户点击停止")
+                SnadLog.info("UI", "用户点击停止")
                 startService(AudioCaptureService.stopIntent(this@MainActivity))
                 setStatus("idle", "已请求停止")
             }
@@ -239,7 +239,7 @@ class MainActivity : AppCompatActivity() {
             cm.setPrimaryClip(ClipData.newPlainText("SNAD log", logLines.joinToString("\n")))
             Toast.makeText(this, "日志已复制", Toast.LENGTH_SHORT).show()
         } catch (t: Throwable) {
-            SnadLog.e("UI", "复制日志失败", t)
+            SnadLog.err("UI", "复制日志失败", t)
         }
     }
 
@@ -250,10 +250,10 @@ class MainActivity : AppCompatActivity() {
         val port = portField.text.toString().trim().ifEmpty { SnadProtocol.DEFAULT_PORT.toString() }
             .toIntOrNull() ?: SnadProtocol.DEFAULT_PORT
 
-        SnadLog.i("UI", "点击开始 host=$host port=$port")
+        SnadLog.info("UI", "点击开始 host=$host port=$port")
 
         if (host.isBlank()) {
-            SnadLog.e("UI", "地址为空，中止")
+            SnadLog.err("UI", "地址为空，中止")
             setStatus("error", "请先填电脑地址")
             return
         }
@@ -268,7 +268,7 @@ class MainActivity : AppCompatActivity() {
         setStatus("waiting", "请求录音权限…")
         val granted = ContextCompat.checkSelfPermission(this, Manifest.permission.RECORD_AUDIO) ==
                 PackageManager.PERMISSION_GRANTED
-        SnadLog.i("UI", "RECORD_AUDIO 已授权=$granted")
+        SnadLog.info("UI", "RECORD_AUDIO 已授权=$granted")
         if (granted) requestProjection() else audioPermLauncher.launch(Manifest.permission.RECORD_AUDIO)
     }
 
@@ -276,10 +276,10 @@ class MainActivity : AppCompatActivity() {
         try {
             val mpm = getSystemService(MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
             setStatus("waiting", "请在弹窗中选择「整个屏幕」并确认共享音频")
-            SnadLog.i("UI", "拉起系统录屏授权对话框")
+            SnadLog.info("UI", "拉起系统录屏授权对话框")
             projLauncher.launch(mpm.createScreenCaptureIntent())
         } catch (t: Throwable) {
-            SnadLog.e("UI", "无法拉起录屏授权对话框", t)
+            SnadLog.err("UI", "无法拉起录屏授权对话框", t)
             setStatus("error", "无法请求录屏授权：${t.javaClass.simpleName}: ${t.message}")
         }
     }
@@ -294,7 +294,7 @@ class MainActivity : AppCompatActivity() {
             )
             setStatus("waiting", "服务启动中…")
         } catch (t: Throwable) {
-            SnadLog.e("UI", "启动前台服务失败", t)
+            SnadLog.err("UI", "启动前台服务失败", t)
             setStatus("error", "启动服务失败：${t.javaClass.simpleName}: ${t.message}")
         }
     }
@@ -312,7 +312,7 @@ class MainActivity : AppCompatActivity() {
             }
             detailView.text = detail
             if (status == "error") {
-                SnadLog.e("UI", "界面报错：$detail")
+                SnadLog.err("UI", "界面报错：$detail")
                 Toast.makeText(this, detail, Toast.LENGTH_LONG).show()
             }
         }
