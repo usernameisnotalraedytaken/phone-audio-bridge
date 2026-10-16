@@ -1,7 +1,6 @@
 package com.dicaeopolis.snad
 
 import android.content.Context
-import android.content.Intent
 import android.util.Log
 import java.io.File
 import java.net.DatagramPacket
@@ -45,6 +44,9 @@ object SnadLog {
 
     /** 界面回调。Service 与 Activity 运行在同进程，直接持有引用即可。 */
     @Volatile var uiSink: ((String) -> Unit)? = null
+
+    /** 文件写入锁：发送线程与界面线程都会写日志，必须串行化避免行内容交错。 */
+    private val fileLock = Any()
 
     fun init(context: Context) {
         ctx = context.applicationContext
@@ -125,13 +127,15 @@ object SnadLog {
     private fun appendToFile(line: String) {
         val c = ctx ?: return
         try {
-            val f = File(c.filesDir, "snad.log")
-            // 简单轮转：超过 512KB 就截掉前半
-            if (f.exists() && f.length() > 512 * 1024) {
-                val keep = f.readLines().takeLast(500)
-                f.writeText(keep.joinToString("\n") + "\n")
+            synchronized(fileLock) {
+                val f = File(c.filesDir, "snad.log")
+                // 简单轮转：超过 512KB 就截掉前半
+                if (f.exists() && f.length() > 512 * 1024) {
+                    val keep = f.readLines().takeLast(500)
+                    f.writeText(keep.joinToString("\n") + "\n")
+                }
+                f.appendText(line + "\n")
             }
-            f.appendText(line + "\n")
         } catch (t: Throwable) {
             // 这里再失败就只上 logcat，避免递归写日志
             Log.e(TAG, "写日志文件失败: ${t.javaClass.name}: ${t.message}")

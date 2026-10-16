@@ -18,6 +18,7 @@ import json
 import os
 import subprocess
 import sys
+import time
 import urllib.error
 import urllib.request
 
@@ -37,22 +38,55 @@ def get_token() -> str:
         sys.exit(f"无法获取 token（请先 gh auth login 或设置 GH_TOKEN）: {e}")
 
 
-def call(token, method, url, payload=None):
-    data = json.dumps(payload).encode() if payload is not None else None
-    req = urllib.request.Request(url, data=data, method=method)
-    req.add_header("Authorization", f"token {token}")
-    req.add_header("Accept", "application/vnd.github+json")
-    req.add_header("User-Agent", "snad-push")
-    if data:
-        req.add_header("Content-Type", "application/json")
-    try:
-        with urllib.request.urlopen(req, timeout=60) as r:
-            body = r.read().decode()
-            return r.status, (json.loads(body) if body else {})
-    except urllib.error.HTTPError as e:
-        return e.code, {"error": e.read().decode()[:500]}
-    except Exception as e:
-        return 0, {"error": f"{type(e).__name__}: {e}"}
+def call(token, method, url, payload=None, retries=4):
+    """带重试的 API 调用。远端偶发 RemoteDisconnected，必须重试否则长推送必然中断。"""
+    last = None
+    for attempt in range(1, retries + 1):
+        data = json.dumps(payload).encode() if payload is not None else None
+        req = urllib.request.Request(url, data=data, method=method)
+        req.add_header("Authorization", f"token {token}")
+        req.add_header("Accept", "application/vnd.github+json")
+        req.add_header("User-Agent", "snad-push")
+        if data:
+            req.add_header("Content-Type", "application/json")
+        try:
+            with urllib.request.urlopen(req, timeout=90) as r:
+                body = r.read().decode()
+                return r.status, (json.loads(body) if body else {})
+        except urllib.error.HTTPError as e:
+            body = e.read().decode()[:500]
+            # 4xx 是请求本身的问题，重试无意义
+            if e.code < 500:
+                return e.code, {"error": body}
+            last = f"HTTP {e.code}: {body}"
+        except Exception as e:
+            last = f"{type(e).__name__}: {e}"
+        if attempt < retries:
+            wait = 2 ** attempt
+            print(f"      重试 {attempt}/{retries - 1}（{last}），等待 {wait}s")
+            time.sleep(wait)
+    return 0, {"error": last}
+
+
+def remote_tree_map(token):
+    """取远端当前 tree，用于跳过内容未变的文件。"""
+    ok, ref = call(token, "GET", f"{API}/git/ref/heads/{BRANCH}")
+    if ok != 200:
+        return {}, None
+    commit_sha = ref["object"]["sha"]
+    ok, commit = call(token, "GET", f"{API}/git/commits/{commit_sha}")
+    if ok != 200:
+        return {}, commit_sha
+    ok, tree = call(token, "GET", f"{API}/git/trees/{commit['tree']['sha']}?recursive=1")
+    if ok != 200:
+        return {}, commit_sha
+    return {e["path"]: e["sha"] for e in tree.get("tree", []) if e["type"] == "blob"}, commit_sha
+
+
+def git_blob_sha(path):
+    """计算文件在 git 中的 blob 哈希，用于与远端比对。"""
+    out = subprocess.run(["git", "hash-object", path], capture_output=True, text=True)
+    return out.stdout.strip() if out.returncode == 0 else None
 
 
 def main():
@@ -74,18 +108,24 @@ def main():
     files = sorted(set(tracked) | set(staged))
     print(f"准备推送 {len(files)} 个文件到 {REPO}@{BRANCH}")
 
-    # 取当前分支头作为父提交
-    ok, ref = call(token, "GET", f"{API}/git/ref/heads/{BRANCH}")
-    if ok != 200:
-        sys.exit(f"无法读取分支 {BRANCH}: {ref}")
-    parent = ref["object"]["sha"]
-    print(f"父提交 {parent[:8]}")
+    # 取远端当前状态，用于跳过内容未变的文件
+    remote_blobs, parent = remote_tree_map(token)
+    if not parent:
+        sys.exit("无法读取远端分支状态")
+    print(f"父提交 {parent[:8]}，远端已有 {len(remote_blobs)} 个文件")
 
-    # 逐个建 blob
+    # 逐个处理：内容与远端一致就直接复用其 sha，否则上传
     tree_items = []
+    skipped = 0
     for i, path in enumerate(files, 1):
         if not os.path.isfile(path):
             print(f"  [{i}/{len(files)}] {path} 跳过（不是文件）")
+            continue
+        local_sha = git_blob_sha(path)
+        if local_sha and remote_blobs.get(path) == local_sha:
+            tree_items.append({"path": path, "mode": "100644", "type": "blob", "sha": local_sha})
+            skipped += 1
+            print(f"  [{i}/{len(files)}] {path} 未改动，复用")
             continue
         raw = open(path, "rb").read()
         ok, blob = call(token, "POST", f"{API}/git/blobs",
@@ -93,7 +133,8 @@ def main():
         if ok != 201:
             sys.exit(f"  {path} 建 blob 失败: {blob}")
         tree_items.append({"path": path, "mode": "100644", "type": "blob", "sha": blob["sha"]})
-        print(f"  [{i}/{len(files)}] {path}  {len(raw)}B")
+        print(f"  [{i}/{len(files)}] {path}  {len(raw)}B 上传")
+    print(f"（{skipped} 个文件未改动）")
 
     # 建 tree
     ok, tree = call(token, "POST", f"{API}/git/trees", {"tree": tree_items})
