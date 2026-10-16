@@ -80,15 +80,24 @@ namespace Snad
             // 尺寸按屏幕工作区自适应。
             //
             // 期望高度由布局的实际需要算出来，而不是写死一个数：
-            //   标题 40 + 指标条 92 + 声道条 + 控制行 92 + 日志状态行 26 + 图的可用高度
+            //   标题 40 + 指标条 + 声道条(每条 76 起) + 控制行 92 + 日志状态行 26
+            //   + 频谱图所需的可用高度
             // 之前写死 640，结果声道条被挤到 30px——竖电平表完全没有纵向行程，
             // 波形也被压扁。该由内容决定窗口多大，而不是反过来把内容压扁。
+            //
+            // 默认尺寸取"970x700 客户区"这个比例（约 1.39:1）：
+            // 实测该比例下频谱图、两条声道、控制行都不局促，
+            // 各行的相对高度也比较均衡。
             var wa = Screen.PrimaryScreen != null ? Screen.PrimaryScreen.WorkingArea : new Rectangle(0, 0, 1280, 800);
-            int wantH = 40 + 92 + 26 + (76 * StereoMeter.Channels + 8 * (StereoMeter.Channels + 1)) + 280;
-            int wantW = 980;
+            int wantW = 970;
+            int wantH = 700;
             int w = Math.Min(wantW, Math.Max(720, wa.Width - 20));
             int h = Math.Min(wantH, Math.Max(480, wa.Height - 20));
-            MinimumSize = new Size(Math.Min(720, wa.Width), Math.Min(480, wa.Height));
+
+            // 最小尺寸：宽要放得下控制行的档位+设备滚轮与两个按钮；
+            // 高要保证声道条不被压到看不出波形与竖表。
+            int minH = 40 + 92 + 26 + (56 * StereoMeter.Channels + 8 * (StereoMeter.Channels + 1)) + 150;
+            MinimumSize = new Size(Math.Min(820, wa.Width), Math.Min(minH, wa.Height));
             Size = new Size(w, h);
 
             BuildUi();
