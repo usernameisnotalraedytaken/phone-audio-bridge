@@ -13,9 +13,28 @@ namespace Snad
 {
     internal sealed class SpectrumAnalyzer
     {
-        public const int FftSize = 1024;          // 2 的幂
+        /// <summary>
+        /// FFT 点数。
+        ///
+        /// 这个值直接决定低频能不能看。频率分辨率 = 采样率 / FftSize：
+        ///   1024 点 @48kHz -> 每 bin 46.9Hz，而频谱从 30Hz 起，
+        ///                     最低两个八度只剩 2 个数据点，画出来是一条平线
+        ///                     （用户实测发现）。
+        ///   4096 点 @48kHz -> 每 bin 11.7Hz，30~100Hz 之间有 6 根柱可用。
+        ///
+        /// 再加大会更细，但单次 FFT 成本按 N·log N 增长，且时间窗变长
+        /// （4096 点约 85ms），瞬态响应变钝。4096 是这两者的折中。
+        /// </summary>
+        public const int FftSize = 4096;           // 2 的幂
         private const int Bins = FftSize / 2;      // 有效频点
         public const int Bars = 64;                // 显示柱数
+
+        /// <summary>
+        /// 每次分析前移的样本数。小于 FftSize 即形成重叠分析：
+        /// 刷新率 = 采样率 / HopSize，4096/1024 在 48kHz 下约 47 次/秒，
+        /// 视觉上足够顺滑，且不必为每个音频块都做一次 FFT。
+        /// </summary>
+        private const int HopSize = FftSize / 4;
 
         private readonly double[] _re = new double[FftSize];
         private readonly double[] _im = new double[FftSize];
@@ -23,6 +42,16 @@ namespace Snad
         private readonly double[] _bars = new double[Bars];
         private readonly double[] _peak = new double[Bars];
         private readonly double[] _wave = new double[512];
+
+        /// <summary>
+        /// 环形缓冲：累积足够的样本再做 FFT。
+        /// 直接用"本块样本"会因块长不定而让有效分辨率随块长漂移，
+        /// 环缓冲保证每次分析的都是固定的 FftSize 个样本。
+        /// </summary>
+        private readonly double[] _ring = new double[FftSize];
+        private int _ringFill;
+        private int _ringPos;
+        private int _sinceAnalysis;
 
         private readonly int[] _barStart = new int[Bars];
         private readonly int[] _barEnd = new int[Bars];
@@ -70,15 +99,19 @@ namespace Snad
 
         public void Reset(int sampleRate, int channels)
         {
-            if (sampleRate > 0 && sampleRate != _sampleRate)
-            {
-                _sampleRate = sampleRate;
-                BuildLogBins();
-            }
+            bool rateChanged = sampleRate > 0 && sampleRate != _sampleRate;
+            if (sampleRate > 0) _sampleRate = sampleRate;
             if (channels > 0) _channels = channels;
-        }
 
-        private long _framesSeen;
+            // bin 映射依赖采样率，变了必须重算
+            if (rateChanged) BuildLogBins();
+
+            // 环缓冲也要清空：换了采样率或重启流之后，
+            // 里面还留着上一段的样本，混进来会让最初几次分析是错的
+            _ringFill = 0;
+            _ringPos = 0;
+            _sinceAnalysis = 0;
+        }
 
         /// <summary>
         /// 喂入一块立体声交错 PCM16LE。为了降低开销，每两次调用才做一次 FFT
@@ -106,24 +139,40 @@ namespace Snad
                 _wave[i] = l / 32768.0;
             }
 
-            // 频谱：隔次计算，省一半 CPU
-            _framesSeen++;
-            if ((_framesSeen & 1) != 0) return;
+            // ---- 频谱：把样本填入环缓冲，攒够一跳就分析一次 ----
+            //
+            // 每个低频柱至少覆盖 1 个 bin 已由 BuildLogBins 保证，
+            // 但 30~100Hz 能否分辨取决于 FftSize（见其注释）。
+            for (int i = 0; i < frames; i++)
+            {
+                int b = i * bytesPerFrame;
+                short l = (short)(pcm[b] | (pcm[b + 1] << 8));
+                short r = channels >= 2 ? (short)(pcm[b + 2] | (pcm[b + 3] << 8)) : l;
+                _ring[_ringPos] = (l + r) * 0.5 / 32768.0;
+                _ringPos++;
+                if (_ringPos >= FftSize) _ringPos = 0;
+                if (_ringFill < FftSize) _ringFill++;
+                _sinceAnalysis++;
+            }
 
-            int take = Math.Min(FftSize, frames);
-            int off = Math.Max(0, (frames - take) / 2);
+            if (_ringFill < FftSize || _sinceAnalysis < HopSize) return;
+            _sinceAnalysis = 0;
+            AnalyzeFft();
+        }
+
+        /// <summary>
+        /// 对环缓冲里最近的 FftSize 个样本做一次加窗 FFT，并归并到显示柱。
+        /// 与 Feed 分开是为了让"取样本"和"算频谱"各自清楚。
+        /// </summary>
+        private void AnalyzeFft()
+        {
+            // 从最旧的样本开始取，保证时间顺序正确
+            int start = _ringFill < FftSize ? 0 : _ringPos;
             for (int i = 0; i < FftSize; i++)
             {
-                int f = off + i;
-                double v = 0;
-                if (f < frames)
-                {
-                    int b = f * bytesPerFrame;
-                    short l = (short)(pcm[b] | (pcm[b + 1] << 8));
-                    short r = channels >= 2 ? (short)(pcm[b + 2] | (pcm[b + 3] << 8)) : l;
-                    v = (l + r) * 0.5 / 32768.0;
-                }
-                _re[i] = v * _window[i];
+                int idx = start + i;
+                if (idx >= FftSize) idx -= FftSize;
+                _re[i] = _ring[idx] * _window[i];
                 _im[i] = 0;
             }
 
@@ -140,7 +189,9 @@ namespace Snad
                     n++;
                 }
                 double power = n > 0 ? sum / n : 0;
-                // 归一化到满量程：FFT 结果与窗增益、点数有关
+                // 归一化到满量程：FFT 结果与窗增益、点数有关。
+                // 系数里的 16 来自 Hann 窗的相干增益（0.5）平方后的倒数修正，
+                // 除以 FftSize^2 把点数的影响消掉，换 FftSize 不必重调标定。
                 double db = power > 1e-20
                     ? 10.0 * Math.Log10(power / (FftSize * FftSize / 16.0))
                     : FloorDb;

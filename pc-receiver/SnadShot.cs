@@ -76,6 +76,7 @@ namespace Snad
                 CollectByType(f, typeof(SpectrumGraph), graphs);
 
             if (CheckMetricStripLayout(f) > 0) failures++;
+            failures += CheckFrequencyResolution();
 
             Console.WriteLine("  自绘按钮 " + buttons.Count + " 个，滚轮选择器 " + combos.Count +
                                   " 个，通道条 " + strips.Count + " 个，频谱图 " + graphs.Count + " 个");
@@ -292,6 +293,76 @@ namespace Snad
                 }
                 else Console.WriteLine("  [通过] 标签 / 数值 / 电平条互不重叠");
             }
+            return bad;
+        }
+
+        /// <summary>
+        /// 断言频谱的低频分辨率足够。
+        ///
+        /// 现象是"100Hz 以下画成一条平线"：FftSize=1024 时每 bin 宽 46.9Hz，
+        /// 而频谱从 30Hz 起，最低两个八度只剩 2 个数据点。
+        ///
+        /// 做法：喂一个 120Hz 纯音，检查能量是否集中在 120Hz 所属的柱上。
+        /// 分辨率不足时低频各柱取到同一个 bin，能量会摊平，
+        /// 最高柱与邻近柱的落差很小——这条断言就会失败。
+        /// </summary>
+        private static int CheckFrequencyResolution()
+        {
+            int bad = 0;
+            Console.WriteLine();
+            Console.WriteLine("--- 频谱低频分辨率 ---");
+
+            const int sr = 48000;
+            var an = new SpectrumAnalyzer();
+            an.Reset(sr, 2);
+
+            const int frames = 2048;
+            var pcm = new byte[frames * 4];
+            double ph = 0;
+            for (int k = 0; k < 24; k++)      // 足够填满环缓冲并完成多次分析
+            {
+                for (int i = 0; i < frames; i++)
+                {
+                    short s = (short)(Math.Sin(ph) * 20000);
+                    ph += 2 * Math.PI * 120.0 / sr;
+                    int b = i * 4;
+                    pcm[b] = (byte)(s & 0xFF); pcm[b + 1] = (byte)((s >> 8) & 0xFF);
+                    pcm[b + 2] = pcm[b]; pcm[b + 3] = pcm[b + 1];
+                }
+                an.Feed(pcm, pcm.Length, 2, sr);
+            }
+
+            var bars = an.BarsDb;
+            int peakBar = 0;
+            for (int i = 1; i < bars.Length; i++) if (bars[i] > bars[peakBar]) peakBar = i;
+
+            double fMin = 30.0, fMax = 16000.0;
+            double peakF = fMin * Math.Pow(fMax / fMin, (peakBar + 0.5) / bars.Length);
+            Console.WriteLine("  120Hz 纯音 -> 最高柱 #" + peakBar +
+                              " 对应 " + peakF.ToString("F0") + "Hz，电平 " + bars[peakBar].ToString("F1") + " dB");
+
+            if (peakF < 90 || peakF > 170)
+            {
+                Console.WriteLine("  [失败] 峰值落在 " + peakF.ToString("F0") +
+                                  "Hz，与输入的 120Hz 不符（低频分辨率不足会把能量摊平）");
+                bad++;
+            }
+            else Console.WriteLine("  [通过] 峰值落在输入频率附近");
+
+            int lo = Math.Max(0, peakBar - 4);
+            double neighbor = double.MinValue;
+            for (int i = lo; i <= Math.Min(bars.Length - 1, peakBar + 4); i++)
+                if (i != peakBar && bars[i] > neighbor) neighbor = bars[i];
+            double drop = bars[peakBar] - neighbor;
+            Console.WriteLine("  与附近柱的最大落差 " + drop.ToString("F1") + " dB");
+            if (drop < 3.0)
+            {
+                Console.WriteLine("  [失败] 峰形不足（落差仅 " + drop.ToString("F1") +
+                                  " dB），低频各柱可能取到同一个 bin");
+                bad++;
+            }
+            else Console.WriteLine("  [通过] 峰形明显，低频可分辨");
+
             return bad;
         }
 
