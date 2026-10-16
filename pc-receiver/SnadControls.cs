@@ -586,6 +586,13 @@ namespace Snad
         private bool _hover;
         private readonly Timer _anim;
 
+        /// <summary>按下瞬间的鼠标位置与展开状态，用于区分"点开"与"点选"。</summary>
+        private int _downX, _downY;
+        private bool _wasOpenAtDown;
+
+        /// <summary>最近一次鼠标事件的位置。OnClick 里用它而不是 Cursor.Position。</summary>
+        private int _lastX, _lastY;
+
         public event EventHandler SelectedIndexChanged;
 
         /// <summary>展开后可见行数（奇数，保证中间一行完整）。</summary>
@@ -956,6 +963,11 @@ namespace Snad
         {
             base.OnMouseDown(e);
             _pressed = true;
+            _downX = e.X;
+            _downY = e.Y;
+            // 必须在展开之前记录：OnMouseDown 里就会把 _open 置为 true，
+            // 事后再读就分不清"本来就是展开的"和"这次点开的"了。
+            _wasOpenAtDown = _open;
             Invalidate();
 
             if (!_open)
@@ -980,6 +992,8 @@ namespace Snad
         protected override void OnMouseMove(MouseEventArgs e)
         {
             base.OnMouseMove(e);
+            _lastX = e.X;
+            _lastY = e.Y;
             if (!_dragging || !_open) return;
             // 向上拖动 = 内容上移 = 索引变大，与触屏直觉一致
             double delta = (double)(_dragStartY - e.Y) / RowHeight;
@@ -991,13 +1005,15 @@ namespace Snad
         {
             base.OnMouseUp(e);
             _pressed = false;
+            _lastX = e.X;
+            _lastY = e.Y;
             Invalidate();
             if (!_dragging) return;
             _dragging = false;
             Capture = false;
 
             // 松手吸附到最近一项。
-            // 高亮条固定在顶行，因此"滚到哪一行"就是选中哪一项——
+            // 高亮固定在正中，因此 _offset 就是中间那一项的序号，
             // 两者必须收敛到同一个值，否则会出现"高亮的和选中的不是同一个"。
             int target = (int)Math.Round(ClampOffset(_offset));
             if (target < 0) target = 0;
@@ -1005,22 +1021,54 @@ namespace Snad
             _offset = target;
             SelectedIndex = target;
             _anim.Start();
+
+            // 只有"本来展开、或这次拖动了"才算确认，才收起。
+            // 收起态按下只为展开：此时若也收起，表现就是点开一松手又关掉
+            // （实测正是如此——提前收起的其实是这里，不是 OnClick）。
+            bool moved = Math.Abs(e.Y - _downY) > 3 || Math.Abs(e.X - _downX) > 3;
+            if (DebugGestures)
+                Console.WriteLine("    [手势] OnMouseUp: wasOpenAtDown=" + _wasOpenAtDown +
+                                  " moved=" + moved + " 位置 " + e.X + "," + e.Y +
+                                  " 按下于 " + _downX + "," + _downY);
+            if (_wasOpenAtDown || moved) Close();
         }
 
-        /// <summary>展开态点击某一行直接跳到它并确认收起；收起态由 OnMouseDown 负责展开。</summary>
+        /// <summary>
+        /// 点击。
+        ///
+        /// 这里必须区分两种手势，否则"点开"会被自己立刻收起：
+        ///   点开     —— 按下与松开位置几乎相同，且按下时处于收起态
+        ///   点选确认 —— 按下时已展开，或期间发生了拖动
+        ///
+        /// 位置一律用事件里记下的 _lastX/_lastY，不读 Cursor.Position：
+        /// 控件未挂到窗口、或光标已移开时，反推出来的坐标是错的
+        /// （实测 OnMouseUp 判为未移动、OnClick 却判为移动了）。
+        /// </summary>
         protected override void OnClick(EventArgs e)
         {
             base.OnClick(e);
-            if (!_open || _items.Length == 0) return;
+            if (_items.Length == 0) return;
 
-            var pt = PointToClient(Cursor.Position);
+            bool moved = Math.Abs(_lastY - _downY) > 3 || Math.Abs(_lastX - _downX) > 3;
+            if (DebugGestures)
+                Console.WriteLine("    [手势] OnClick: wasOpenAtDown=" + _wasOpenAtDown +
+                                  " moved=" + moved + " open=" + _open +
+                                  " 松开于 " + _lastX + "," + _lastY);
+            if (!_open) return;
+
+            // 在收起态按下、且没有拖动 → 这是一次"点开"，保持展开
+            if (!_wasOpenAtDown && !moved) return;
+
             int rowH = RowHeight;
             float center = BarTop + BarHeight;
-            int delta = (int)Math.Round((pt.Y - center) / rowH);
-            // 点到正中间那一项时 delta 为 0，但那也是一次"确认"，同样要收起
+            int delta = (int)Math.Round((_lastY - center) / rowH);
             if (delta != 0) SelectedIndex = _index + delta;
+            // 点到正中间那一项时 delta 为 0，但那也是一次确认，同样要收起
             Close();
         }
+
+        /// <summary>手势诊断开关。排查"点开被自己收起"这类问题时打开。</summary>
+        public static bool DebugGestures = false;
 
         protected override void OnMouseWheel(MouseEventArgs e)
         {

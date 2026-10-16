@@ -208,6 +208,9 @@ namespace Snad
                 w4.Open();
                 SetPrivate(w4, "_expand", 1.0);
                 bool openedOk = w4.IsOpen;
+                // 模拟真实序列：在偏下一行的位置按下、松开、Click
+                InvokeMouse(w4, "OnMouseDown", 100, 37);
+                InvokeMouse(w4, "OnMouseUp", 100, 37);
                 InvokeOnClick(w4);
                 if (!openedOk)
                 {
@@ -227,6 +230,42 @@ namespace Snad
                         Console.WriteLine("  [失败] 收起后高度仍为 " + w4.Height + "（应为单行高）");
                         bad++;
                     }
+                }
+
+                // ---- 断言：单纯"点开"不能自己收起 ----
+                // 真实踩过的坑：点开与点选是同一套手势。OnMouseDown 展开后，
+                // 紧接的 OnMouseUp / OnClick 若无条件收起，
+                // 表现就是"点一下展开一瞬间又收起"。
+                WheelSelector.DebugGestures = true;
+                var w5 = new WheelSelector { Width = 200 };
+                w5.Items = items;
+                w5.SelectText("balanced");
+                Console.WriteLine("  模拟单纯点开（按下与松开同一位置，无拖动）：");
+                InvokeMouse(w5, "OnMouseDown", 100, 12);   // 收起态按下即展开
+                bool openedByClick = w5.IsOpen;
+                InvokeMouse(w5, "OnMouseUp", 100, 12);     // 未移动
+                bool stillOpenAfterUp = w5.IsOpen;
+                InvokeOnClick(w5);
+                WheelSelector.DebugGestures = false;
+
+                if (!openedByClick)
+                {
+                    Console.WriteLine("  [失败] 按下未能展开");
+                    bad++;
+                }
+                else if (!stillOpenAfterUp)
+                {
+                    Console.WriteLine("  [失败] 松手就被收起（OnMouseUp 未区分点开与确认）");
+                    bad++;
+                }
+                else if (!w5.IsOpen)
+                {
+                    Console.WriteLine("  [失败] Click 后被收起（OnClick 未区分点开与确认）");
+                    bad++;
+                }
+                else
+                {
+                    Console.WriteLine("  [通过] 点开后保持展开，不会被自己的事件收起");
                 }
                 b1.Save(Path.Combine(dir, "wheel-1-idle.png"), ImageFormat.Png);
                 b2.Save(Path.Combine(dir, "wheel-2-hover.png"), ImageFormat.Png);
@@ -312,6 +351,20 @@ namespace Snad
                 return;
             }
             m.Invoke(c, new object[] { EventArgs.Empty });
+        }
+
+        /// <summary>调用受保护的鼠标事件方法。必须用完整序列（按下->松开->Click）
+        /// 才能复现真实手势，只调其中一个会漏掉"点开被自己收起"这类缺陷。</summary>
+        private static void InvokeMouse(Control c, string method, int x, int y)
+        {
+            var m = c.GetType().GetMethod(method,
+                System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic);
+            if (m == null)
+            {
+                Console.WriteLine("  提示：找不到 " + method);
+                return;
+            }
+            m.Invoke(c, new object[] { new MouseEventArgs(MouseButtons.Left, 1, x, y, 0) });
         }
 
         /// <summary>
