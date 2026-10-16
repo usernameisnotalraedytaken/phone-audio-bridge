@@ -6,6 +6,11 @@
 #   但 VS Build Tools 自带 Roslyn 编译器，且系统有 .NET Framework 4.x 运行时程序集，
 #   因此直接调用 csc.exe 针对运行时程序集编译，零依赖、零安装。
 #
+# ⚠ 本文件必须带 UTF-8 BOM。
+#   Windows PowerShell 5.1 在中文系统上对无 BOM 的 .ps1 按 GBK 解码，
+#   于是这里的中文注释会变成乱码并破坏语法，报出难以理解的
+#   "表达式或语句中包含意外的标记"。踩过两次，改完务必确认前三字节是 EF BB BF。
+#
 # 用法：
 #   powershell -NoProfile -ExecutionPolicy Bypass -File build.ps1
 
@@ -125,7 +130,21 @@ $consoleArgs += $consoleSources
 if ($LASTEXITCODE -ne 0) { throw "控制台版编译失败，csc 退出码 $LASTEXITCODE" }
 Install-Binary 'SnadReceiver.new.exe' 'SnadReceiver.exe'
 
-# ---- 1b) 信标协议验证工具（独立入口，用于在手机端实现前先证明协议可用）----
+# ---- 1b) 音频设备能力探测工具 ----
+#
+# 编辑器只允许用户选择"实际可用"的后端与周期组合，因此能力探测必须先行，
+# 且要是可信的工具而不是一次性脚本。它探明的事实记录在 AUDIO-CAPABILITIES.md。
+if (Test-Path 'SnadAudioProbe.cs') {
+    $probeArgs = @('/nologo', '/target:exe', '/platform:x64', '/optimize+',
+                   '/main:Snad.AudioProbe', '/out:SnadAudioProbe.new.exe')
+    foreach ($a in $coreRefs) { $probeArgs += ("/r:" + (Join-Path $fw $a)) }
+    $probeArgs += 'SnadAudioProbe.cs'
+    & $csc @probeArgs
+    if ($LASTEXITCODE -ne 0) { throw "音频能力探测工具编译失败，csc 退出码 $LASTEXITCODE" }
+    Install-Binary 'SnadAudioProbe.new.exe' 'SnadAudioProbe.exe'
+}
+
+# ---- 1c) 信标协议验证工具（独立入口，用于在手机端实现前先证明协议可用）----
 if (Test-Path 'SnadBeaconTest.cs') {
     $testSources = @('SnadBeacon.cs', 'SnadBeaconService.cs', 'SnadSecret.cs', 'SnadBeaconTest.cs')
     $testArgs = @('/nologo', '/target:exe', '/platform:x64', '/optimize+',
@@ -136,7 +155,7 @@ if (Test-Path 'SnadBeaconTest.cs') {
     if ($LASTEXITCODE -ne 0) { throw "信标验证工具编译失败，csc 退出码 $LASTEXITCODE" }
 }
 
-# ---- 1c) 均衡器 DSP 验证工具 ----
+# ---- 1d) 均衡器 DSP 验证工具 ----
 if (Test-Path 'SnadEqTest.cs') {
     $eqTestArgs = @('/nologo', '/target:exe', '/platform:x64', '/optimize+',
                     '/main:Snad.EqTest', '/out:SnadEqTest.exe')
