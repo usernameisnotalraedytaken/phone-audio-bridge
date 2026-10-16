@@ -663,18 +663,16 @@ namespace Snad
         /// <summary>
         /// 滚动位置的合法区间。
         ///
-        /// 高亮条固定在顶行，因此"第一行显示哪一项"就等于"选中哪一项"。
-        /// 为了让任何选中项都能滚到顶行、同时底部不留空行，区间取
-        /// [总数-可见行数, 总数-1]（列表比可见行数短时退化为 [0, 总数-1]）。
+        /// 高亮固定在正中，因此 _offset 直接就是"正中间那一项的序号"，
+        /// 区间就是 [0, 总数-1]。不需要为"底部留白"做补偿——
+        /// 两端本来就会自然露出空白（iOS 滚轮同理）。
         /// </summary>
         private void OffsetRange(out double lo, out double hi)
         {
             int n = _items.Length;
             if (n <= 0) { lo = 0; hi = 0; return; }
-            double maxStart = Math.Max(0, n - VisibleRows);
-            lo = maxStart;
+            lo = 0;
             hi = n - 1;
-            if (hi < lo) hi = lo;
         }
 
         private double ClampOffset(double v)
@@ -691,9 +689,10 @@ namespace Snad
             if (_open || _items.Length == 0) return;
             _open = true;
 
-            // 展开时让选中项落在第一行（高亮条所在处），其余项在下方依次排开。
-            // 这样"展开"是纯粹的向下长出，当前值始终停在原地。
-            _offset = ClampOffset(_index);
+            // 高亮在正中，_offset 就是中间那一项的序号，因此直接取当前选中项，
+            // 它就会出现在正中间。展开过程因此是"高亮处始终是当前值"，
+            // 上下两侧把相邻候选露出来。
+            _offset = _index;
             Height = ExpandedHeight + 2;
             NotifyHeightChanged();
 
@@ -736,13 +735,21 @@ namespace Snad
         /// <summary>滚轮模式下的横条一半高度。</summary>
         private float BarHeight { get { return (float)(_expand * RowHeight / 2.0); } }
 
-        /// <summary>滚轮模式下高亮条在控件内的 y（第一行中心）。</summary>
+        /// <summary>
+        /// 高亮条在控件内的 y。
+        ///
+        /// 展开后必须落在正中间——这是 iOS 时间滚轮的核心特征：
+        /// 高亮位置固定不动，列表从它下面滚过。之前把高亮放在第一行，
+        /// 结果选中项永远贴顶、下方空一截，观感是"错位"而不是"滚轮"。
+        /// 收起态本来就是单行居中，因此用 _expand 过渡即可，无需跳变。
+        /// </summary>
         private float BarTop
         {
             get
             {
                 float collapsed = (ClientSize.Height - RowHeight) / 2f;
-                return (float)(collapsed + (0f - collapsed) * _expand);
+                float expanded = (ClientSize.Height - RowHeight) / 2f;
+                return (float)(collapsed + (expanded - collapsed) * _expand);
             }
         }
 
@@ -897,7 +904,26 @@ namespace Snad
                     g.DrawString(_items[idx], f, br,
                                  (ClientSize.Width - sz.Width) / 2f, cy - sz.Height / 2f);
 
-                if (isSel) selCenterY = cy;
+                if (isSel)
+                {
+                    selCenterY = cy;
+
+                    // 确认态：选中项左侧一个实心方块 + 右侧一个勾。
+                    // 只靠高亮条不够——高亮表示"光标停在这"，方块与勾才表示
+                    // "这一项就是当前值"，两者在有滚动偏移时是不同含义。
+                    using (var br = new SolidBrush(Color.FromArgb(230, Theme.Accent)))
+                    {
+                        g.FillRectangle(br, 4, cy - 3, 6, 6);
+                        // 右侧勾：两段短线
+                        float cx = ClientSize.Width - 14, cyy = cy;
+                        using (var pen = new Pen(Color.FromArgb(230, Theme.Accent), 2f))
+                        {
+                            pen.StartCap = LineCap.Flat; pen.EndCap = LineCap.Flat;
+                            g.DrawLine(pen, cx - 4, cyy, cx - 1, cyy + 3);
+                            g.DrawLine(pen, cx - 1, cyy + 3, cx + 4, cyy - 3);
+                        }
+                    }
+                }
             }
 
             // 块状光标：贴在选中行左端，是终端里最常见的"当前位置"标记
@@ -981,7 +1007,7 @@ namespace Snad
             _anim.Start();
         }
 
-        /// <summary>展开态点击某一行直接跳到它；收起态由 OnMouseDown 负责展开。</summary>
+        /// <summary>展开态点击某一行直接跳到它并确认收起；收起态由 OnMouseDown 负责展开。</summary>
         protected override void OnClick(EventArgs e)
         {
             base.OnClick(e);
@@ -991,7 +1017,9 @@ namespace Snad
             int rowH = RowHeight;
             float center = BarTop + BarHeight;
             int delta = (int)Math.Round((pt.Y - center) / rowH);
+            // 点到正中间那一项时 delta 为 0，但那也是一次"确认"，同样要收起
             if (delta != 0) SelectedIndex = _index + delta;
+            Close();
         }
 
         protected override void OnMouseWheel(MouseEventArgs e)

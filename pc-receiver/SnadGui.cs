@@ -61,7 +61,7 @@ namespace Snad
 
         public MainForm()
         {
-            Text = "SNAD 音频桥 —— 接收端";
+            Text = "SNAD  Audio Bridge  -  Receiver";
             Icon = LoadAppIcon();
             BackColor = Theme.BgBase;
             ForeColor = Theme.TextPrimary;
@@ -189,10 +189,10 @@ namespace Snad
             _deviceBox.SelectedIndexChanged += OnDeviceChanged;
             _deviceBox.Resize += (s, e) => { LayoutControlRow(); EnsureRowTallEnough(); };
 
-            _startBtn = new FlatButton("开始", true) { Width = 88, Height = 32, Location = new Point(0, 10) };
+            _startBtn = new FlatButton("START", true) { Width = 88, Height = 32, Location = new Point(0, 10) };
             _startBtn.Click += OnStartStop;
 
-            _eqBtn = new FlatButton("均衡器") { Width = 88, Height = 32, Location = new Point(0, 10) };
+            _eqBtn = new FlatButton("EQ") { Width = 88, Height = 32, Location = new Point(0, 10) };
             _eqBtn.Click += OnOpenEq;
 
             controls.Controls.AddRange(new Control[] { _profileBox, _deviceBox, _startBtn, _eqBtn });
@@ -228,19 +228,22 @@ namespace Snad
             LayoutAll();
 
             // 点击滚轮以外的地方就收起。
-            // 两个滚轮各自处理自己的点击，因此能走到窗体这一层的点击都算"别处"。
-            MouseDown += (s, e) => CloseAllWheels();
+            //
+            // 注意不能只挂窗体的 MouseDown：客户区被各子面板铺满，
+            // 点击落在子控件上，事件不会冒泡到窗体——实测怎么点都收不起来。
+            // 因此递归挂到所有子控件。
+            HookDismiss(this);
 
             // ---- 托盘 ----
             _tray = new NotifyIcon
             {
                 Icon = LoadAppIcon(),
-                Text = "SNAD 音频桥",
+                Text = "SNAD Audio Bridge",
                 Visible = true
             };
             var menu = new ContextMenuStrip();
-            menu.Items.Add("显示窗口", null, (s, e) => { Show(); WindowState = FormWindowState.Normal; Activate(); });
-            menu.Items.Add("退出", null, (s, e) => { StopReceiver(); _tray.Visible = false; Application.Exit(); });
+            menu.Items.Add("Show window", null, (s, e) => { Show(); WindowState = FormWindowState.Normal; Activate(); });
+            menu.Items.Add("Quit", null, (s, e) => { StopReceiver(); _tray.Visible = false; Application.Exit(); });
             _tray.ContextMenuStrip = menu;
             _tray.DoubleClick += (s, e) => { Show(); WindowState = FormWindowState.Normal; Activate(); };
 
@@ -257,15 +260,15 @@ namespace Snad
         private void BuildMetricLabels()
         {
             string[] labels = { "LATENCY", "BUFFER", "RX", "TX", "DROP", "UNDER" };
-            string[] units = { "ms", "ms", "fps", "fps", "帧", "次" };
+            string[] units = { "ms", "ms", "fps", "fps", "frames", "underruns" };
             string[] tips =
             {
-                "端到端链路延迟估算（采集 + 网络 + 抖动缓冲 + 音频块），不含声卡自身延迟",
-                "抖动缓冲当前水位。接近容量会开始丢帧，接近零会欠载",
-                "手机端送入的帧率。应与采样率一致（44.1k 或 48k）",
-                "实际写入声卡的帧率。持续低于 RX 说明消费端跟不上",
-                "缓冲溢出而丢弃的帧数。非零说明水位偏高或突发过大",
-                "缓冲见底导致的欠载次数。非零说明水位偏低或调度抖动大"
+                "Estimated end-to-end latency: capture + network + jitter buffer + audio block. Excludes sound card latency.",
+                "Jitter buffer level. Near capacity starts dropping frames; near zero causes underruns.",
+                "Frame rate arriving from the phone. Should match the sample rate.",
+                "Frame rate actually written to the sound card. Persistently below RX means the consumer cannot keep up.",
+                "Frames dropped from buffer overflow. Non-zero means the level is too high or bursts are too large.",
+                "Underruns from an empty buffer. Non-zero means the level is too low or scheduling jitter is high."
             };
             for (int i = 0; i < _metrics.Count; i++)
             {
@@ -382,6 +385,41 @@ namespace Snad
             if (_deviceBox != null && _deviceBox.IsOpen) _deviceBox.Close();
         }
 
+        /// <summary>
+        /// 给窗体与所有子控件挂上"点到别处就收起滚轮"的处理。
+        ///
+        /// 必须递归：客户区被面板铺满，点击落在子控件上不会冒泡到窗体。
+        /// 若点击源本身是滚轮（或滚轮内部的子控件），则不收起。
+        /// </summary>
+        private void HookDismiss(Control root)
+        {
+            root.MouseDown += OnAnyMouseDown;
+            foreach (Control c in root.Controls)
+            {
+                // 滚轮自己处理点击（展开/拖动/选择），不再挂
+                if (c is WheelSelector) continue;
+                HookDismiss(c);
+            }
+        }
+
+        private void OnAnyMouseDown(object sender, MouseEventArgs e)
+        {
+            var c = sender as Control;
+            // 点击落在某个滚轮内部（例如它内部的子控件）时不收起
+            if (c != null && IsInsideWheel(c)) return;
+            CloseAllWheels();
+        }
+
+        private bool IsInsideWheel(Control c)
+        {
+            while (c != null)
+            {
+                if (c is WheelSelector) return true;
+                c = c.Parent;
+            }
+            return false;
+        }
+
         // ------------------------------------------------------------------ 配置与设备
 
         private void LoadConfigAndDevices()
@@ -409,7 +447,7 @@ namespace Snad
             }
 
             RefreshDevices();
-            AppendLog("配置载入：" + _cfgPath + "（" + _profiles.Count + " 个档位，选中 " + selected + "）");
+            AppendLog("Config: " + _cfgPath + "  (" + _profiles.Count + " profiles, selected " + selected + ")");
         }
 
         private void RefreshDevices()
@@ -418,7 +456,7 @@ namespace Snad
             string defName = WaveOut.DefaultDeviceName();
             int defIdx = FindDeviceByName(defName);
 
-            var items = new List<string> { "跟随系统默认" };
+            var items = new List<string> { "SYSTEM DEFAULT" };
             foreach (var d in _devices) items.Add("[" + d.Index + "] " + d.Name);
             _deviceBox.Items = items.ToArray();
 
@@ -426,8 +464,8 @@ namespace Snad
             else _deviceBox.SelectedIndex = Math.Min(items.Count - 1, _deviceIndex + 1);
 
             AppendLog(defIdx >= 0
-                ? "系统默认输出：" + _devices[defIdx].Name
-                : "未识别系统默认输出设备");
+                ? "Default output: " + _devices[defIdx].Name
+                : "Default output device not identified");
         }
 
         /// <summary>按名字找设备。默认设备名可能被截断（MMDevice 与 waveOut 的取名方式不同），
@@ -465,7 +503,7 @@ namespace Snad
 
             if (_receiver != null)
             {
-                AppendLog("切换档位到 " + name + "，重启接收…");
+                AppendLog("Switching profile to " + name + ", restarting...");
                 StopReceiver();
                 ProfileLibrary.ApplyEq(_active, _idleEq);
                 StartReceiver();
@@ -492,7 +530,7 @@ namespace Snad
                 string sel = _profileBox.SelectedItem;
                 if (sel != null && _profiles.ContainsKey(sel)) _active = _profiles[sel];
             }
-            if (_active == null) { MessageBox.Show("没有可用的档位配置。"); return; }
+            if (_active == null) { MessageBox.Show("No usable profile configuration."); return; }
 
             // 选设备：-1 表示跟随系统默认；被占用时回退 Voicemeeter Input
             int dev = _deviceIndex;
@@ -506,7 +544,7 @@ namespace Snad
                     if (rc == 0)
                     {
                         dev = defIdx;
-                        AppendLog("输出：跟随系统默认 [" + defIdx + "] " + _devices[defIdx].Name);
+                        AppendLog("Output: system default [" + defIdx + "] " + _devices[defIdx].Name);
                     }
                     else
                     {
@@ -514,24 +552,24 @@ namespace Snad
                         if (vm.Name != null)
                         {
                             dev = vm.Index;
-                            AppendLog("系统默认设备被占用（rc=" + rc + "），改用 Voicemeeter Input 混音输出");
+                            AppendLog("Default device busy (rc=" + rc + "), falling back to Voicemeeter Input");
                         }
                         else
                         {
                             dev = defIdx;
-                            AppendLog("系统默认设备被占用且无 Voicemeeter Input，仍尝试默认设备");
+                            AppendLog("Default device busy and no Voicemeeter Input found, still trying the default");
                         }
                     }
                 }
                 else
                 {
                     dev = 0;
-                    AppendLog("未识别系统默认设备，使用 [0] " + (_devices.Count > 0 ? _devices[0].Name : "?"));
+                    AppendLog("Default device not identified, using [0] " + (_devices.Count > 0 ? _devices[0].Name : "?"));
                 }
             }
             else
             {
-                AppendLog("输出：指定设备 [" + dev + "] " + _devices[dev].Name);
+                AppendLog("Output: selected device [" + dev + "] " + _devices[dev].Name);
             }
 
             _runCts = new CancellationTokenSource();
@@ -548,7 +586,7 @@ namespace Snad
             }
             catch (Exception ex)
             {
-                AppendLog("复制均衡器设置失败：" + ex.Message);
+                AppendLog("Failed to copy EQ settings: " + ex.Message);
             }
 
             // 图上的 EQ 直接操作接收器的实例，这样拖动即时生效
@@ -558,7 +596,7 @@ namespace Snad
             _rxThread = new Thread(() =>
             {
                 try { r.Run(); }
-                catch (Exception ex) { BeginInvoke(new Action(() => AppendLog("接收线程异常：" + ex.Message))); }
+                catch (Exception ex) { BeginInvoke(new Action(() => AppendLog("Receiver thread error: " + ex.Message))); }
             })
             { IsBackground = true, Name = "snad-ui-rx" };
             _rxThread.Start();
@@ -570,35 +608,35 @@ namespace Snad
             {
                 var key = SnadBeacon.DeriveKey(SnadSecret.Psk);
                 _beacon = new BeaconBroadcaster(Program.MachineDeviceId, Program.DefaultPort, key, 2000,
-                    m => BeginInvoke(new Action(() => AppendLog("信标：" + m))));
+                    m => BeginInvoke(new Action(() => AppendLog("Beacon: " + m))));
                 _beacon.Start();
-                AppendLog("信标广播已启动：device=" + Program.MachineDeviceId +
-                          "，KeyId=" + SnadSecret.KeyId + "（手机端此值必须一致）");
+                AppendLog("Beacon broadcasting: device=" + Program.MachineDeviceId +
+                          ", KeyId=" + SnadSecret.KeyId + "  (phone must report the same KeyId)");
             }
             catch (Exception ex)
             {
-                AppendLog("信标广播启动失败：" + ex.GetType().Name + ": " + ex.Message + "（手机端需手填地址）");
+                AppendLog("Beacon broadcast failed: " + ex.GetType().Name + ": " + ex.Message + "  (phone must enter the address manually)");
             }
 
-            _startBtn.Text = "停止";
+            _startBtn.Text = "STOP";
             _eqBtn.Enabled = true;
-            AppendLog("已启动：档位 " + _active.Name + "，预计链路延迟约 " +
-                      _active.EstimatedPipelineLatencyMs() + " ms（不含声卡自身延迟）");
+            AppendLog("Started: profile " + _active.Name + ", estimated link latency ~" +
+                      _active.EstimatedPipelineLatencyMs() + " ms (excludes sound card latency)");
             UpdateRunState();
         }
 
         private void StopReceiver()
         {
             try { if (_receiver != null) _receiver.Stop(); }
-            catch (Exception ex) { AppendLog("停止时异常：" + ex.Message); }
+            catch (Exception ex) { AppendLog("Error while stopping: " + ex.Message); }
             try { if (_rxThread != null && _rxThread.IsAlive) _rxThread.Join(1500); }
-            catch (Exception ex) { AppendLog("等待线程退出异常：" + ex.Message); }
+            catch (Exception ex) { AppendLog("Error waiting for thread exit: " + ex.Message); }
             try { if (_receiver != null) _receiver.Dispose(); }
-            catch (Exception ex) { AppendLog("释放接收器异常：" + ex.Message); }
+            catch (Exception ex) { AppendLog("Error disposing receiver: " + ex.Message); }
 
             // 停止信标广播，避免接收停止后手机仍能"发现"一个不再工作的电脑
             try { if (_beacon != null) { _beacon.Dispose(); _beacon = null; } }
-            catch (Exception ex) { AppendLog("停止信标广播异常：" + ex.Message); }
+            catch (Exception ex) { AppendLog("Error stopping beacon: " + ex.Message); }
 
             _receiver = null;
             _rxThread = null;
@@ -607,8 +645,8 @@ namespace Snad
             // 图回到"待用"实例，保持 EQ 仍可编辑
             _graph.Eq = _idleEq;
 
-            _startBtn.Text = "开始";
-            AppendLog("已停止");
+            _startBtn.Text = "START";
+            AppendLog("Stopped");
             UpdateRunState();
         }
 
@@ -619,7 +657,7 @@ namespace Snad
             _stateLabel.Text = running ? "LIVE" : "IDLE";
             _stateLabel.ForeColor = running ? Theme.Success : Theme.TextTertiary;
             _dot.BackColor = running ? Theme.Success : Theme.TextTertiary;
-            _tray.Text = running ? "SNAD 音频桥 · 运行中" : "SNAD 音频桥";
+            _tray.Text = running ? "SNAD Audio Bridge  -  RUNNING" : "SNAD Audio Bridge";
 
             if (!running)
             {
@@ -645,7 +683,7 @@ namespace Snad
 
         private void OnGraphBandReset(int band)
         {
-            AppendLog("频段 " + _idleEq.Bands[band].Label + " 已归零");
+            AppendLog("Band " + _idleEq.Bands[band].Label + " reset to 0");
             SaveEqToProfile();
         }
 
@@ -670,7 +708,7 @@ namespace Snad
             }
             catch (Exception ex)
             {
-                AppendLog("保存均衡器设置失败：" + ex.GetType().Name + ": " + ex.Message);
+                AppendLog("Failed to save EQ settings: " + ex.GetType().Name + ": " + ex.Message);
             }
         }
 
@@ -693,7 +731,7 @@ namespace Snad
             }
             catch (Exception ex)
             {
-                AppendLog("打开均衡器失败：" + ex.GetType().Name + ": " + ex.Message);
+                AppendLog("Failed to open EQ: " + ex.GetType().Name + ": " + ex.Message);
             }
         }
 
@@ -834,7 +872,7 @@ namespace Snad
                 if (SetProcessDPIAware()) return "System";
             }
             catch (Exception ex) { System.Diagnostics.Debug.WriteLine("SetProcessDPIAware: " + ex.Message); }
-            return "未设置";
+            return "none";
         }
 
         [STAThread]
@@ -880,9 +918,9 @@ namespace Snad
             }
             catch (Exception ex)
             {
-                MessageBox.Show("启动失败：\n\n" + ex.GetType().Name + ": " + ex.Message +
+                MessageBox.Show("Startup failed:\n\n" + ex.GetType().Name + ": " + ex.Message +
                                 "\n\n" + ex.StackTrace,
-                                "SNAD 音频桥", MessageBoxButtons.OK, MessageBoxIcon.Error);
+                                "SNAD Audio Bridge", MessageBoxButtons.OK, MessageBoxIcon.Error);
             }
         }
     }

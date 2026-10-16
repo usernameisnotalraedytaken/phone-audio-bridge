@@ -119,7 +119,7 @@ namespace Snad
             // ---- 5. 滚轮选择器的三种状态 ----
             try
             {
-                RenderWheelStates(dir);
+                failures += RenderWheelStates(dir);
                 Console.WriteLine("滚轮选择器三态已生成");
             }
             catch (Exception ex)
@@ -140,8 +140,9 @@ namespace Snad
         /// 静止与悬停由鼠标事件驱动，离屏渲染时无法自然触发，因此用反射直接设
         /// 对应字段——比伪造鼠标消息可靠，也不会真的移动用户的光标。
         /// </summary>
-        private static void RenderWheelStates(string dir)
+        private static int RenderWheelStates(string dir)
         {
+            int bad = 0;
             string[] items = { "lowlatency", "balanced", "highquality" };
 
             var w1 = new WheelSelector { Width = 200 };
@@ -178,6 +179,55 @@ namespace Snad
                                   " SelectedIndex=" + w3.SelectedIndex +
                                   " _offset=" + GetPrivate(w3, "_offset") +
                                   " _expand=" + GetPrivate(w3, "_expand"));
+
+                // ---- 断言：高亮必须在正中 ----
+                // 之前把高亮放在第一行，选中项永远贴顶，观感是"错位"而非"滚轮"。
+                // 这里直接比对：展开态下选中项中心应接近控件竖直中点。
+                double rowH = w3.Height / 3.0;
+                double offset = Convert.ToDouble(GetPrivate(w3, "_offset"));
+                double centerY = (offset + 0.5) * rowH;
+                double mid = w3.Height / 2.0;
+                if (Math.Abs(centerY - mid) > rowH * 0.6)
+                {
+                    Console.WriteLine("  [失败] 高亮未落在正中：选中项中心 y=" + centerY.ToString("F1") +
+                                      "，控件中点 y=" + mid.ToString("F1"));
+                    bad++;
+                }
+                else
+                {
+                    Console.WriteLine("  [通过] 高亮落在正中（选中项中心 y=" + centerY.ToString("F1") +
+                                      "，控件中点 y=" + mid.ToString("F1") + "）");
+                }
+
+                // ---- 断言：点选后必须收起 ----
+                // 用户反馈"不管点哪里都看不到收起"——展开态是选择过程，
+                // 选完就该回到单行状态，否则会以为还要再点一次。
+                var w4 = new WheelSelector { Width = 200 };
+                w4.Items = items;
+                w4.SelectText("balanced");
+                w4.Open();
+                SetPrivate(w4, "_expand", 1.0);
+                bool openedOk = w4.IsOpen;
+                InvokeOnClick(w4);
+                if (!openedOk)
+                {
+                    Console.WriteLine("  [失败] 滚轮未能展开");
+                    bad++;
+                }
+                else if (w4.IsOpen)
+                {
+                    Console.WriteLine("  [失败] 点选后滚轮仍处于展开态（应收起）");
+                    bad++;
+                }
+                else
+                {
+                    Console.WriteLine("  [通过] 点选后自动收起，回到单行状态");
+                    if (w4.Height > 40)
+                    {
+                        Console.WriteLine("  [失败] 收起后高度仍为 " + w4.Height + "（应为单行高）");
+                        bad++;
+                    }
+                }
                 b1.Save(Path.Combine(dir, "wheel-1-idle.png"), ImageFormat.Png);
                 b2.Save(Path.Combine(dir, "wheel-2-hover.png"), ImageFormat.Png);
                 b3.Save(Path.Combine(dir, "wheel-3-open.png"), ImageFormat.Png);
@@ -229,6 +279,7 @@ namespace Snad
                     bmp.Save(Path.Combine(dir, "wheel-states.png"), ImageFormat.Png);
                 }
             }
+            return bad;
         }
 
         private static void SetPrivate(object o, string field, object value)
@@ -248,6 +299,19 @@ namespace Snad
             var f = o.GetType().GetField(field,
                 System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic);
             return f == null ? "?" : f.GetValue(o);
+        }
+
+        /// <summary>调用受保护的 OnClick。用于验证"点选后收起"这条行为。</summary>
+        private static void InvokeOnClick(Control c)
+        {
+            var m = c.GetType().GetMethod("OnClick",
+                System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic);
+            if (m == null)
+            {
+                Console.WriteLine("  提示：找不到 OnClick，无法验证收起行为");
+                return;
+            }
+            m.Invoke(c, new object[] { EventArgs.Empty });
         }
 
         /// <summary>
