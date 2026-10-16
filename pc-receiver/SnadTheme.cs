@@ -51,13 +51,23 @@ namespace Snad
         public const int S1 = 4, S2 = 8, S3 = 12, S4 = 16, S5 = 20, S6 = 24, S8 = 32;
 
         // ---- 字体 ----
-        // 数值用等宽，跳变不抖动；界面文字用 UI 字体。
+        // 按用途分工，不是一律等宽：
+        //   大号数显  Bahnschrift —— DIN 风格窄体，数字有分量、字面紧凑，仪表读数就该这样。
+        //                           Consolas 的大号数字又瘦又平，放大后很单薄。
+        //   技术文字  Consolas   —— 小标签、坐标轴、日志、状态词。等宽保证对齐与不抖动。
+        //   人读界面  Segoe/YaHei—— 按钮、中文标签。中文必须走含汉字的字体。
+        private static readonly string ReadoutFamily = PickFamily(
+            new[] { "Bahnschrift", "DIN Alternate", "Segoe UI Variable Display", "Segoe UI" });
         private static readonly string MetricFamily = PickFamily(
-            new[] { "Bahnschrift", "Cascadia Mono", "Consolas" });
+            new[] { "Consolas", "Cascadia Mono", "Lucida Console" });
         private static readonly string UiFamily = PickFamily(
             new[] { "Segoe UI Variable Text", "Segoe UI", "Microsoft YaHei UI" });
         private static readonly string MonoFamily = PickFamily(
-            new[] { "Cascadia Mono", "Consolas", "Lucida Console" });
+            new[] { "Consolas", "Cascadia Mono", "Lucida Console" });
+
+        /// <summary>英文标签字体（TUI 风格）。</summary>
+        private static readonly string LabelFamily = PickFamily(
+            new[] { "Consolas", "Cascadia Mono", "Lucida Console" });
 
         private static readonly Dictionary<string, Font> Cache = new Dictionary<string, Font>();
 
@@ -93,13 +103,13 @@ namespace Snad
         public static string MetricFontName { get { return MetricFamily; } }
         public static string UiFontName { get { return UiFamily; } }
         public static string MonoFontName { get { return MonoFamily; } }
+        public static string LabelFontName { get { return LabelFamily; } }
 
         /// <summary>
         /// 取字体（带缓存，避免绘制时反复构造）。
         /// 返回值是共享实例，调用方**不要 Dispose**。
         /// </summary>
-        public static Font Font(string family, float size, FontStyle style = FontStyle.Regular)
-        {
+        public static Font Font(string family, float size, FontStyle style = FontStyle.Regular)        {
             string key = family + "|" + size.ToString("0.##") + "|" + (int)style;
             Font f;
             if (Cache.TryGetValue(key, out f)) return f;
@@ -108,11 +118,23 @@ namespace Snad
             return f;
         }
 
-        /// <summary>数值字体：等宽、适合读数。</summary>
+        /// <summary>数值字体：等宽、适合小号读数与单位。</summary>
         public static Font Metric(float size, FontStyle style = FontStyle.Regular)
         {
             return Font(MetricFamily, size, style);
         }
+
+        /// <summary>
+        /// 大号数显字体。用 DIN 风格窄体而不是等宽——
+        /// 数显是界面的视觉重心，需要字面厚重、字形紧凑；
+        /// 等宽字体放大后笔画过细，一片灰色反而显得廉价。
+        /// </summary>
+        public static Font Readout(float size, FontStyle style = FontStyle.Regular)
+        {
+            return Font(ReadoutFamily, size, style);
+        }
+
+        public static string ReadoutFontName { get { return ReadoutFamily; } }
 
         /// <summary>界面文字字体。</summary>
         public static Font Ui(float size, FontStyle style = FontStyle.Regular)
@@ -120,10 +142,58 @@ namespace Snad
             return Font(UiFamily, size, style);
         }
 
+        /// <summary>
+        /// 强调字体：UI 字体族加粗。
+        /// 若该族没有真粗体（雅黑就是这样，Bold 会退化成 Regular），
+        /// 则改用稍大字号表达强调，避免"设了粗体却没变化"。
+        /// </summary>
+        public static Font UiEmphasis(float size)
+        {
+            return Emphasis(UiFamily, size);
+        }
+
+        /// <summary>
+        /// 等宽强调字体。给 TUI 部件（滚轮选择器等）用：
+        /// 它们的形态语言就是终端，字体必须同族，否则整块味道就散了。
+        /// </summary>
+        public static Font MonoEmphasis(float size)
+        {
+            return Emphasis(LabelFamily, size);
+        }
+
+        private static Font Emphasis(string family, float size)
+        {
+            try
+            {
+                bool hasBold = false;
+                using (var col = new InstalledFontCollection())
+                {
+                    foreach (var fam in col.Families)
+                    {
+                        if (!string.Equals(fam.Name, family, StringComparison.OrdinalIgnoreCase)) continue;
+                        hasBold = fam.IsStyleAvailable(FontStyle.Bold);
+                        break;
+                    }
+                }
+                return hasBold ? Font(family, size, FontStyle.Bold) : Font(family, size + 0.5f);
+            }
+            catch (Exception ex)
+            {
+                System.Diagnostics.Debug.WriteLine("Theme：检测粗体可用性失败：" + ex.Message);
+                return Font(family, size, FontStyle.Bold);
+            }
+        }
+
         /// <summary>等宽字体（日志、地址等）。</summary>
         public static Font Mono(float size, FontStyle style = FontStyle.Regular)
         {
             return Font(MonoFamily, size, style);
+        }
+
+        /// <summary>英文标签字体（TUI 风格，全大写时观感最好）。</summary>
+        public static Font Label(float size, FontStyle style = FontStyle.Regular)
+        {
+            return Font(LabelFamily, size, style);
         }
 
         // ---------------------------------------------------------------- 绘制助手
@@ -178,6 +248,23 @@ namespace Snad
         {
             using (var path = SuperEllipse(r, radius))
                 g.FillPath(b, path);
+        }
+
+        /// <summary>
+        /// 纵向渐变填充的圆角矩形（上浅下深）。
+        ///
+        /// 纯色填充的控件看起来是"贴上去的纸片"，一点顶亮底暗的渐变就能让它有厚度，
+        /// 这是界面显"精致"而非"粗糙"的主要来源，代价只是多一个画刷。
+        /// </summary>
+        public static void FillRoundGradient(Graphics g, RectangleF r, float radius,
+                                             Color top, Color bottom)
+        {
+            if (r.Width < 1 || r.Height < 1) return;
+            using (var lg = new LinearGradientBrush(
+                new RectangleF(r.X, r.Y, r.Width, Math.Max(1, r.Height)),
+                top, bottom, LinearGradientMode.Vertical))
+            using (var path = SuperEllipse(r, radius))
+                g.FillPath(lg, path);
         }
 
         /// <summary>描边超椭圆圆角矩形。</summary>

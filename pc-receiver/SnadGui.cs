@@ -1,16 +1,14 @@
-// SNAD 接收器图形界面。
+// 主窗口。
 //
-// 目标：双击即用。不需要命令行参数，不需要命令行窗口。
-//   顶部：档位切换、输出设备选择、开始/停止
-//   中部：实时频谱（foobar2000 风格）+ 波形
-//   底部：延迟、缓冲水位、各级帧率、丢帧与异常计数
+// 版面按 K 方向分区：上半屏是频谱图（既是可视化也是 EQ 控件），
+// 下半屏是通道条读数（六项指标横排），再下面是控件行与事件日志。
 //
-// 档位切换会重启接收线程并重新建缓冲，因此切换后会有约 0.3 秒的重连。
+// 设计语言统一由 Theme 提供，本文件不出现散落的颜色字面量——
+// 否则改一处配色要翻遍全文，而且很容易漏。
 
 using System;
 using System.Collections.Generic;
 using System.Drawing;
-using System.Drawing.Drawing2D;
 using System.Globalization;
 using System.IO;
 using System.Threading;
@@ -20,27 +18,21 @@ namespace Snad
 {
     internal sealed class MainForm : Form
     {
-        // ---- 视觉 ----
-        private static readonly Color BgDark = Color.FromArgb(18, 20, 26);
-        private static readonly Color BgPanel = Color.FromArgb(28, 32, 40);
-        private static readonly Color BgBar = Color.FromArgb(40, 46, 58);
-        private static readonly Color FgMain = Color.FromArgb(226, 232, 240);
-        private static readonly Color FgDim = Color.FromArgb(140, 150, 165);
-        private static readonly Color Accent = Color.FromArgb(80, 200, 255);
-        private static readonly Color AccentWarm = Color.FromArgb(255, 190, 90);
-        private static readonly Color Warn = Color.FromArgb(255, 110, 110);
-        private static readonly Color Ok = Color.FromArgb(120, 220, 140);
-
         // ---- 控件 ----
-        private ComboBox _profileBox;
-        private ComboBox _deviceBox;
-        private Button _startBtn;
-        private Label _statusLabel;
-        private Label _latencyLabel;
-        private TextBox _statsBox;
-        private SpectrumPanel _spectrum;
-        private WavePanel _wave;
+        private WheelSelector _profileBox;
+        private WheelSelector _deviceBox;
+        private FlatButton _startBtn;
+        private FlatButton _eqBtn;
+        private SpectrumGraph _graph;
+        private MetricStrip _metrics;
+        private LogStrip _log;
         private NotifyIcon _tray;
+        private Panel _titleBar;
+        private Panel _graphHost;
+        private Panel _controlsRow;
+        private Panel _logHost;
+        private Label _titleMain, _titleSub, _stateLabel, _rateLabel;
+        private Panel _dot;
 
         // ---- 状态 ----
         private Dictionary<string, Profile> _profiles;
@@ -56,41 +48,49 @@ namespace Snad
         /// <summary>信标广播器。手机端据此自动发现本机，无需手填地址。</summary>
         private BeaconBroadcaster _beacon;
 
-        /// <summary>均衡器入口按钮。</summary>
-        private Button _eqBtn;
-
-        /// <summary>顶部控制条，用于把右侧控件贴到右边缘。</summary>
-        private Panel _topBar;
-
-        /// <summary>
-        /// 把状态标签与均衡器按钮贴到顶部条的右边缘。
-        /// 状态标签宽度固定并启用 AutoEllipsis，因此状态文字再长也只会被截断，
-        /// 不会压到按钮上（原先正是这样把按钮盖住的）。
-        /// </summary>
-        private void LayoutTopRight()
-        {
-            if (_topBar == null || _eqBtn == null || _statusLabel == null) return;
-            int right = _topBar.ClientSize.Width - _topBar.Padding.Right;
-            int btnW = _eqBtn.Width;
-            int statusW = _statusLabel.Width;
-
-            _eqBtn.Left = right - btnW;
-            _statusLabel.Left = _eqBtn.Left - 6 - statusW;
-        }
-
         private readonly SpectrumAnalyzer _analyzer = new SpectrumAnalyzer();
+        private readonly Equalizer _idleEq = new Equalizer();
         private readonly object _audioGate = new object();
         private byte[] _pendingAudio;
         private int _pendingBytes, _pendingRate, _pendingCh;
 
         private System.Windows.Forms.Timer _uiTimer;
 
+        /// <summary>闪烁状态：欠载或丢帧时状态点闪烁，静止的灯容易被忽略。</summary>
+        private bool _blinkOn = true;
+        private int _blinkTick;
+
+        public MainForm()
+        {
+            Text = "SNAD 音频桥 —— 接收端";
+            Icon = LoadAppIcon();
+            BackColor = Theme.BgBase;
+            ForeColor = Theme.TextPrimary;
+            Font = Theme.Ui(9f);
+            StartPosition = FormStartPosition.CenterScreen;
+            DoubleBuffered = true;
+            // 自绘控件多，窗口缩放时整屏重画会有闪烁，用合成绘制压掉
+            SetStyle(ControlStyles.OptimizedDoubleBuffer | ControlStyles.AllPaintingInWmPaint, true);
+
+            // 尺寸按屏幕工作区自适应。
+            // 本机实测工作区 1280x720（PerMonitor DPI 感知），布局需要
+            // 标题 40 + 图 300 + 通道条 88 + 控件行 52 + 日志 110 + 边距 ≈ 630。
+            var wa = Screen.PrimaryScreen != null ? Screen.PrimaryScreen.WorkingArea : new Rectangle(0, 0, 1280, 800);
+            int wantW = 960, wantH = 640;
+            int w = Math.Min(wantW, Math.Max(720, wa.Width - 20));
+            int h = Math.Min(wantH, Math.Max(480, wa.Height - 20));
+            MinimumSize = new Size(Math.Min(720, wa.Width), Math.Min(480, wa.Height));
+            Size = new Size(w, h);
+
+            BuildUi();
+            LoadConfigAndDevices();
+        }
+
         /// <summary>
         /// 从 exe 自身内嵌资源取出应用图标。
         ///
         /// 说明：/win32icon 只是把图标写进 exe 资源（供资源管理器显示），
         /// WinForms 窗口并不会自动采用它，必须显式赋给 Form.Icon 与 NotifyIcon.Icon。
-        /// 此前两处都没设，所以标题栏与托盘一直是系统默认图标。
         /// </summary>
         private static Icon LoadAppIcon()
         {
@@ -107,199 +107,143 @@ namespace Snad
             return SystemIcons.Application;
         }
 
-        public MainForm()
-        {
-            Text = "SNAD 音频桥 —— 接收端";
-            // 显式采用内嵌图标，否则标题栏显示系统默认图标
-            Icon = LoadAppIcon();
-            BackColor = BgDark;
-            ForeColor = FgMain;
-            Font = new Font("Microsoft YaHei UI", 9f);
-            StartPosition = FormStartPosition.CenterScreen;
-            DoubleBuffered = true;
-
-            // 按屏幕工作区自适应尺寸，并保证不低于布局所需的最小高度。
-            //
-            // 本机实测：屏幕 1280x720，工作区同为 1280x720，进程为 PerMonitor DPI 感知。
-            // 布局所需：顶部 76 + 波形 76 + 频谱(至少约 120) + 底部 116 ≈ 390，
-            // 加上边框与标题栏，取 620 高可完整显示且不溢出屏幕。
-            // 宽度取 960：顶部要同时容纳"档位+设备+开始+状态文字+均衡器按钮"，
-            // 太窄时状态文字会被截断（按钮本身有锚定保护，不会重叠）。
-            var wa = Screen.PrimaryScreen != null ? Screen.PrimaryScreen.WorkingArea : new Rectangle(0, 0, 1280, 800);
-            int wantW = 960, wantH = 620;
-            int w = Math.Min(wantW, Math.Max(700, wa.Width - 20));
-            int h = Math.Min(wantH, Math.Max(460, wa.Height - 20));
-            MinimumSize = new Size(Math.Min(700, wa.Width), Math.Min(460, wa.Height));
-            Size = new Size(w, h);
-
-            BuildUi();
-            LoadConfigAndDevices();
-        }
-
         // ------------------------------------------------------------------ 界面构建
 
         private void BuildUi()
         {
-            // 紧凑布局：逻辑可用高度只有约 480 px（本机 1280x720 @ 150%）。
-            //
-            // 经验教训：此前全部用固定 Location + 固定高度，中文字体在 9pt 下
-            // 实际行高比预期大，导致"开始"按钮的文字下沿被按钮底边裁掉。
-            // 因此这里改用 AutoSize 标签，并给输入控件留足高度。
+            SuspendLayout();
 
-            // ---- 顶部控制条 ----
-            var top = new Panel { Dock = DockStyle.Top, Height = 76, BackColor = BgPanel, Padding = new Padding(10, 8, 10, 8) };
-
-            var lblProfile = new Label
+            // ---- 标题条 ----
+            _titleBar = new Panel { Dock = DockStyle.Top, Height = 40, BackColor = Theme.BgPanel };
+            _titleMain = new Label
             {
-                Text = "档位",
-                ForeColor = FgDim,
+                Text = "SNAD",
+                ForeColor = Theme.TextPrimary,
+                Font = Theme.Ui(11f, FontStyle.Bold),
                 AutoSize = true,
-                Location = new Point(10, 6)
+                BackColor = Color.Transparent,
+                Location = new Point(16, 10)
             };
-            _profileBox = new ComboBox
+            _titleSub = new Label
             {
-                DropDownStyle = ComboBoxStyle.DropDownList,
-                Width = 132,
-                Height = 30,
-                Location = new Point(10, 26),
-                BackColor = BgBar,
-                ForeColor = FgMain,
-                FlatStyle = FlatStyle.Flat
-            };
-            _profileBox.SelectedIndexChanged += OnProfileChanged;
-
-            var lblDevice = new Label
-            {
-                Text = "输出设备",
-                ForeColor = FgDim,
+                Text = "AUDIO BRIDGE",
+                ForeColor = Theme.TextTertiary,
+                Font = Theme.Ui(8f),
                 AutoSize = true,
-                Location = new Point(152, 6)
+                BackColor = Color.Transparent,
+                Location = new Point(74, 14)
             };
-            _deviceBox = new ComboBox
+            // 状态点：正常绿、异常橙，异常时闪烁
+            _dot = new Panel { Size = new Size(7, 7), BackColor = Theme.TextTertiary, Location = new Point(0, 17) };
+            _stateLabel = new Label
             {
-                DropDownStyle = ComboBoxStyle.DropDownList,
-                Width = 240,
-                Height = 30,
-                Location = new Point(152, 26),
-                BackColor = BgBar,
-                ForeColor = FgMain,
-                FlatStyle = FlatStyle.Flat
+                Text = "IDLE",
+                ForeColor = Theme.TextSecondary,
+                Font = Theme.Metric(9f),
+                AutoSize = true,
+                BackColor = Color.Transparent,
+                Location = new Point(0, 11)
             };
-            _deviceBox.SelectedIndexChanged += OnDeviceChanged;
-
-            _startBtn = new Button
+            _rateLabel = new Label
             {
-                Text = "开始",
-                Width = 84,
-                // 高度必须够：中文在 9pt 下加上内边距与边框，26 px 会把文字下沿裁掉
-                // （实测正是文字底部被按钮底边切掉）。34 px 留足余量。
-                Height = 34,
-                Location = new Point(402, 24),
-                FlatStyle = FlatStyle.Flat,
-                BackColor = BgBar,
-                ForeColor = FgMain,
-                // 默认 UseVisualStyleBackColor = true 时视觉样式会忽略 BackColor，
-                // 按钮回落到系统浅灰底，配上浅色前景几乎看不清。必须关掉。
-                UseVisualStyleBackColor = false
+                Text = "",
+                ForeColor = Theme.TextPrimary,
+                Font = Theme.Metric(9f),
+                AutoSize = true,
+                BackColor = Color.Transparent,
+                Location = new Point(0, 11)
             };
-            _startBtn.FlatAppearance.BorderColor = Accent;
-            _startBtn.FlatAppearance.MouseOverBackColor = Color.FromArgb(52, 60, 74);
-            _startBtn.FlatAppearance.MouseDownBackColor = Color.FromArgb(34, 40, 52);
-            _startBtn.Click += OnStartStop;
+            _titleBar.Controls.AddRange(new Control[] { _titleMain, _titleSub, _dot, _stateLabel, _rateLabel });
+            _titleBar.Resize += (s, e) => LayoutTitleBar();
 
-            // 状态文字与均衡器按钮改用锚定布局，不再用绝对坐标。
-            //
-            // 原因：状态标签原本 autoSize 从 x=496 起画，文本是
-            // "系统默认: 耳机 (Realtek(R) Audio)" 这种长串时会一路盖到 x≈760，
-            // 把 x=672 的按钮整个挡住（实测截图里按钮被文字覆盖）。
-            // 绝对坐标无法预知文本长度，必须让布局自己分配空间。
-            //
-            // 用 Anchor 而不是 Dock：Dock 会让按钮填满所在容器的高度，
-            // 实测得到一个 88x60 的按钮（与"开始"的 34 高不一致）。
-            // Anchor 保持显式尺寸，同时跟随窗口右边缘移动。
-            const int eqBtnW = 88, eqBtnH = 34, statusW = 280, statusGap = 6;
-
-            _eqBtn = new Button
-            {
-                Text = "均衡器",
-                Width = eqBtnW,
-                Height = eqBtnH,
-                // 先给一个占位位置，随后由 OnTopBarResize 按实际宽度摆到右边缘
-                Location = new Point(800, 24),
-                Anchor = AnchorStyles.Top | AnchorStyles.Right,
-                FlatStyle = FlatStyle.Flat,
-                BackColor = BgBar,
-                ForeColor = FgMain,
-                UseVisualStyleBackColor = false
-            };
-            _eqBtn.FlatAppearance.BorderColor = Accent;
-            _eqBtn.FlatAppearance.MouseOverBackColor = Color.FromArgb(52, 60, 74);
-            _eqBtn.FlatAppearance.MouseDownBackColor = Color.FromArgb(34, 40, 52);
-            _eqBtn.Click += OnOpenEq;
-
-            _statusLabel = new Label
-            {
-                Text = "未启动",
-                ForeColor = FgDim,
-                AutoSize = false,
-                Width = statusW,
-                Height = eqBtnH,
-                TextAlign = ContentAlignment.MiddleLeft,
-                AutoEllipsis = true,
-                Location = new Point(800 - statusGap - statusW, 24),
-                Anchor = AnchorStyles.Top | AnchorStyles.Right
-            };
-
-            top.Controls.AddRange(new Control[] { lblProfile, _profileBox, lblDevice, _deviceBox, _startBtn, _statusLabel, _eqBtn });
-
-            // 顶部条的宽度在构造时还不确定（窗口尺寸随后才设），
-            // 因此用 Resize 事件把这两个控件贴到右边缘。
-            _topBar = top;
-            top.Resize += (s, e) => LayoutTopRight();
-            LayoutTopRight();
-
-            // ---- 底部统计 ----
-            var bottom = new Panel { Dock = DockStyle.Bottom, Height = 116, BackColor = BgPanel, Padding = new Padding(10, 6, 10, 6) };
-            _latencyLabel = new Label
-            {
-                Dock = DockStyle.Top,
-                Height = 24,
-                ForeColor = Accent,
-                Font = new Font("Microsoft YaHei UI", 10f, FontStyle.Bold),
-                Text = "延迟 —"
-            };
-            _statsBox = new TextBox
+            // ---- 频谱图 ----
+            // Dock=Fill 让图吃掉标题条、通道条、控件行与日志之外的全部高度——
+            // 图是视觉主体，应该占最大面积且随窗口缩放。
+            _graph = new SpectrumGraph(_analyzer)
             {
                 Dock = DockStyle.Fill,
-                Multiline = true,
-                ReadOnly = true,
-                ScrollBars = ScrollBars.Vertical,
-                BackColor = BgPanel,
-                ForeColor = FgDim,
-                BorderStyle = BorderStyle.None,
-                Font = new Font("Consolas", 8.5f)
+                Eq = _idleEq
             };
-            bottom.Controls.Add(_statsBox);
-            bottom.Controls.Add(_latencyLabel);
+            _graph.BandChanged += OnGraphBandChanged;
+            _graph.BandReset += OnGraphBandReset;
 
-            // ---- 中部可视化：频谱填充剩余空间，波形停靠其底部 ----
-            _spectrum = new SpectrumPanel(_analyzer) { Dock = DockStyle.Fill };
-            _wave = new WavePanel(_analyzer) { Dock = DockStyle.Bottom, Height = 76 };
+            var graphHost = new Panel { Dock = DockStyle.Fill, Padding = new Padding(12, 8, 12, 6), BackColor = Theme.BgBase };
+            graphHost.Controls.Add(_graph);
 
-            var center = new Panel { Dock = DockStyle.Fill, Padding = new Padding(10, 6, 10, 0) };
-            center.Controls.Add(_spectrum);   // Fill 先加
-            center.Controls.Add(_wave);       // Bottom 后加，避免压住 Fill 区
+            // ---- 通道条 ----
+            _metrics = new MetricStrip(6) { Dock = DockStyle.Top, Height = 88 };
+            BuildMetricLabels();
 
-            // WinForms 停靠规则：后添加的控件先占据边缘。
-            // 因此顺序应为 center(Fill) -> bottom(Bottom) -> top(Top)。
-            Controls.Add(center);
-            Controls.Add(bottom);
-            Controls.Add(top);
+            // ---- 控件行 ----
+            // 高度按滚轮选择器算：可见 3 行 × 行高（字体高 + 8）≈ 78，
+            // 上下各留 8 的边距，取 92。给矮了会把滚轮压扁并与日志重叠。
+            var controls = new Panel { Dock = DockStyle.Top, Height = 92, BackColor = Theme.BgBase, Padding = new Padding(12, 8, 12, 8) };
+
+            // 档位与设备用滚轮选择器：收起时只占一行显示当前值，
+            // 点击展开成滚轮（iOS 时间选择器形态），选完自动收起。
+            _profileBox = new WheelSelector { Width = 150, Location = new Point(12, 10) };
+            _profileBox.SelectedIndexChanged += OnProfileChanged;
+            // 展开/收起会改变高度，需要重新垂直居中，否则会偏出中心或被容器裁掉
+            _profileBox.Resize += (s, e) => { LayoutControlRow(); EnsureRowTallEnough(); };
+
+            _deviceBox = new WheelSelector { Width = 240, Location = new Point(172, 10) };
+            _deviceBox.SelectedIndexChanged += OnDeviceChanged;
+            _deviceBox.Resize += (s, e) => { LayoutControlRow(); EnsureRowTallEnough(); };
+
+            _startBtn = new FlatButton("开始", true) { Width = 88, Height = 32, Location = new Point(0, 10) };
+            _startBtn.Click += OnStartStop;
+
+            _eqBtn = new FlatButton("均衡器") { Width = 88, Height = 32, Location = new Point(0, 10) };
+            _eqBtn.Click += OnOpenEq;
+
+            controls.Controls.AddRange(new Control[] { _profileBox, _deviceBox, _startBtn, _eqBtn });
+            controls.Resize += (s, e) => LayoutControlRow();
+
+            // ---- 事件日志 ----
+            // TextBox 的 Dock=Fill 在固定高度的容器里不会撑满（它有自己的
+            // 首选高度），因此改为四边锚定 + 容器尺寸变化时同步大小。
+            var logHost = new Panel { Dock = DockStyle.Bottom, Height = 118, BackColor = Theme.BgPanel, Padding = new Padding(12, 8, 12, 8) };
+            _log = new LogStrip { BackColor = Theme.BgPanel };
+            logHost.Controls.Add(_log);
+            logHost.Resize += (s, e) =>
+            {
+                _log.Bounds = new Rectangle(
+                    logHost.Padding.Left, logHost.Padding.Top,
+                    Math.Max(10, logHost.ClientSize.Width - logHost.Padding.Horizontal),
+                    Math.Max(10, logHost.ClientSize.Height - logHost.Padding.Vertical));
+            };
+
+            // ---- 组装 ----
+            // 不用 Dock 排版面：WinForms 的停靠顺序由控件在集合里的次序决定，
+            // 实测 BringToFront 无法可靠改变布局顺序，通道条会跑到图上面
+            // （与 K 方向相反）。这里改为显式摆放，位置全部由 LayoutAll 算出。
+            Controls.Add(graphHost);
+            Controls.Add(logHost);
+            Controls.Add(controls);
+            Controls.Add(_metrics);
+            Controls.Add(_titleBar);
+
+            _graphHost = graphHost;
+            _controlsRow = controls;
+            _logHost = logHost;
+
+            // 每一块都不再自行停靠，统一由 LayoutAll 定位
+            _titleBar.Dock = DockStyle.None;
+            _metrics.Dock = DockStyle.None;
+            controls.Dock = DockStyle.None;
+            graphHost.Dock = DockStyle.None;
+            logHost.Dock = DockStyle.None;
+
+            Resize += (s, e) => LayoutAll();
+            LayoutAll();
+
+            // 点击滚轮以外的地方就收起。
+            // 两个滚轮各自处理自己的点击，因此能走到窗体这一层的点击都算"别处"。
+            MouseDown += (s, e) => CloseAllWheels();
 
             // ---- 托盘 ----
             _tray = new NotifyIcon
             {
-                // 与窗口共用同一个内嵌图标
                 Icon = LoadAppIcon(),
                 Text = "SNAD 音频桥",
                 Visible = true
@@ -313,6 +257,139 @@ namespace Snad
             _uiTimer = new System.Windows.Forms.Timer { Interval = 33 };   // ≈30fps
             _uiTimer.Tick += OnUiTick;
             _uiTimer.Start();
+
+            ResumeLayout(true);
+            LayoutTitleBar();
+            LayoutControlRow();
+        }
+
+        /// <summary>通道条的六项指标：固定标签与悬浮说明，数值由 OnUiTick 填。</summary>
+        private void BuildMetricLabels()
+        {
+            string[] labels = { "LATENCY", "BUFFER", "RX", "TX", "DROP", "UNDER" };
+            string[] units = { "ms", "ms", "fps", "fps", "帧", "次" };
+            string[] tips =
+            {
+                "端到端链路延迟估算（采集 + 网络 + 抖动缓冲 + 音频块），不含声卡自身延迟",
+                "抖动缓冲当前水位。接近容量会开始丢帧，接近零会欠载",
+                "手机端送入的帧率。应与采样率一致（44.1k 或 48k）",
+                "实际写入声卡的帧率。持续低于 RX 说明消费端跟不上",
+                "缓冲溢出而丢弃的帧数。非零说明水位偏高或突发过大",
+                "缓冲见底导致的欠载次数。非零说明水位偏低或调度抖动大"
+            };
+            for (int i = 0; i < _metrics.Count; i++)
+            {
+                _metrics[i].Label = labels[i];
+                _metrics[i].Unit = units[i];
+                _metrics[i].Tip = tips[i];
+                _metrics[i].Value = "—";
+                _metrics[i].Bar = -1;
+                // RX/TX 是"达到采样率才好"，其余是越低越好
+                _metrics[i].HigherIsWorse = (i != 2 && i != 3);
+            }
+        }
+
+        /// <summary>
+        /// 显式排版整个窗口。
+        ///
+        /// 为什么不用 Dock：WinForms 的停靠结果取决于控件在集合里的次序，
+        /// 实测 BringToFront 也无法可靠改变布局顺序，导致通道条跑到图上方。
+        /// 显式摆放虽然啰嗦，但结果完全可预测，也便于在检查工具里断言。
+        ///
+        /// 纵向分配：标题 40 / 图（弹性，最少 160）/ 通道条 88 / 控件行 52 / 日志（弹性，最少 90）。
+        /// </summary>
+        private void LayoutAll()
+        {
+            if (_titleBar == null || IsDisposed) return;
+
+            int w = ClientSize.Width;
+            int h = ClientSize.Height;
+            const int titleH = 40, metricsH = 88, controlsH = 92;   // controlsH 要容下滚轮的三行
+            const int logMinH = 90, graphMinH = 150;
+
+            // 两块弹性区域：图优先，日志保底
+            int fixedH = titleH + metricsH + controlsH;
+            int flexible = h - fixedH;
+            int graphH = flexible / 2 + 60;           // 图约占弹性部分的六成
+            if (graphH < graphMinH) graphH = graphMinH;
+            int logH = flexible - graphH;
+            if (logH < logMinH) { logH = logMinH; graphH = Math.Max(graphMinH, flexible - logMinH); }
+
+            _titleBar.Bounds = new Rectangle(0, 0, w, titleH);
+            _graphHost.Bounds = new Rectangle(0, titleH, w, graphH);
+            _metrics.Bounds = new Rectangle(0, titleH + graphH, w, metricsH);
+            _controlsRow.Bounds = new Rectangle(0, titleH + graphH + metricsH, w, controlsH);
+            _logHost.Bounds = new Rectangle(0, titleH + graphH + metricsH + controlsH, w,
+                                            Math.Max(10, h - (titleH + graphH + metricsH + controlsH)));
+
+            LayoutTitleBar();
+            LayoutControlRow();
+        }
+
+        /// <summary>标题条右侧的状态点、状态文字与采样率贴右对齐。</summary>
+        private void LayoutTitleBar()
+        {
+            if (_titleBar == null || _dot == null) return;
+            int right = _titleBar.ClientSize.Width - 16;
+            int rateW = _rateLabel.PreferredWidth > 0 ? _rateLabel.PreferredWidth : 70;
+            _rateLabel.Left = right - rateW;
+            _stateLabel.Left = _rateLabel.Left - 8 - _stateLabel.PreferredWidth;
+            _dot.Left = _stateLabel.Left - 14;
+            _dot.Top = (_titleBar.Height - _dot.Height) / 2;
+        }
+
+        /// <summary>控件行：开始与均衡器贴右，档位与设备在左。</summary>
+        /// <summary>
+        /// 控件行排版。
+        ///
+        /// 每个控件按自身高度垂直居中，而不是统一 Top——滚轮选择器收起时只有一行高，
+        /// 展开时会变高，写死 Top 会让它在展开过程中偏出中心。
+        /// 因此在滚轮的 Resize 事件里也调一次本方法。
+        /// </summary>
+        private void LayoutControlRow()
+        {
+            if (_startBtn == null || _startBtn.Parent == null) return;
+            var host = _startBtn.Parent;
+            int right = host.ClientSize.Width - host.Padding.Right;
+            int midY = host.ClientSize.Height / 2;
+
+            CenterInRow(_profileBox, midY);
+            CenterInRow(_deviceBox, midY);
+            CenterInRow(_startBtn, midY);
+            CenterInRow(_eqBtn, midY);
+
+            // 右侧两个按钮先定位
+            _eqBtn.Left = right - _eqBtn.Width;
+            _startBtn.Left = _eqBtn.Left - 8 - _startBtn.Width;
+
+            // 设备滚轮吃掉左侧剩余空间，并保证不与按钮重叠。
+            int deviceLeft = _profileBox.Left + _profileBox.Width + 10;
+            int deviceMax = _startBtn.Left - 10 - deviceLeft;
+            _deviceBox.Left = deviceLeft;
+            _deviceBox.Width = Math.Max(140, Math.Min(280, deviceMax));
+        }
+
+        private static void CenterInRow(Control c, int midY)
+        {
+            if (c == null) return;
+            c.Top = midY - c.Height / 2;
+        }
+
+        /// <summary>控件行必须高到能容下展开的滚轮，否则滚轮会被容器裁掉。</summary>
+        private void EnsureRowTallEnough()
+        {
+            if (_controlsRow == null) return;
+            int needed = Math.Max(
+                _profileBox != null ? _profileBox.Height : 0,
+                _deviceBox != null ? _deviceBox.Height : 0) + 16;
+            if (needed > _controlsRow.Height) _controlsRow.Height = needed;
+        }
+
+        /// <summary>收起所有展开的滚轮选择器。</summary>
+        private void CloseAllWheels()
+        {
+            if (_profileBox != null && _profileBox.IsOpen) _profileBox.Close();
+            if (_deviceBox != null && _deviceBox.IsOpen) _deviceBox.Close();
         }
 
         // ------------------------------------------------------------------ 配置与设备
@@ -326,47 +403,53 @@ namespace Snad
 
             string selected;
             _profiles = ProfileLibrary.Load(_cfgPath, out selected);
-            _profileBox.Items.Clear();
-            foreach (var kv in _profiles) _profileBox.Items.Add(kv.Key);
-            if (_profileBox.Items.Contains(selected)) _profileBox.SelectedItem = selected;
-            else if (_profileBox.Items.Count > 0) _profileBox.SelectedIndex = 0;
+
+            var names = new List<string>(_profiles.Keys);
+            _profileBox.Items = names.ToArray();
+            int si = names.IndexOf(selected);
+            _profileBox.SelectedIndex = si >= 0 ? si : (names.Count > 0 ? 0 : -1);
 
             // 把选中档位里保存的均衡器设置套到待用实例上，
             // 这样上次调好的 EQ 在下次启动时自动恢复。
             Profile sel;
-            if (_profiles.TryGetValue(selected, out sel)) ProfileLibrary.ApplyEq(sel, _idleEq);
+            if (_profiles.TryGetValue(selected, out sel))
+            {
+                ProfileLibrary.ApplyEq(sel, _idleEq);
+                _active = sel;
+            }
 
             RefreshDevices();
+            AppendLog("配置载入：" + _cfgPath + "（" + _profiles.Count + " 个档位，选中 " + selected + "）");
         }
 
         private void RefreshDevices()
         {
             _devices = WaveOut.ListDevices();
-            _deviceBox.Items.Clear();
             string defName = WaveOut.DefaultDeviceName();
-            int defIdx = -1;
-            if (!string.IsNullOrEmpty(defName))
-            {
-                var m = _devices.Find(d => string.Equals(d.Name, defName, StringComparison.OrdinalIgnoreCase));
-                if (m.Name != null) defIdx = m.Index;
-                else
-                {
-                    string pre = defName.Substring(0, Math.Min(12, defName.Length));
-                    m = _devices.Find(d => d.Name.StartsWith(pre, StringComparison.OrdinalIgnoreCase));
-                    if (m.Name != null) defIdx = m.Index;
-                }
-            }
+            int defIdx = FindDeviceByName(defName);
 
-            _deviceBox.Items.Add("跟随系统默认");
-            foreach (var d in _devices)
-                _deviceBox.Items.Add("[" + d.Index + "] " + d.Name);
+            var items = new List<string> { "跟随系统默认" };
+            foreach (var d in _devices) items.Add("[" + d.Index + "] " + d.Name);
+            _deviceBox.Items = items.ToArray();
 
             if (_deviceIndex < 0) _deviceBox.SelectedIndex = 0;
-            else _deviceBox.SelectedIndex = Math.Min(_deviceBox.Items.Count - 1, _deviceIndex + 1);
+            else _deviceBox.SelectedIndex = Math.Min(items.Count - 1, _deviceIndex + 1);
 
-            _statusLabel.Text = defIdx >= 0
-                ? "系统默认：" + _devices[defIdx].Name
-                : "未识别系统默认设备";
+            AppendLog(defIdx >= 0
+                ? "系统默认输出：" + _devices[defIdx].Name
+                : "未识别系统默认输出设备");
+        }
+
+        /// <summary>按名字找设备。默认设备名可能被截断（MMDevice 与 waveOut 的取名方式不同），
+        /// 因此先精确匹配再退回前缀匹配。</summary>
+        private int FindDeviceByName(string name)
+        {
+            if (string.IsNullOrEmpty(name) || _devices == null) return -1;
+            var m = _devices.Find(d => string.Equals(d.Name, name, StringComparison.OrdinalIgnoreCase));
+            if (m.Name != null) return m.Index;
+            string pre = name.Substring(0, Math.Min(12, name.Length));
+            m = _devices.Find(d => d.Name.StartsWith(pre, StringComparison.OrdinalIgnoreCase));
+            return m.Name != null ? m.Index : -1;
         }
 
         private void OnDeviceChanged(object sender, EventArgs e)
@@ -377,8 +460,8 @@ namespace Snad
 
         private void OnProfileChanged(object sender, EventArgs e)
         {
-            string name = _profileBox.SelectedItem as string;
-            if (name == null || !_profiles.ContainsKey(name)) return;
+            string name = _profileBox.SelectedItem;
+            if (name == null || _profiles == null || !_profiles.ContainsKey(name)) return;
 
             // 换档位也换调音：不同用途需要不同 EQ（游戏突出脚步、音乐要平直），
             // 因此每个档位各自保存一份均衡器设置。
@@ -390,18 +473,17 @@ namespace Snad
 
             _active = next;
 
-            // 正在运行则重启以应用新参数（缓冲尺寸需要重建）
             if (_receiver != null)
             {
-                AppendStatsLine("切换档位到 " + name + "，重启接收…");
+                AppendLog("切换档位到 " + name + "，重启接收…");
                 StopReceiver();
-                // StopReceiver 会清空 _receiver，因此这里重新套用 EQ 到待用实例
                 ProfileLibrary.ApplyEq(_active, _idleEq);
                 StartReceiver();
             }
             else
             {
                 ProfileLibrary.ApplyEq(_active, _idleEq);
+                _graph.Invalidate();
             }
         }
 
@@ -417,7 +499,7 @@ namespace Snad
         {
             if (_active == null)
             {
-                string sel = _profileBox.SelectedItem as string;
+                string sel = _profileBox.SelectedItem;
                 if (sel != null && _profiles.ContainsKey(sel)) _active = _profiles[sel];
             }
             if (_active == null) { MessageBox.Show("没有可用的档位配置。"); return; }
@@ -426,19 +508,7 @@ namespace Snad
             int dev = _deviceIndex;
             if (dev < 0)
             {
-                string defName = WaveOut.DefaultDeviceName();
-                int defIdx = -1;
-                if (!string.IsNullOrEmpty(defName))
-                {
-                    var m = _devices.Find(d => string.Equals(d.Name, defName, StringComparison.OrdinalIgnoreCase));
-                    if (m.Name != null) defIdx = m.Index;
-                    else
-                    {
-                        string pre = defName.Substring(0, Math.Min(12, defName.Length));
-                        m = _devices.Find(d => d.Name.StartsWith(pre, StringComparison.OrdinalIgnoreCase));
-                        if (m.Name != null) defIdx = m.Index;
-                    }
-                }
+                int defIdx = FindDeviceByName(WaveOut.DefaultDeviceName());
                 if (defIdx >= 0)
                 {
                     IntPtr probe;
@@ -446,7 +516,7 @@ namespace Snad
                     if (rc == 0)
                     {
                         dev = defIdx;
-                        AppendStatsLine("输出：跟随系统默认 [" + defIdx + "] " + _devices[defIdx].Name);
+                        AppendLog("输出：跟随系统默认 [" + defIdx + "] " + _devices[defIdx].Name);
                     }
                     else
                     {
@@ -454,24 +524,24 @@ namespace Snad
                         if (vm.Name != null)
                         {
                             dev = vm.Index;
-                            AppendStatsLine("系统默认设备被占用（rc=" + rc + "），改用 Voicemeeter Input 混音输出");
+                            AppendLog("系统默认设备被占用（rc=" + rc + "），改用 Voicemeeter Input 混音输出");
                         }
                         else
                         {
                             dev = defIdx;
-                            AppendStatsLine("系统默认设备被占用且无 Voicemeeter Input，仍尝试默认设备");
+                            AppendLog("系统默认设备被占用且无 Voicemeeter Input，仍尝试默认设备");
                         }
                     }
                 }
                 else
                 {
                     dev = 0;
-                    AppendStatsLine("未识别系统默认设备，使用 [0] " + (_devices.Count > 0 ? _devices[0].Name : "?"));
+                    AppendLog("未识别系统默认设备，使用 [0] " + (_devices.Count > 0 ? _devices[0].Name : "?"));
                 }
             }
             else
             {
-                AppendStatsLine("输出：指定设备 [" + dev + "] " + _devices[dev].Name);
+                AppendLog("输出：指定设备 [" + dev + "] " + _devices[dev].Name);
             }
 
             _runCts = new CancellationTokenSource();
@@ -488,15 +558,19 @@ namespace Snad
             }
             catch (Exception ex)
             {
-                AppendStatsLine("复制均衡器设置失败：" + ex.Message);
+                AppendLog("复制均衡器设置失败：" + ex.Message);
             }
 
+            // 图上的 EQ 直接操作接收器的实例，这样拖动即时生效
+            _graph.Eq = _receiver.Equalizer;
+
             var r = _receiver;
-            _rxThread = new Thread(() => { try { r.Run(); } catch (Exception ex) { AppendStatsLine("接收线程异常：" + ex.Message); } })
+            _rxThread = new Thread(() =>
             {
-                IsBackground = true,
-                Name = "snad-ui-rx"
-            };
+                try { r.Run(); }
+                catch (Exception ex) { BeginInvoke(new Action(() => AppendLog("接收线程异常：" + ex.Message))); }
+            })
+            { IsBackground = true, Name = "snad-ui-rx" };
             _rxThread.Start();
 
             // 启动信标广播：手机端据此自动发现本机，用户无需知道 IP。
@@ -506,73 +580,95 @@ namespace Snad
             {
                 var key = SnadBeacon.DeriveKey(SnadSecret.Psk);
                 _beacon = new BeaconBroadcaster(Program.MachineDeviceId, Program.DefaultPort, key, 2000,
-                    m => AppendStatsLine("信标：" + m));
+                    m => BeginInvoke(new Action(() => AppendLog("信标：" + m))));
                 _beacon.Start();
-                AppendStatsLine("信标广播已启动：device=" + Program.MachineDeviceId +
-                                "，KeyId=" + SnadSecret.KeyId + "（手机端此值必须一致）");
+                AppendLog("信标广播已启动：device=" + Program.MachineDeviceId +
+                          "，KeyId=" + SnadSecret.KeyId + "（手机端此值必须一致）");
             }
             catch (Exception ex)
             {
-                AppendStatsLine("信标广播启动失败：" + ex.GetType().Name + ": " + ex.Message +
-                                "（手机端需手填地址）");
+                AppendLog("信标广播启动失败：" + ex.GetType().Name + ": " + ex.Message + "（手机端需手填地址）");
             }
 
             _startBtn.Text = "停止";
-            _startBtn.FlatAppearance.BorderColor = Warn;
-            _statusLabel.Text = "运行中 · 档位 " + _active.Name;
-            _tray.Text = "SNAD 音频桥 · 运行中";
-            AppendStatsLine("已启动：档位 " + _active.Name + "，预计链路延迟约 " +
-                            _active.EstimatedPipelineLatencyMs() + " ms（不含音频设备自身延迟）");
+            _eqBtn.Enabled = true;
+            AppendLog("已启动：档位 " + _active.Name + "，预计链路延迟约 " +
+                      _active.EstimatedPipelineLatencyMs() + " ms（不含声卡自身延迟）");
+            UpdateRunState();
         }
 
         private void StopReceiver()
         {
             try { if (_receiver != null) _receiver.Stop(); }
-            catch (Exception ex) { AppendStatsLine("停止时异常：" + ex.Message); }
+            catch (Exception ex) { AppendLog("停止时异常：" + ex.Message); }
             try { if (_rxThread != null && _rxThread.IsAlive) _rxThread.Join(1500); }
-            catch (Exception ex) { AppendStatsLine("等待线程退出异常：" + ex.Message); }
+            catch (Exception ex) { AppendLog("等待线程退出异常：" + ex.Message); }
             try { if (_receiver != null) _receiver.Dispose(); }
-            catch (Exception ex) { AppendStatsLine("释放接收器异常：" + ex.Message); }
+            catch (Exception ex) { AppendLog("释放接收器异常：" + ex.Message); }
 
             // 停止信标广播，避免接收停止后手机仍能"发现"一个不再工作的电脑
-            try
-            {
-                if (_beacon != null) { _beacon.Dispose(); _beacon = null; }
-            }
-            catch (Exception ex) { AppendStatsLine("停止信标广播异常：" + ex.Message); }
+            try { if (_beacon != null) { _beacon.Dispose(); _beacon = null; } }
+            catch (Exception ex) { AppendLog("停止信标广播异常：" + ex.Message); }
 
             _receiver = null;
             _rxThread = null;
             if (_runCts != null) { _runCts.Dispose(); _runCts = null; }
 
+            // 图回到"待用"实例，保持 EQ 仍可编辑
+            _graph.Eq = _idleEq;
+
             _startBtn.Text = "开始";
-            _startBtn.FlatAppearance.BorderColor = Accent;
-            _statusLabel.Text = "已停止";
-            _tray.Text = "SNAD 音频桥";
-            _latencyLabel.Text = "延迟 —";
-            AppendStatsLine("已停止");
+            AppendLog("已停止");
+            UpdateRunState();
         }
 
-        // ------------------------------------------------------------------ 音频与刷新
+        /// <summary>刷新标题条状态与通道条的未运行态。</summary>
+        private void UpdateRunState()
+        {
+            bool running = _receiver != null;
+            _stateLabel.Text = running ? "LIVE" : "IDLE";
+            _stateLabel.ForeColor = running ? Theme.Success : Theme.TextTertiary;
+            _dot.BackColor = running ? Theme.Success : Theme.TextTertiary;
+            _tray.Text = running ? "SNAD 音频桥 · 运行中" : "SNAD 音频桥";
+
+            if (!running)
+            {
+                for (int i = 0; i < _metrics.Count; i++)
+                {
+                    _metrics[i].Value = "—";
+                    _metrics[i].Bar = -1;
+                    _metrics[i].Alert = false;
+                }
+                _rateLabel.Text = "";
+            }
+            LayoutTitleBar();
+            _metrics.Invalidate();
+        }
+
+        // ------------------------------------------------------------------ 均衡器
+
+        /// <summary>图上的 EQ 节点被拖动：写回档位并落盘（拖动结束时）。</summary>
+        private void OnGraphBandChanged(int band, double gainDb)
+        {
+            SaveEqToProfile();
+        }
+
+        private void OnGraphBandReset(int band)
+        {
+            AppendLog("频段 " + _idleEq.Bands[band].Label + " 已归零");
+            SaveEqToProfile();
+        }
 
         /// <summary>
-        /// 打开均衡器窗口。
-        /// _receiver 为空（未启动）时也能打开：此时改的是模板实例，
-        /// 启动后会被复制到接收器的均衡器上，因此可以先调好再开始。
+        /// 把当前 EQ 设置写回所在档位并落盘。
+        /// 只改 eq / eqpreamp / eqgains 三个键，不动配置文件里其他内容与注释。
         /// </summary>
-        private void OnOpenEq(object sender, EventArgs e)
+        private void SaveEqToProfile()
         {
             try
             {
                 var eq = _receiver != null ? _receiver.Equalizer : _idleEq;
-                using (var f = new EqForm(eq, AppendStatsLine))
-                {
-                    f.ShowDialog(this);
-                }
-
-                // 关闭窗口时把设置写回当前档位并落盘，下次启动自动恢复。
-                // 只改 eq / eqpreamp / eqgains 三个键，不动文件里其他内容和注释。
-                string name = _profileBox.SelectedItem as string;
+                string name = _profileBox.SelectedItem;
                 if (string.IsNullOrEmpty(name)) name = _active != null ? _active.Name : "balanced";
 
                 Profile p;
@@ -581,22 +677,37 @@ namespace Snad
                     ProfileLibrary.CaptureEq(p, eq);
                     ProfileLibrary.SaveEq(_cfgPath, name, eq);
                 }
-                else
-                {
-                    AppendStatsLine("未找到档位 " + name + "，均衡器设置未保存");
-                }
             }
             catch (Exception ex)
             {
-                AppendStatsLine("打开均衡器失败：" + ex.GetType().Name + ": " + ex.Message);
+                AppendLog("保存均衡器设置失败：" + ex.GetType().Name + ": " + ex.Message);
             }
         }
 
         /// <summary>
-        /// 未启动时使用的均衡器实例。启动后把它的设置复制给接收器的均衡器，
-        /// 这样"先调 EQ 再点开始"也能生效。
+        /// 打开独立的均衡器窗口。
+        /// 主界面的图上已可直接拖动频段，这个窗口用于预设与前置增益这类
+        /// 在图上不好表达的操作。
         /// </summary>
-        private readonly Equalizer _idleEq = new Equalizer();
+        private void OnOpenEq(object sender, EventArgs e)
+        {
+            try
+            {
+                var eq = _receiver != null ? _receiver.Equalizer : _idleEq;
+                using (var f = new EqForm(eq, AppendLog))
+                {
+                    f.ShowDialog(this);
+                }
+                SaveEqToProfile();
+                _graph.Invalidate();
+            }
+            catch (Exception ex)
+            {
+                AppendLog("打开均衡器失败：" + ex.GetType().Name + ": " + ex.Message);
+            }
+        }
+
+        // ------------------------------------------------------------------ 音频与刷新
 
         private void OnAudioBlock(byte[] pcm, int sampleRate, int channels)
         {
@@ -613,38 +724,81 @@ namespace Snad
         private void OnUiTick(object sender, EventArgs e)
         {
             byte[] pcm = null;
+            int bytes = 0, rate = 0, ch = 0;
             lock (_audioGate)
             {
                 if (_pendingAudio != null)
                 {
                     pcm = _pendingAudio;
+                    bytes = _pendingBytes; rate = _pendingRate; ch = _pendingCh;
                     _pendingAudio = null;
                 }
             }
             if (pcm != null)
             {
-                _analyzer.Feed(pcm, pcm.Length, _pendingCh, _pendingRate);
-                _spectrum.Invalidate();
-                _wave.Invalidate();
+                _analyzer.Feed(pcm, bytes, ch, rate);
+                _graph.Invalidate();
             }
 
-            if (_receiver != null)
-            {
-                var m = _receiver.Snapshot();
-                int pipeline = 21 + 8 + m.TargetMs + m.BlockMs;
-                _latencyLabel.Text = string.Format(CultureInfo.InvariantCulture,
-                    "链路延迟 ≈ {0} ms   （缓冲 {1} / 目标 {2} ms，每块 {3} ms）  档位 {4}",
-                    pipeline, m.BufferMs, m.TargetMs, m.BlockMs, m.ProfileName);
+            if (_receiver == null) return;
 
-                bool unhealthy = m.FramesDropped > 0 || m.Underruns > 0;
-                _latencyLabel.ForeColor = unhealthy ? AccentWarm : Ok;
-            }
+            var m = _receiver.Snapshot();
+            UpdateMetrics(m);
+
+            _rateLabel.Text = m.SampleRate > 0
+                ? (m.SampleRate / 1000.0).ToString("0.0", CultureInfo.InvariantCulture) + " kHz"
+                : "";
+
+            // 异常时状态点闪烁——静止的指示灯容易被忽略
+            bool bad = m.FramesDropped > 0 || m.Underruns > 0;
+            _blinkTick++;
+            if (bad && _blinkTick % 8 == 0) _blinkOn = !_blinkOn;
+            if (!bad) _blinkOn = true;
+            _dot.BackColor = bad ? (_blinkOn ? Theme.Warning : Theme.BgPanel)
+                                 : Theme.Success;
         }
 
-        private void AppendStatsLine(string s)
+        /// <summary>把快照填进通道条。阈值与配色语义在这里统一决定。</summary>
+        private void UpdateMetrics(SnadReceiver.Metrics m)
         {
-            if (_statsBox == null) return;
-            _statsBox.AppendText(DateTime.Now.ToString("HH:mm:ss") + "  " + s + Environment.NewLine);
+            // 延迟：与 Profile 的估算口径一致（采集 + 网络 + 抖动缓冲 + 音频块）
+            int pipeline = 21 + 8 + m.TargetMs + m.BlockMs;
+            _metrics[0].Value = pipeline.ToString(CultureInfo.InvariantCulture);
+            _metrics[0].Unit = "ms";
+            _metrics[0].Bar = Math.Min(1.0, pipeline / 400.0);
+
+            // 缓冲水位：以容量为满刻度，接近容量即告警
+            double bufRatio = m.RingCapacityFrames > 0
+                ? (double)m.BufferFrames / m.RingCapacityFrames : 0;
+            _metrics[1].Value = m.BufferMs.ToString(CultureInfo.InvariantCulture);
+            _metrics[1].Unit = "ms";
+            _metrics[1].Bar = Math.Min(1.0, bufRatio);
+            _metrics[1].Alert = bufRatio > 0.9;
+
+            int sr = m.SampleRate > 0 ? m.SampleRate : 48000;
+            _metrics[2].Value = ((long)m.RateIn).ToString(CultureInfo.InvariantCulture);
+            _metrics[2].Bar = Math.Min(1.0, m.RateIn / sr);
+
+            _metrics[3].Value = ((long)m.RateWritten).ToString(CultureInfo.InvariantCulture);
+            _metrics[3].Bar = Math.Min(1.0, m.RateWritten / sr);
+
+            _metrics[4].Value = m.FramesDropped.ToString(CultureInfo.InvariantCulture);
+            _metrics[4].Bar = m.FramesDropped == 0 ? 0 : 1.0;
+            _metrics[4].Alert = m.FramesDropped > 0;
+
+            _metrics[5].Value = m.Underruns.ToString(CultureInfo.InvariantCulture);
+            _metrics[5].Bar = m.Underruns == 0 ? 0 : 1.0;
+            _metrics[5].Alert = m.Underruns > 0;
+
+            _metrics.Invalidate();
+        }
+
+        /// <summary>写事件日志。所有运行期消息都汇总到这里，便于事后排查。</summary>
+        private void AppendLog(string s)
+        {
+            if (_log == null || _log.IsDisposed) return;
+            if (_log.InvokeRequired) { _log.BeginInvoke(new Action<string>(AppendLog), s); return; }
+            _log.Append(s);
         }
 
         protected override void OnFormClosing(FormClosingEventArgs e)
@@ -652,157 +806,6 @@ namespace Snad
             StopReceiver();
             if (_tray != null) _tray.Visible = false;
             base.OnFormClosing(e);
-        }
-    }
-
-    // ------------------------------------------------------------------ 频谱面板
-
-    internal sealed class SpectrumPanel : Panel
-    {
-        private readonly SpectrumAnalyzer _an;
-        public SpectrumPanel(SpectrumAnalyzer an)
-        {
-            _an = an;
-            DoubleBuffered = true;
-            BackColor = Color.FromArgb(28, 32, 40);
-            ResizeRedraw = true;
-        }
-
-        protected override void OnPaint(PaintEventArgs e)
-        {
-            var g = e.Graphics;
-            g.SmoothingMode = SmoothingMode.None;
-            int w = Width, h = Height;
-            g.Clear(BackColor);
-
-            // 网格与刻度
-            using (var pen = new Pen(Color.FromArgb(46, 52, 64)))
-            {
-                for (int db = 0; db >= -96; db -= 16)
-                {
-                    int y = DbToY(db, h);
-                    g.DrawLine(pen, 0, y, w, y);
-                }
-            }
-            using (var f = new Font("Consolas", 7.5f))
-            using (var br = new SolidBrush(Color.FromArgb(110, 120, 135)))
-            {
-                for (int db = 0; db >= -96; db -= 24)
-                    g.DrawString(db + " dB", f, br, 3, DbToY(db, h) + 1);
-            }
-
-            var bars = _an.BarsDb;
-            var peaks = _an.PeaksDb;
-            int n = bars.Length;
-            if (n == 0) return;
-            float bw = (float)w / n;
-            bool silent = _an.IsSilent();
-
-            for (int i = 0; i < n; i++)
-            {
-                int y = DbToY(bars[i], h);
-                int bh = h - y;
-                if (bh < 1) bh = 1;
-                float x = i * bw;
-                float bwFill = Math.Max(1f, bw - 1f);
-
-                if (silent)
-                {
-                    // 静默：画一条贴底的细柱，用暗色，避免"没声音却满屏红色"
-                    using (var br = new SolidBrush(Color.FromArgb(52, 60, 74)))
-                        g.FillRectangle(br, x, h - 3, bwFill, 3);
-                    continue;
-                }
-
-                // foobar2000 风格：绿→黄→红的渐变柱
-                var barRect = new RectangleF(x, 0, bwFill, h);
-                using (var lg = new LinearGradientBrush(barRect,
-                    Color.FromArgb(60, 200, 130), Color.FromArgb(250, 90, 90),
-                    LinearGradientMode.Vertical))
-                {
-                    // Blend 不是 IDisposable，直接赋值即可（它是普通类）
-                    lg.Blend = new Blend
-                    {
-                        Positions = new[] { 0f, 0.55f, 0.8f, 1f },
-                        Factors = new[] { 1f, 0.85f, 0.5f, 0.12f }
-                    };
-                    g.FillRectangle(lg, x, y, bwFill, bh);
-                }
-
-                // 峰值线
-                int py = DbToY(peaks[i], h);
-                using (var p = new Pen(Color.FromArgb(220, 235, 250)))
-                    g.DrawLine(p, x, py, x + bwFill, py);
-            }
-
-            if (silent)
-            {
-                // 偏右上角放置，避免压住左下角的频率刻度
-                using (var f = new Font("Consolas", 8.5f))
-                using (var br = new SolidBrush(Color.FromArgb(96, 106, 122)))
-                {
-                    var sz = g.MeasureString("无信号", f);
-                    g.DrawString("无信号", f, br, w - sz.Width - 10, 8);
-                }
-            }
-
-            using (var f = new Font("Consolas", 7.5f))
-            using (var br = new SolidBrush(Color.FromArgb(110, 120, 135)))
-            {
-                g.DrawString("30Hz", f, br, 2, h - 14);
-                g.DrawString("1kHz", f, br, w / 2f - 12, h - 14);
-                g.DrawString("16kHz", f, br, w - 40, h - 14);
-            }
-        }
-
-        private static int DbToY(double db, int h)
-        {
-            // 显示范围 -96..0 dB（与 SpectrumAnalyzer.FloorDb 一致）
-            double lo = SpectrumAnalyzer.FloorDb;
-            double t = (db - lo) / (0.0 - lo);
-            if (t < 0) t = 0;
-            if (t > 1) t = 1;
-            return (int)(h - t * (h - 4)) + 2;
-        }
-    }
-
-    // ------------------------------------------------------------------ 波形面板
-
-    internal sealed class WavePanel : Panel
-    {
-        private readonly SpectrumAnalyzer _an;
-        public WavePanel(SpectrumAnalyzer an)
-        {
-            _an = an;
-            DoubleBuffered = true;
-            BackColor = Color.FromArgb(24, 28, 35);
-            ResizeRedraw = true;
-        }
-
-        protected override void OnPaint(PaintEventArgs e)
-        {
-            var g = e.Graphics;
-            int w = Width, h = Height;
-            g.Clear(BackColor);
-
-            using (var pen = new Pen(Color.FromArgb(46, 52, 64)))
-                g.DrawLine(pen, 0, h / 2, w, h / 2);
-
-            var wave = _an.Waveform;
-            int n = wave.Length;
-            if (n < 2) return;
-
-            var pts = new PointF[n];
-            float mid = h / 2f;
-            float amp = (h / 2f) - 4f;
-            for (int i = 0; i < n; i++)
-            {
-                float x = (float)i / (n - 1) * w;
-                float y = mid - (float)wave[i] * amp;
-                pts[i] = new PointF(x, y);
-            }
-            using (var pen = new Pen(Color.FromArgb(120, 215, 255), 1.2f))
-                g.DrawLines(pen, pts);
         }
     }
 
@@ -855,11 +858,9 @@ namespace Snad
 
                 // 提高系统计时器精度：播放线程每个音频块仅十几毫秒，
                 // 默认 15.6 ms 的调度粒度会直接拖慢消费速率。
-                // 控制台版在 Program.Main 里做同样的事，GUI 版必须自己做。
                 bool timerRaised = NativeTimer.Begin();
 
                 var form = new MainForm();
-                System.Diagnostics.Debug.WriteLine("DPI 感知：" + dpiMode);
 
                 // 启动时把实际尺寸与 DPI 落盘，便于核对布局是否被系统压缩。
                 // 这份自述比从外部推断可靠：外部工具看到的 DPI 可能与进程内不同。
@@ -870,13 +871,14 @@ namespace Snad
                     var wa = Screen.PrimaryScreen != null ? Screen.PrimaryScreen.WorkingArea : Rectangle.Empty;
                     using (var g = form.CreateGraphics())
                     {
-                        float dpiX = g.DpiX, dpiY = g.DpiY;
                         string line = string.Format(CultureInfo.InvariantCulture,
                             "{0:yyyy-MM-dd HH:mm:ss} dpiMode={1} graphicsDpi={2}x{3} " +
-                            "workingArea={4}x{5} formSize={6}x{7} minSize={8}x{9}",
-                            DateTime.Now, dpiMode, dpiX, dpiY,
+                            "workingArea={4}x{5} formSize={6}x{7} minSize={8}x{9} " +
+                            "fonts={10}/{11}/{12}",
+                            DateTime.Now, dpiMode, g.DpiX, g.DpiY,
                             wa.Width, wa.Height, form.Width, form.Height,
-                            form.MinimumSize.Width, form.MinimumSize.Height);
+                            form.MinimumSize.Width, form.MinimumSize.Height,
+                            Theme.MetricFontName, Theme.UiFontName, Theme.MonoFontName);
                         File.AppendAllText(Path.Combine(dir, "gui-startup.log"), line + Environment.NewLine);
                     }
                 }

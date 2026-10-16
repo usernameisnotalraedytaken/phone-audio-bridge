@@ -11,6 +11,7 @@
 // 生成 main.png 与 eq.png
 
 using System;
+using System.Collections.Generic;
 using System.Drawing;
 using System.Drawing.Imaging;
 using System.IO;
@@ -46,40 +47,75 @@ namespace Snad
                 f.Location = new Point(-5000, -5000);
                 f.Show();
                 Pump(10);
+
+                // 未启动时读数条是空的，截图会显得又空又冷，看不出真实观感。
+                // 因此填入典型运行值，并往频谱分析器喂一段合成音频。
+                FillSyntheticMetrics(f);
+                FeedSyntheticSpectrum(f);
+                Pump(30);        // 让频谱的缓动收敛到位
+
                 string p = Path.Combine(dir, "main.png");
                 Render(f, p);
                 Console.WriteLine("主界面 " + f.Width + "x" + f.Height + " -> " + p);
 
-                // 检查均衡器按钮是否真的可见、未被其他控件遮挡
-                var btn = FindEqButton(f);
-                if (btn == null)
+                // 检查关键控件是否都在窗口内、尺寸正常。
+                // 版式改成标题条+图+通道条+控件行后，用的是 FlatButton/FlatCombo/MetricStrip
+                // 这些自绘控件，按类型遍历统计比按文本查找可靠。
+                var buttons = new List<Control>();
+                var combos = new List<Control>();
+                var strips = new List<Control>();
+                var graphs = new List<Control>();
+                CollectByType(f, typeof(FlatButton), buttons);
+                CollectByType(f, typeof(WheelSelector), combos);
+                CollectByType(f, typeof(MetricStrip), strips);
+                CollectByType(f, typeof(SpectrumGraph), graphs);
+
+                Console.WriteLine("  自绘按钮 " + buttons.Count + " 个，滚轮选择器 " + combos.Count +
+                                  " 个，通道条 " + strips.Count + " 个，频谱图 " + graphs.Count + " 个");
+
+                // 滚轮选择器必须是收起态（单行），展开态会占三行并压到别的区域
+                foreach (var c in combos)
                 {
-                    Console.WriteLine("  [失败] 未找到均衡器按钮");
-                    failures++;
-                }
-                else
-                {
-                    Console.WriteLine("  均衡器按钮位置 " + btn.Left + "," + btn.Top +
-                                      " 尺寸 " + btn.Width + "x" + btn.Height +
-                                      " 可见=" + btn.Visible);
-                    if (btn.Width < 20 || btn.Height < 20)
+                    var w = c as WheelSelector;
+                    var tl = f.PointToClient(w.PointToScreen(Point.Empty));
+                    Console.WriteLine("    滚轮 \"" + (w.SelectedItem ?? "?") + "\" 位置 " + tl.X + "," + tl.Y +
+                                      " 尺寸 " + w.Width + "x" + w.Height +
+                                      " 展开中=" + w.IsOpen);
+                    if (w.Height > 40)
                     {
-                        Console.WriteLine("  [失败] 按钮尺寸异常");
+                        Console.WriteLine("  [失败] 滚轮启动时不应处于展开态（高度 " + w.Height + "）");
                         failures++;
                     }
-                    // 检查按钮右边缘是否在窗口内
-                    var screenPt = f.PointToClient(btn.PointToScreen(new Point(btn.Width - 1, btn.Height / 2)));
-                    if (screenPt.X >= f.ClientSize.Width)
+                }
+
+                int before = failures;
+                if (buttons.Count < 2) { Console.WriteLine("  [失败] 按钮不足（应至少 开始 + 均衡器）"); failures++; }
+                if (combos.Count < 2) { Console.WriteLine("  [失败] 滚轮选择器不足（应至少 档位 + 输出设备）"); failures++; }
+                if (strips.Count != 1) { Console.WriteLine("  [失败] 未找到通道条"); failures++; }
+                if (graphs.Count != 1) { Console.WriteLine("  [失败] 未找到频谱图"); failures++; }
+
+                // 每个控件都必须完整落在窗口客户区内，否则会被裁切
+                var all = new List<Control>();
+                all.AddRange(buttons); all.AddRange(combos); all.AddRange(strips); all.AddRange(graphs);
+                foreach (var c in all)
+                {
+                    var tl = f.PointToClient(c.PointToScreen(Point.Empty));
+                    int right = tl.X + c.Width, bottom = tl.Y + c.Height;
+                    if (right > f.ClientSize.Width + 1 || bottom > f.ClientSize.Height + 1 ||
+                        tl.X < -1 || tl.Y < -1)
                     {
-                        Console.WriteLine("  [失败] 按钮超出窗口右边界（" + screenPt.X + " >= " + f.ClientSize.Width + "）");
+                        Console.WriteLine("  [失败] " + c.GetType().Name + " 超出窗口：位置 " +
+                                          tl.X + "," + tl.Y + " 尺寸 " + c.Width + "x" + c.Height +
+                                          "（客户区 " + f.ClientSize.Width + "x" + f.ClientSize.Height + "）");
                         failures++;
                     }
-                    else
+                    if (c.Width < 8 || c.Height < 8)
                     {
-                        Console.WriteLine("  [通过] 按钮完整位于窗口内（右边缘 x=" + screenPt.X +
-                                          "，窗口宽 " + f.ClientSize.Width + "）");
+                        Console.WriteLine("  [失败] " + c.GetType().Name + " 尺寸异常 " + c.Width + "x" + c.Height);
+                        failures++;
                     }
                 }
+                if (failures == before) Console.WriteLine("  [通过] 关键控件都在窗口内且尺寸正常");
 
                 f.Close();
                 f.Dispose();
@@ -145,6 +181,93 @@ namespace Snad
             return failures == 0 ? 0 : 1;
         }
 
+        /// <summary>
+        /// 往主界面的通道条里填一组典型运行值，用于渲染"运行中"的观感。
+        ///
+        /// 未启动时这些格子是空的，截图会显得又空又冷——那不代表控件本身难看，
+        /// 只是没有数据。要让界面检查有意义，就得给它数据。
+        /// 数值取自真机实测（48kHz、balanced 档、稳态无丢帧）。
+        /// </summary>
+        private static void FillSyntheticMetrics(Control root)
+        {
+            var strips = new List<Control>();
+            CollectByType(root, typeof(MetricStrip), strips);
+            if (strips.Count == 0) return;
+
+            var s = strips[0] as MetricStrip;
+            if (s == null || s.Count < 6) return;
+
+            s[0].Value = "148.0"; s[0].Bar = 0.37;     // 延迟 148ms
+            s[1].Value = "62.4"; s[1].Bar = 0.52;      // 缓冲 62ms / 容量 150ms
+            s[2].Value = "48107"; s[2].Bar = 1.0; s[2].HigherIsWorse = false;
+            s[3].Value = "48031"; s[3].Bar = 1.0; s[3].HigherIsWorse = false;
+            s[4].Value = "0"; s[4].Bar = 0;
+            s[5].Value = "0"; s[5].Bar = 0;
+
+            // 标题条的状态点与采样率也一并填上，否则渲染出来是 IDLE
+            var labels = new List<Control>();
+            CollectByType(root, typeof(Label), labels);
+            foreach (var c in labels)
+            {
+                var l = c as Label;
+                if (l == null) continue;
+                if (l.Text == "IDLE") { l.Text = "LIVE"; l.ForeColor = Theme.Success; }
+                else if (string.IsNullOrEmpty(l.Text)) l.Text = "48.0 kHz";
+            }
+            s.Invalidate();
+        }
+
+        /// <summary>
+        /// 往主界面的频谱分析器喂一段合成音频，让频谱在截图里也有内容。
+        ///
+        /// 走真实通路（Feed -> FFT -> BarsDb），不是往数据里塞假数字——
+        /// 后者验证不了绘制路径。泛音列 + 宽带噪声能产生自然的谱形与高频滚降。
+        /// </summary>
+        private static void FeedSyntheticSpectrum(Control root)
+        {
+            // _analyzer 是 MainForm 的私有字段，这里用反射取；
+            // 检查工具本就是诊断用途，不值得为它开放内部接口。
+            var fi = root.GetType().GetField("_analyzer",
+                System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic);
+            if (fi == null)
+            {
+                Console.WriteLine("  提示：未找到 _analyzer，频谱将为空");
+                return;
+            }
+            var an = fi.GetValue(root) as SpectrumAnalyzer;
+            if (an == null) return;
+
+            var rnd = new Random(20261017);
+            const int frames = 2048, sr = 48000;
+            double[] partials = { 110, 220, 330, 440, 660, 880, 1320, 1760, 2640, 3520, 5280 };
+            double[] gains = { 1.0, 0.72, 0.5, 0.62, 0.34, 0.4, 0.22, 0.26, 0.14, 0.1, 0.06 };
+            var phase = new double[partials.Length];
+            for (int p = 0; p < phase.Length; p++) phase[p] = rnd.NextDouble() * Math.PI * 2;
+
+            var pcm = new byte[frames * 2 * 2];
+            an.Reset(sr, 2);
+            for (int k = 0; k < 60; k++)
+            {
+                for (int i = 0; i < frames; i++)
+                {
+                    double t = 1.0 / sr, v = 0;
+                    for (int p = 0; p < partials.Length; p++)
+                    {
+                        v += gains[p] * Math.Sin(phase[p]);
+                        phase[p] += 2 * Math.PI * partials[p] * t;
+                    }
+                    v += (rnd.NextDouble() - 0.5) * 0.10;
+                    int s = (int)(v * 2600);
+                    if (s > 32767) s = 32767; else if (s < -32768) s = -32768;
+                    pcm[i * 4] = (byte)(s & 0xFF);
+                    pcm[i * 4 + 1] = (byte)((s >> 8) & 0xFF);
+                    pcm[i * 4 + 2] = pcm[i * 4];
+                    pcm[i * 4 + 3] = pcm[i * 4 + 1];
+                }
+                an.Feed(pcm, pcm.Length, 2, sr);
+            }
+        }
+
         /// <summary>跑若干轮消息循环，让布局与绘制完成。</summary>
         private static void Pump(int rounds)
         {
@@ -175,6 +298,16 @@ namespace Snad
                 if (found != null) return found;
             }
             return null;
+        }
+
+        /// <summary>按类型收集控件（含自绘控件，它们没有可匹配的文本）。</summary>
+        private static void CollectByType(Control root, Type t, List<Control> into)
+        {
+            foreach (Control c in root.Controls)
+            {
+                if (t.IsInstanceOfType(c)) into.Add(c);
+                CollectByType(c, t, into);
+            }
         }
 
         /// <summary>按文本找复选框。</summary>

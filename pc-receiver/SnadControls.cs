@@ -8,6 +8,7 @@
 // 这里全部自绘。代价是要自己处理状态与键盘，换来的是整套界面真正一致。
 
 using System;
+using System.Collections.Generic;
 using System.Drawing;
 using System.Drawing.Drawing2D;
 using System.Windows.Forms;
@@ -28,7 +29,8 @@ namespace Snad
                      ControlStyles.OptimizedDoubleBuffer | ControlStyles.ResizeRedraw, true);
             BackColor = Theme.BgPanel;
             Cursor = Cursors.Hand;
-            Font = Theme.Ui(9f);
+            // 与滚轮选择器同族：整块界面走终端语言，中文字形由系统回退补上
+            Font = Theme.Mono(9f);
             TabStop = true;
         }
 
@@ -44,6 +46,13 @@ namespace Snad
         protected override void OnMouseUp(MouseEventArgs e) { base.OnMouseUp(e); _down = false; Invalidate(); }
         protected override void OnEnabledChanged(EventArgs e) { base.OnEnabledChanged(e); Invalidate(); }
 
+        /// <summary>
+        /// 按钮外观。
+        ///
+        /// 取折中：保留等宽字体（与读数系统同族），但恢复圆角与轻微渐变。
+        /// 之前做成直角纯色块，"终端感"是足了，却让按钮看着像早年 Win32 控件——
+        /// 按钮是动作入口，不是数据展示，不需要承担终端语言的重量。
+        /// </summary>
         protected override void OnPaint(PaintEventArgs e)
         {
             var g = e.Graphics;
@@ -53,47 +62,56 @@ namespace Snad
                 g.FillRectangle(bg, ClientRectangle);
 
             var r = new RectangleF(0.5f, 0.5f, Width - 1f, Height - 1f);
+            const float radius = 4f;
             bool on = Enabled;
 
-            Color fill, border, text;
+            Color fillTop, fillBottom, border, text;
             if (!on)
             {
-                fill = Theme.Mix(Theme.BgRaised, Theme.BgPanel, 0.5f);
+                fillTop = fillBottom = Theme.Mix(Theme.BgRaised, Theme.BgPanel, 0.5f);
                 border = Color.FromArgb(90, Theme.Line);
                 text = Theme.TextTertiary;
             }
             else if (_primary)
             {
-                fill = _down ? Theme.Scale(Theme.Accent, 0.75f)
-                     : _hover ? Theme.Scale(Theme.Accent, 0.9f)
-                     : Theme.Accent;
-                border = Color.FromArgb(160, Theme.Scale(Theme.Accent, 1.15f));
-                text = Color.FromArgb(255, 10, 14, 18);       // 强调底上用深色文字，对比最高
+                // 主按钮：强调色反白，但用渐变给它厚度，不是一块死色
+                Color baseCol = _down ? Theme.Scale(Theme.Accent, 0.78f)
+                              : _hover ? Theme.Scale(Theme.Accent, 0.92f)
+                              : Theme.Accent;
+                fillTop = Theme.Scale(baseCol, 1.10f);
+                fillBottom = Theme.Scale(baseCol, 0.90f);
+                border = Theme.Scale(baseCol, 1.22f);
+                text = Color.FromArgb(255, 10, 14, 18);
             }
             else
             {
-                fill = _down ? Theme.BgActive
-                     : _hover ? Theme.BgHover
-                     : Theme.BgRaised;
-                // 悬停时描边亮起，是"可点"的明确提示
-                border = _hover ? Color.FromArgb(150, Theme.Accent) : Color.FromArgb(120, Theme.Line);
+                Color baseCol = _down ? Theme.BgActive
+                              : _hover ? Theme.BgHover
+                              : Theme.BgRaised;
+                fillTop = Theme.Scale(baseCol, 1.12f);
+                fillBottom = Theme.Scale(baseCol, 0.94f);
+                border = _hover ? Color.FromArgb(170, Theme.Accent) : Color.FromArgb(120, Theme.Line);
                 text = Theme.TextPrimary;
             }
 
-            using (var br = new SolidBrush(fill))
-                Theme.FillRound(g, br, r, 5f);
+            Theme.FillRoundGradient(g, r, radius, fillTop, fillBottom);
             using (var pen = new Pen(border, 1f))
-                Theme.DrawRound(g, pen, r, 5f);
+                Theme.DrawRound(g, pen, r, radius);
 
-            // 主按钮加一层极淡外发光，突出主操作
-            if (_primary && on)
-                using (var pen = new Pen(Color.FromArgb(45, Theme.Accent), 3f))
-                    Theme.DrawRound(g, pen, new RectangleF(1.5f, 1.5f, Width - 3f, Height - 3f), 5f);
+            // 顶部一道极淡高光，强化"上表面受光"的感觉
+            if (on)
+            {
+                using (var pen = new Pen(Color.FromArgb(38, 255, 255, 255), 1f))
+                using (var path = Theme.SuperEllipse(
+                    new RectangleF(r.X + 1, r.Y + 1, r.Width - 2, r.Height - 2), radius - 1))
+                    g.DrawPath(pen, path);
+            }
 
             var f = Font;
             var sz = g.MeasureString(Text, f);
             using (var br = new SolidBrush(text))
-                g.DrawString(Text, f, br, (Width - sz.Width) / 2f, (Height - sz.Height) / 2f);
+                g.DrawString(Text, f, br,
+                             (int)((Width - sz.Width) / 2f), (int)((Height - sz.Height) / 2f));
         }
     }
 
@@ -221,35 +239,65 @@ namespace Snad
 
         /// <summary>
         /// 在父容器上绘制展开的列表。
-        /// WinForms 没有内建下拉层，这里让父容器负责重绘列表区域。
+        ///
+        /// 形态：每一项各自带一圈边框，当前项用强调色边框并加一个左侧标记条，
+        /// 一眼能看出"列表里哪一项是当前的"，而不是只靠底色深浅区分。
+        /// 外圈再套一层容器边框把整个列表框住。
         /// </summary>
         public void DrawDropdown(Graphics g)
         {
             if (!_open || _items.Length == 0) return;
-            int itemH = ItemHeight;
-            var boxRect = new RectangleF(Left + 0.5f, Top + Height, Width - 1f, _items.Length * itemH);
 
-            using (var br = new SolidBrush(Color.FromArgb(250, Theme.BgRaised)))
-                Theme.FillRound(g, br, boxRect, 5f);
-            using (var pen = new Pen(Color.FromArgb(170, Theme.Accent), 1f))
-                Theme.DrawRound(g, pen, boxRect, 5f);
+            int itemH = ItemHeight;
+            const int margin = 3;          // 项与容器边框之间的留白
+            const int gap = 2;             // 项与项之间的间隙
+            var boxRect = new RectangleF(Left + 0.5f, Top + Height + 2, Width - 1f,
+                                         _items.Length * itemH + margin * 2);
+
+            // 投影：极淡的偏移层，制造"浮起"的感觉
+            using (var sh = new SolidBrush(Color.FromArgb(70, 0, 0, 0)))
+                Theme.FillRound(g, sh, new RectangleF(boxRect.X + 2, boxRect.Y + 3, boxRect.Width, boxRect.Height), 6f);
+
+            using (var br = new SolidBrush(Color.FromArgb(252, Theme.BgRaised)))
+                Theme.FillRound(g, br, boxRect, 6f);
+            using (var pen = new Pen(Color.FromArgb(190, Theme.Accent), 1f))
+                Theme.DrawRound(g, pen, boxRect, 6f);
 
             for (int i = 0; i < _items.Length; i++)
             {
-                var itemRect = new RectangleF(boxRect.Left + 2, boxRect.Top + 2 + i * itemH,
-                                              boxRect.Width - 4, itemH - 1);
-                if (i == _hoverItem)
+                bool sel = (i == _selected);
+                bool hov = (i == _hoverItem);
+                var itemRect = new RectangleF(boxRect.Left + margin,
+                                              boxRect.Top + margin + i * itemH,
+                                              boxRect.Width - margin * 2,
+                                              itemH - gap);
+
+                // 每项自己的底与边框
+                Color fill = sel ? Color.FromArgb(48, Theme.Accent)
+                           : hov ? Theme.BgActive
+                           : Theme.Mix(Theme.BgRaised, Theme.BgPanel, 0.35f);
+                using (var br = new SolidBrush(fill))
+                    Theme.FillRound(g, br, itemRect, 4f);
+
+                Color border = sel ? Theme.Accent
+                             : hov ? Color.FromArgb(150, Theme.Accent)
+                             : Color.FromArgb(110, Theme.Line);
+                using (var pen = new Pen(border, sel ? 1.4f : 1f))
+                    Theme.DrawRound(g, pen, itemRect, 4f);
+
+                // 当前项左侧的强调标记条
+                if (sel)
                 {
-                    using (var br = new SolidBrush(Theme.BgActive))
-                        Theme.FillRound(g, br, itemRect, 4f);
+                    using (var br = new SolidBrush(Theme.Accent))
+                        Theme.FillRound(g, br,
+                            new RectangleF(itemRect.Left + 3, itemRect.Top + 5, 2.5f, itemRect.Height - 10), 1.2f);
                 }
-                else if (i == _selected)
-                {
-                    using (var br = new SolidBrush(Color.FromArgb(60, Theme.Accent)))
-                        Theme.FillRound(g, br, itemRect, 4f);
-                }
-                using (var br = new SolidBrush(i == _selected ? Theme.Accent : Theme.TextPrimary))
-                    g.DrawString(_items[i], Font, br, itemRect.Left + 8,
+
+                // 文本：当前项用强调色，其余用主文字色
+                Color fg = sel ? Theme.Accent : Theme.TextPrimary;
+                using (var br = new SolidBrush(fg))
+                    g.DrawString(_items[i], Font, br,
+                                 itemRect.Left + (sel ? 12 : 9),
                                  itemRect.Top + (itemRect.Height - Font.Height) / 2f);
             }
         }
@@ -346,6 +394,728 @@ namespace Snad
 
             using (var br = new SolidBrush(_hover ? Theme.TextPrimary : Theme.TextSecondary))
                 g.DrawString(Text, Font, br, bs + 8, (Height - Font.Height) / 2f);
+        }
+    }
+
+    /// <summary>
+    /// 自绘细滚动条。
+    ///
+    /// 为什么不用系统滚动条：深色主题下原生滚动条的浅灰轨道和立体箭头非常突兀，
+    /// 而且无法通过任何属性改色。WinForms 的 ScrollBar 是系统绘制的，只能自绘。
+    ///
+    /// 形态参照现代应用：细轨、圆角滑块、悬停加宽并提亮、无需滚动时整条淡出。
+    /// </summary>
+    internal sealed class FlatScrollBar : Control
+    {
+        private int _value;
+        private int _maximum = 1;      // 可滚动的内容单位总数
+        private int _viewSize = 1;     // 可视区域占用的单位数
+        private bool _hover, _dragging;
+        private int _dragOffset;
+
+        /// <summary>值变化时通知宿主重绘内容。</summary>
+        public event EventHandler ValueChanged;
+
+        private const int TrackWidth = 10;
+        private const int ThumbWidth = 6;
+        private const int ThumbWidthHover = 8;
+        private const int MinThumbHeight = 28;
+
+        public FlatScrollBar()
+        {
+            SetStyle(ControlStyles.AllPaintingInWmPaint | ControlStyles.UserPaint |
+                     ControlStyles.OptimizedDoubleBuffer | ControlStyles.ResizeRedraw, true);
+            BackColor = Theme.BgPanel;
+            Width = TrackWidth;
+            Cursor = Cursors.Default;
+        }
+
+        public int Value
+        {
+            get { return _value; }
+            set
+            {
+                int max = Math.Max(0, _maximum - _viewSize);
+                int v = value < 0 ? 0 : (value > max ? max : value);
+                if (v == _value) return;
+                _value = v;
+                Invalidate();
+                if (ValueChanged != null) ValueChanged(this, EventArgs.Empty);
+            }
+        }
+
+        public int Maximum
+        {
+            get { return _maximum; }
+            set { _maximum = Math.Max(1, value); ClampValue(); Invalidate(); }
+        }
+
+        public int ViewSize
+        {
+            get { return _viewSize; }
+            set { _viewSize = Math.Max(1, value); ClampValue(); Invalidate(); }
+        }
+
+        /// <summary>内容是否超出可视区。未超出时整条淡出，不占用视觉注意力。</summary>
+        public bool Needed { get { return _maximum > _viewSize; } }
+
+        private void ClampValue()
+        {
+            int max = Math.Max(0, _maximum - _viewSize);
+            if (_value > max) _value = max;
+            if (_value < 0) _value = 0;
+        }
+
+        /// <summary>滑块的位置与高度（像素）。</summary>
+        private void ThumbRect(out float top, out float height)
+        {
+            float track = ClientSize.Height;
+            double frac = Math.Min(1.0, (double)_viewSize / _maximum);
+            height = (float)Math.Max(MinThumbHeight, track * frac);
+            if (height > track) height = track;
+            double scrollFrac = _maximum > _viewSize
+                ? (double)_value / (_maximum - _viewSize) : 0;
+            top = (float)(scrollFrac * (track - height));
+            if (top < 0) top = 0;
+        }
+
+        protected override void OnPaint(PaintEventArgs e)
+        {
+            var g = e.Graphics;
+            Theme.SetupQuality(g);
+
+            using (var bg = new SolidBrush(Parent != null ? Parent.BackColor : Theme.BgPanel))
+                g.FillRectangle(bg, ClientRectangle);
+
+            if (!Needed) return;   // 不需要滚动时不画任何东西
+
+            float top, height;
+            ThumbRect(out top, out height);
+
+            int w = (_hover || _dragging) ? ThumbWidthHover : ThumbWidth;
+            float x = (ClientSize.Width - w) / 2f;
+
+            Color c = _dragging ? Theme.Accent
+                    : _hover ? Theme.Mix(Theme.TextTertiary, Theme.Accent, 0.4f)
+                    : Color.FromArgb(150, Theme.TextTertiary);
+
+            using (var br = new SolidBrush(c))
+                Theme.FillRound(g, br, new RectangleF(x, top, w, height), w / 2f);
+        }
+
+        protected override void OnMouseEnter(EventArgs e) { base.OnMouseEnter(e); _hover = true; Invalidate(); }
+        protected override void OnMouseLeave(EventArgs e) { base.OnMouseLeave(e); _hover = false; Invalidate(); }
+
+        protected override void OnMouseDown(MouseEventArgs e)
+        {
+            base.OnMouseDown(e);
+            float top, height;
+            ThumbRect(out top, out height);
+
+            if (e.Y >= top && e.Y <= top + height)
+            {
+                _dragOffset = (int)(e.Y - top);
+            }
+            else
+            {
+                // 点击空白处：把滑块中心移到点击位置（一屏一屏跳太慢）
+                _dragOffset = (int)(height / 2);
+                MoveThumbTo(e.Y - _dragOffset, height);
+            }
+            _dragging = true;
+            Capture = true;
+            Invalidate();
+        }
+
+        protected override void OnMouseMove(MouseEventArgs e)
+        {
+            base.OnMouseMove(e);
+            if (!_dragging) return;
+            float top, height;
+            ThumbRect(out top, out height);
+            MoveThumbTo(e.Y - _dragOffset, height);
+        }
+
+        private void MoveThumbTo(float thumbTop, float thumbHeight)
+        {
+            float track = ClientSize.Height;
+            float range = track - thumbHeight;
+            if (range <= 0) return;
+            double frac = thumbTop / range;
+            if (frac < 0) frac = 0; if (frac > 1) frac = 1;
+            Value = (int)Math.Round(frac * Math.Max(0, _maximum - _viewSize));
+        }
+
+        protected override void OnMouseUp(MouseEventArgs e)
+        {
+            base.OnMouseUp(e);
+            _dragging = false;
+            Capture = false;
+            Invalidate();
+        }
+
+        /// <summary>鼠标滚轮：向上为负 delta。</summary>
+        public void WheelBy(int delta)
+        {
+            int step = Math.Max(1, _viewSize / 6);
+            Value = _value + (delta < 0 ? -step : step);
+        }
+    }
+
+    /// <summary>
+    /// 滚轮选择器（iOS 时间选择器形态），默认收起，点击才展开。
+    ///
+    /// 收起态只占一行，显示当前值——参数不常改，常驻三行会白占地方且显得凌乱。
+    /// 点击后用高度动画展开成滚轮：中间是选中项（高亮框），上下项按距离渐隐。
+    /// 选中、点空白处或失焦都会收起。
+    ///
+    /// 用高度动画而不是直接切换高度：高度突变会让整行控件跳一下，
+    /// 展开过程本身也是"这里可以滚"的提示。
+    /// </summary>
+    internal sealed class WheelSelector : Control
+    {
+        private string[] _items = new string[0];
+        private int _index;
+        private double _offset;          // 滚动位置（以项为单位），向 _index 缓动
+        private double _expand;          // 0=收起 1=展开，动画量
+        private bool _open;
+        private bool _dragging;
+        private bool _pressed;
+        private int _dragStartY;
+        private double _dragStartOffset;
+        private bool _hover;
+        private readonly Timer _anim;
+
+        public event EventHandler SelectedIndexChanged;
+
+        /// <summary>展开后可见行数（奇数，保证中间一行完整）。</summary>
+        public int VisibleRows = 3;
+
+        public WheelSelector()
+        {
+            SetStyle(ControlStyles.AllPaintingInWmPaint | ControlStyles.UserPaint |
+                     ControlStyles.OptimizedDoubleBuffer | ControlStyles.ResizeRedraw, true);
+            BackColor = Theme.BgRaised;
+            Font = Theme.Mono(9.5f);
+            Cursor = Cursors.Hand;
+            Height = RowHeight;
+
+            _anim = new Timer { Interval = 16 };
+            _anim.Tick += (s, e) => Step();
+        }
+
+        private int RowHeight { get { return Math.Max(20, Font.Height + 8); } }
+
+        /// <summary>展开后的目标高度。</summary>
+        private int ExpandedHeight { get { return RowHeight * VisibleRows; } }
+
+        /// <summary>
+        /// 高度变化通知宿主。宿主需要据此重新垂直居中，
+        /// 否则展开后控件会偏出中心或被容器裁掉。
+        /// </summary>
+        public event EventHandler HeightChanged;
+
+        private void NotifyHeightChanged()
+        {
+            if (HeightChanged != null) HeightChanged(this, EventArgs.Empty);
+        }
+
+        public string[] Items
+        {
+            get { return _items; }
+            set
+            {
+                _items = value ?? new string[0];
+                if (_index >= _items.Length) _index = Math.Max(0, _items.Length - 1);
+                _offset = _index;
+                Invalidate();
+            }
+        }
+
+        public int SelectedIndex
+        {
+            get { return _index; }
+            set
+            {
+                if (_items.Length == 0) return;
+                int v = value < 0 ? 0 : (value >= _items.Length ? _items.Length - 1 : value);
+                if (v == _index) return;
+                _index = v;
+                _anim.Start();
+                Invalidate();
+                if (SelectedIndexChanged != null) SelectedIndexChanged(this, EventArgs.Empty);
+            }
+        }
+
+        public string SelectedItem
+        {
+            get { return (_index >= 0 && _index < _items.Length) ? _items[_index] : null; }
+        }
+
+        public void SelectText(string text)
+        {
+            int i = Array.IndexOf(_items, text);
+            if (i >= 0) SelectedIndex = i;
+        }
+
+        public bool IsOpen { get { return _open; } }
+
+        public void Open()
+        {
+            if (_open || _items.Length == 0) return;
+            _open = true;
+
+            // 展开时把滚动位置设为 0，即从列表第一项开始显示。
+            // 选中项会被定位到第一行（高亮条所在处），其余项在下方依次排开——
+            // 这样展开是"向下长出来"，不会把当前值顶到别处。
+            _offset = 0;
+            Height = ExpandedHeight + 2;
+            NotifyHeightChanged();
+
+            _anim.Start();
+            Invalidate();
+        }
+
+        public void Close()
+        {
+            if (!_open) return;
+            _open = false;
+            _dragging = false;
+            // 收起后回到"只显示当前值"的单行高度
+            Height = RowHeight;
+            _offset = _index;
+            NotifyHeightChanged();
+
+            _anim.Start();
+            Invalidate();
+        }
+
+        /// <summary>每帧推进：展开动画与滚动缓动各自收敛。</summary>
+        private void Step()
+        {
+            bool busy = false;
+
+            double targetExpand = _open ? 1.0 : 0.0;
+            double de = targetExpand - _expand;
+            if (Math.Abs(de) > 0.02) { _expand += de * 0.32; busy = true; }
+            else _expand = targetExpand;
+
+            double dd = _index - _offset;
+            if (Math.Abs(dd) > 0.01) { _offset += dd * 0.35; busy = true; }
+            else _offset = _index;
+
+            Invalidate();
+            if (!busy) _anim.Stop();
+        }
+
+        /// <summary>滚轮模式下的横条一半高度。</summary>
+        private float BarHeight { get { return (float)(_expand * RowHeight / 2.0); } }
+
+        /// <summary>滚轮模式下高亮条在控件内的 y（第一行中心）。</summary>
+        private float BarTop
+        {
+            get
+            {
+                float collapsed = (ClientSize.Height - RowHeight) / 2f;
+                return (float)(collapsed + (0f - collapsed) * _expand);
+            }
+        }
+
+        /// <summary>
+        /// 中括号向内收进的距离。展开时收敛到 0，即"线条展开成滚轮"。
+        ///
+        /// 用 Width 而不是 ClientSize.Width：控件尚未挂到父容器时 ClientSize 为 0，
+        /// 会把括号算到文字上（实测悬停态括号压在 "balanced" 上）。
+        /// </summary>
+        private float BracketInset
+        {
+            get
+            {
+                float w = Width > 0 ? Width : 200f;
+                return (float)((1.0 - _expand) * (w * 0.26f));
+            }
+        }
+
+        protected override void OnPaint(PaintEventArgs e)
+        {
+            var g = e.Graphics;
+            Theme.SetupQuality(g);
+
+            using (var bg = new SolidBrush(Parent != null ? Parent.BackColor : Theme.BgPanel))
+                g.FillRectangle(bg, ClientRectangle);
+
+            if (_items.Length == 0) return;
+
+            if (_expand < 0.02) DrawCollapsed(g);
+            else DrawExpanded(g);
+        }
+
+        /// <summary>
+        /// 收起态。三种子状态：
+        ///   静止 —— 只有文字，颜色压到次级，不画任何装饰，尽量不引人注意
+        ///   悬停 —— 文字提亮，两侧出现方块中括号，底部一条细线
+        ///   按下 —— 括号与细线提亮，为展开做视觉准备
+        ///
+        /// 括号用"竖线 + 上下向内短横"的方块形态，全部平直无圆弧：
+        /// 圆弧属于拟物/科技风，方块括号才是终端审美。
+        /// </summary>
+        private void DrawCollapsed(Graphics g)
+        {
+            float h = ClientSize.Height;
+            float midY = h / 2f;
+
+            var font = _hover ? Theme.MonoEmphasis(10f) : Theme.Mono(9.5f);
+            Color fg = _hover ? Theme.TextPrimary : Theme.TextSecondary;
+            if (_hover) fg = Theme.Mix(fg, Theme.Accent, 0.25f);
+
+            // 水平居中于"左右留白之间"的中点，而不是控件中点——
+            // 右侧要给箭头留位，按控件中点居中的话文字会偏右，看着不齐。
+            const float chevW = 11f;
+            const float leftPad = 10f;
+            float rightPad = chevW + 10f;
+            float textCenter = (leftPad + (ClientSize.Width - rightPad)) / 2f;
+            var sz = g.MeasureString(_items[_index], font);
+            using (var br = new SolidBrush(fg))
+                g.DrawString(_items[_index], font, br,
+                             textCenter - sz.Width / 2f, midY - sz.Height / 2f);
+
+            // 静止态不画任何装饰——它应该安静地待在那里，只在被注意到时才亮起来。
+            if (!_hover) return;
+
+            // 括号构成按钮边缘的左右两段，因此贴着控件两侧，而不是紧贴文字。
+            // 箭头放在右括号内侧，文字在括号内居中 —— 视觉上是 [    balanced    v ]
+            float arm = Math.Max(4f, h * 0.18f);     // 上下向内的小横臂，让"["有形状
+            float half = Math.Max(5f, h * 0.32f);
+            float left = 1f;
+            float right = ClientSize.Width - 1f;
+
+            Color line = Color.FromArgb(_pressed ? 255 : 210, Theme.Accent);
+            using (var pen = new Pen(line, _pressed ? 1.8f : 1.3f))
+            {
+                pen.StartCap = LineCap.Flat;
+                pen.EndCap = LineCap.Flat;
+                // 左括号
+                g.DrawLine(pen, left, midY - half, left, midY + half);
+                g.DrawLine(pen, left, midY - half, left + arm, midY - half);
+                g.DrawLine(pen, left, midY + half, left + arm, midY + half);
+                // 右括号（镜像）
+                g.DrawLine(pen, right, midY - half, right, midY + half);
+                g.DrawLine(pen, right, midY - half, right - arm, midY - half);
+                g.DrawLine(pen, right, midY + half, right - arm, midY + half);
+            }
+
+            // 箭头放在右括号内侧
+            float ax = right - arm - chevW / 2f - 2f;
+            using (var pen = new Pen(Color.FromArgb(_pressed ? 240 : 180, fg), 1.4f))
+            {
+                pen.StartCap = LineCap.Flat; pen.EndCap = LineCap.Flat;
+                g.DrawLine(pen, ax - 4, midY - 2, ax, midY + 2);
+                g.DrawLine(pen, ax, midY + 2, ax + 4, midY - 2);
+            }
+        }
+
+        /// <summary>
+        /// 展开态：终端列表的形态——硬边高亮条贯穿整行，左侧一个块状光标，
+        /// 上下项按距离衰减亮度，边缘用渐变淡出。
+        /// 不使用圆角、渐变填充与发光：那些属于拟物风，与 TUI 审美冲突。
+        /// </summary>
+        private void DrawExpanded(Graphics g)
+        {
+            int rowH = RowHeight;
+            float barH = BarHeight;
+            float barY = BarTop;
+            float center = barY + barH;
+
+            // 展开态：外框 + 高亮条都贴到第一行（BarTop≈0），与收起态"条在整行居中"
+            // 之间用 _expand 过渡；文字因此始终停在原处，视觉上是滚轮从下方长出来。
+            // 高度按已展开的部分增长，未展开时控件高度就等于收起高度，不会被裁。
+            float grow = (float)(ClientSize.Height * _expand);
+            if (grow > 1f)
+            {
+                using (var pen = new Pen(Color.FromArgb((int)(200 * _expand), Theme.Accent), 1f))
+                    g.DrawRectangle(pen, 0, 0, ClientSize.Width - 1, grow - 1f);
+            }
+
+            // 选中行：整行硬边高亮
+            if (barH > 0.5f)
+            {
+                var selRect = new RectangleF(0, barY, ClientSize.Width - 1, barH * 2);
+                using (var br = new SolidBrush(Color.FromArgb(_hover ? 70 : 56, Theme.Accent)))
+                    g.FillRectangle(br, selRect);
+            }
+
+            int half = VisibleRows / 2;
+            int baseIdx = (int)Math.Floor(_offset);
+            float selCenterY = float.MinValue;
+
+            for (int row = -half - 1; row <= half + 1; row++)
+            {
+                int idx = baseIdx + row;
+                if (idx < 0 || idx >= _items.Length) continue;
+
+                float cy = center + (float)((idx - _offset) * rowH);
+                if (cy < -rowH || cy > ClientSize.Height + rowH) continue;
+
+                float dist = Math.Abs(cy - center) / rowH;
+                float alpha = 1f - dist * 0.45f;
+                if (alpha < 0.15f) alpha = 0.15f;
+                bool isSel = Math.Abs(cy - center) < rowH * 0.5f;
+
+                // 选中项用强调色，其余按距离衰减——模拟终端里"非焦点行更暗"
+                Color fg = isSel ? Theme.Accent
+                                 : Theme.Mix(Theme.TextTertiary, Theme.TextSecondary,
+                                             Math.Max(0f, 1f - dist * 0.6f));
+
+                var f = isSel ? Theme.MonoEmphasis(10f) : Theme.Mono(9f);
+                var sz = g.MeasureString(_items[idx], f);
+                using (var br = new SolidBrush(Color.FromArgb((int)(255 * alpha), fg)))
+                    g.DrawString(_items[idx], f, br,
+                                 (ClientSize.Width - sz.Width) / 2f, cy - sz.Height / 2f);
+
+                if (isSel) selCenterY = cy;
+            }
+
+            // 块状光标：贴在选中行左端，是终端里最常见的"当前位置"标记
+            if (selCenterY > float.MinValue)
+            {
+                float ch = rowH * 0.5f;
+                using (var br = new SolidBrush(Color.FromArgb(230, Theme.Accent)))
+                    g.FillRectangle(br, 4, selCenterY - ch / 2f, 3, ch);
+            }
+
+            // 上下渐隐遮罩：让边缘项自然消失在背景里，而不是被硬裁
+            int maskH = Math.Max(1, (int)(rowH * _expand));
+            Color bgc = Theme.BgBase;
+            using (var top = new LinearGradientBrush(
+                new Rectangle(0, 0, Math.Max(1, ClientSize.Width), maskH),
+                bgc, Color.Transparent, LinearGradientMode.Vertical))
+                g.FillRectangle(top, 0, 0, ClientSize.Width, maskH);
+            using (var bot = new LinearGradientBrush(
+                new Rectangle(0, Math.Max(0, ClientSize.Height - maskH), Math.Max(1, ClientSize.Width), maskH),
+                Color.Transparent, bgc, LinearGradientMode.Vertical))
+                g.FillRectangle(bot, 0, ClientSize.Height - maskH, ClientSize.Width, maskH);
+        }
+
+        // ---------------------------------------------------------------- 交互
+
+        protected override void OnMouseEnter(EventArgs e) { base.OnMouseEnter(e); _hover = true; Invalidate(); }
+        protected override void OnMouseLeave(EventArgs e) { base.OnMouseLeave(e); _hover = false; Invalidate(); }
+
+        protected override void OnMouseDown(MouseEventArgs e)
+        {
+            base.OnMouseDown(e);
+            _pressed = true;
+            Invalidate();
+
+            if (!_open)
+            {
+                // 收起态：按下即展开，并在展开后开始拖动。
+                // 这样"点一下就能直接拖"，不用先点开再拖第二次。
+                Open();
+                _dragging = true;
+                _dragStartY = e.Y;
+                _dragStartOffset = _offset;
+                Capture = true;
+                return;
+            }
+
+            _dragging = true;
+            _dragStartY = e.Y;
+            _dragStartOffset = _offset;
+            Capture = true;
+            _anim.Stop();
+        }
+
+        protected override void OnMouseMove(MouseEventArgs e)
+        {
+            base.OnMouseMove(e);
+            if (!_dragging || !_open) return;
+            // 向上拖动 = 内容上移 = 索引变大，与触屏直觉一致
+            double delta = (double)(_dragStartY - e.Y) / RowHeight;
+            double o = _dragStartOffset + delta;
+            double max = _items.Length - 1;
+            if (o < 0) o = 0; if (o > max) o = max;
+            _offset = o;
+            Invalidate();
+        }
+
+        protected override void OnMouseUp(MouseEventArgs e)
+        {
+            base.OnMouseUp(e);
+            _pressed = false;
+            Invalidate();
+            if (!_dragging) return;
+            _dragging = false;
+            Capture = false;
+
+            // 松手吸附到最近一项
+            int target = (int)Math.Round(_offset);
+            if (target < 0) target = 0;
+            if (target >= _items.Length) target = _items.Length - 1;
+            _offset = target;
+            SelectedIndex = target;
+            _anim.Start();
+        }
+
+        /// <summary>展开态点击某一行直接跳到它；收起态由 OnMouseDown 负责展开。</summary>
+        protected override void OnClick(EventArgs e)
+        {
+            base.OnClick(e);
+            if (!_open || _items.Length == 0) return;
+
+            var pt = PointToClient(Cursor.Position);
+            int rowH = RowHeight;
+            float center = BarTop + BarHeight;
+            int delta = (int)Math.Round((pt.Y - center) / rowH);
+            if (delta != 0) SelectedIndex = _index + delta;
+        }
+
+        protected override void OnMouseWheel(MouseEventArgs e)
+        {
+            base.OnMouseWheel(e);
+            if (!_open) return;      // 收起态不响应滚轮，避免误改设置
+            SelectedIndex = _index + (e.Delta < 0 ? 1 : -1);
+        }
+
+        /// <summary>失焦即收起。点击别处由宿主调用 CloseAll 处理。</summary>
+        protected override void OnLostFocus(EventArgs e)
+        {
+            base.OnLostFocus(e);
+            Close();
+        }
+
+        protected override void Dispose(bool disposing)
+        {
+            if (disposing) _anim.Dispose();
+            base.Dispose(disposing);
+        }
+    }
+
+    /// <summary>
+    /// 事件日志条。
+    ///
+    /// 用只读 TextBox 承担滚动与选择（自己实现文本排版与命中测试不划算），
+    /// 但把它的系统滚动条藏掉，改用自绘的 FlatScrollBar 并由本控件接管滚轮。
+    /// 颜色压到底色，使日志退到视觉底层——它是排查用的，不该和新界面的数据抢注意力。
+    /// </summary>
+    internal sealed class LogStrip : Control
+    {
+        private const int MaxLines = 400;
+
+        private readonly TextBox _inner;
+        private readonly FlatScrollBar _bar;
+        private readonly List<string> _lines = new List<string>();
+
+        public LogStrip()
+        {
+            SetStyle(ControlStyles.AllPaintingInWmPaint | ControlStyles.UserPaint |
+                     ControlStyles.OptimizedDoubleBuffer | ControlStyles.ResizeRedraw, true);
+            BackColor = Theme.BgPanel;
+
+            _inner = new TextBox
+            {
+                Multiline = true,
+                ReadOnly = true,
+                WordWrap = false,
+                BorderStyle = BorderStyle.None,
+                // 关键：ScrollBars.None 把系统滚动条彻底去掉，只保留滚动能力
+                ScrollBars = ScrollBars.None,
+                BackColor = Theme.BgBase,
+                ForeColor = Theme.TextTertiary,
+                Font = Theme.Mono(8.5f),
+                TabStop = false,
+                ShortcutsEnabled = true      // 允许 Ctrl+C 复制
+            };
+            _inner.MouseWheel += OnInnerWheel;
+            _inner.KeyDown += OnInnerKey;
+            Controls.Add(_inner);
+
+            _bar = new FlatScrollBar { Width = 10 };
+            _bar.ValueChanged += (s, e) => SyncScroll();
+            Controls.Add(_bar);
+
+            Resize += (s, e) => Relayout();
+        }
+
+        private void Relayout()
+        {
+            int barW = 10;
+            _bar.Bounds = new Rectangle(ClientSize.Width - barW, 0, barW, ClientSize.Height);
+            _inner.Bounds = new Rectangle(0, 0, Math.Max(10, ClientSize.Width - barW - 2), ClientSize.Height);
+            UpdateScrollMetrics();
+        }
+
+        /// <summary>追加一行，带时间戳。超出上限时裁掉最早的行。</summary>
+        public void Append(string line)
+        {
+            _lines.Add(DateTime.Now.ToString("HH:mm:ss") + "  " + line);
+            if (_lines.Count > MaxLines)
+                _lines.RemoveRange(0, _lines.Count - MaxLines / 2);
+
+            _inner.Lines = _lines.ToArray();
+            // 新内容到达时滚到底部——日志的价值在于最新的那几行
+            _bar.Value = int.MaxValue;
+            UpdateScrollMetrics();
+        }
+
+        private void UpdateScrollMetrics()
+        {
+            int lineH = Math.Max(1, _inner.Font.Height);
+            int visibleLines = Math.Max(1, _inner.ClientSize.Height / lineH);
+            _bar.Maximum = _lines.Count;
+            _bar.ViewSize = visibleLines;
+            _bar.Invalidate();
+        }
+
+        private void OnInnerWheel(object sender, MouseEventArgs e)
+        {
+            _bar.WheelBy(e.Delta);
+        }
+
+        private void OnInnerKey(object sender, KeyEventArgs e)
+        {
+            // 键盘滚动也走同一条路，保证滚动条位置与实际内容一致
+            if (e.KeyCode == Keys.Up) { _bar.Value -= 1; e.Handled = true; }
+            else if (e.KeyCode == Keys.Down) { _bar.Value += 1; e.Handled = true; }
+            else if (e.KeyCode == Keys.PageUp) { _bar.Value -= _bar.ViewSize; e.Handled = true; }
+            else if (e.KeyCode == Keys.PageDown) { _bar.Value += _bar.ViewSize; e.Handled = true; }
+        }
+
+        /// <summary>把自绘滚动条的位置换算成 TextBox 的字符偏移并滚动。</summary>
+        private void SyncScroll()
+        {
+            int lineH = Math.Max(1, _inner.Font.Height);
+            // TextBox 只能按字符索引定位，用"每行大约多少字符"估算不可靠，
+            // 因此改为按行索引：取第 N 行的首字符位置。
+            int targetLine = _bar.Value;
+            if (targetLine <= 0)
+            {
+                _inner.SelectionStart = 0;
+                _inner.ScrollToCaret();
+                return;
+            }
+            int idx = 0, line = 0;
+            string text = _inner.Text;
+            while (line < targetLine && idx < text.Length)
+            {
+                int nl = text.IndexOf('\n', idx);
+                if (nl < 0) break;
+                idx = nl + 1;
+                line++;
+            }
+            if (idx <= text.Length)
+            {
+                _inner.SelectionStart = idx;
+                _inner.SelectionLength = 0;
+                _inner.ScrollToCaret();
+            }
+        }
+
+        public void Clear()
+        {
+            _lines.Clear();
+            _inner.Clear();
+            UpdateScrollMetrics();
         }
     }
 }

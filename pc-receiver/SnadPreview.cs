@@ -116,9 +116,138 @@ namespace Snad
                 failures++;
             }
 
+            // ---- 5. 滚轮选择器的三种状态 ----
+            try
+            {
+                RenderWheelStates(dir);
+                Console.WriteLine("滚轮选择器三态已生成");
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine("滚轮三态渲染失败：" + ex.GetType().Name + ": " + ex.Message);
+                Console.WriteLine(ex.StackTrace);
+                failures++;
+            }
+
             Console.WriteLine();
             Console.WriteLine(failures == 0 ? "预览生成完毕" : ("有 " + failures + " 项失败"));
             return failures == 0 ? 0 : 1;
+        }
+
+        /// <summary>
+        /// 分别渲染滚轮选择器的三个状态：静止 / 悬停 / 展开。
+        ///
+        /// 静止与悬停由鼠标事件驱动，离屏渲染时无法自然触发，因此用反射直接设
+        /// 对应字段——比伪造鼠标消息可靠，也不会真的移动用户的光标。
+        /// </summary>
+        private static void RenderWheelStates(string dir)
+        {
+            string[] items = { "lowlatency", "balanced", "highquality" };
+
+            var w1 = new WheelSelector { Width = 200 };
+            w1.Items = items;
+            w1.SelectText("balanced");
+
+            var w2 = new WheelSelector { Width = 200 };
+            w2.Items = items;
+            w2.SelectText("balanced");
+            SetPrivate(w2, "_hover", true);
+
+            var w3 = new WheelSelector { Width = 200 };
+            w3.Items = items;
+            w3.Open();                            // 先展开
+            w3.SelectText("balanced");            // 再选中：Open 里 _offset 会被设为当时的 _index，
+                                                  // 顺序颠倒会导致选中项不在中间（踩过）
+            SetPrivate(w3, "_hover", true);
+            SetPrivate(w3, "_expand", 1.0);      // 直接推到展开终态
+            SetPrivate(w3, "_offset", 1.0);
+            // Open 时 SelectText 还没执行，高度按 0 号项算；按最终状态重新撑开。
+            // 否则渲染画布比控件高，滚轮会被画在画布顶部而不是居中（踩过）。
+            w3.Height = 75;
+            // 让高亮条落在第一行：_offset 为 1 时第一行即选中项
+            SetPrivate(w3, "_offset", 1.0);
+
+            using (var b1 = RenderToBitmap(w1))
+            using (var b2 = RenderToBitmap(w2))
+            using (var b3 = RenderToBitmap(w3))
+            {
+                // 打印展开态的实际渲染尺寸与关键字段，避免靠猜（这几项都踩过坑）
+                Console.WriteLine("  静止态：位图=" + b1.Width + "x" + b1.Height);
+                Console.WriteLine("  悬停态：位图=" + b2.Width + "x" + b2.Height);
+                Console.WriteLine("  展开态：位图=" + b3.Width + "x" + b3.Height +
+                                  " SelectedIndex=" + w3.SelectedIndex +
+                                  " _offset=" + GetPrivate(w3, "_offset") +
+                                  " _expand=" + GetPrivate(w3, "_expand"));
+                b1.Save(Path.Combine(dir, "wheel-1-idle.png"), ImageFormat.Png);
+                b2.Save(Path.Combine(dir, "wheel-2-hover.png"), ImageFormat.Png);
+                b3.Save(Path.Combine(dir, "wheel-3-open.png"), ImageFormat.Png);
+
+                // 拼一张放大对照图。
+                //
+                // 关键：三态用**同一个缩放倍数**绘制，且不按格子高度裁剪缩放。
+                // 之前按格子高度等比放大，高的展开态被放得更大，看起来"宽度远宽于前两态"
+                // ——那是我绘图缩放造成的假象，不是控件真的变形。
+                const int scale = 3, gap = 18, labelW = 96;
+                int cellH = 108;
+                int cellW = 200 * scale;
+                int W = labelW + cellW + 32;
+                int H = gap + (cellH + gap) * 3;
+                using (var bmp = new Bitmap(W, H))
+                {
+                    using (var g = Graphics.FromImage(bmp))
+                    {
+                        Theme.SetupQuality(g);
+                        using (var bg = new SolidBrush(Theme.BgBase))
+                            g.FillRectangle(bg, 0, 0, W, H);
+
+                        string[] names = { "IDLE", "HOVER", "OPEN" };
+                        var bmps = new[] { b1, b2, b3 };
+                        var fl = Theme.Label(9f);
+                        for (int i = 0; i < 3; i++)
+                        {
+                            int y = gap + i * (cellH + gap);
+                            using (var br = new SolidBrush(Theme.TextTertiary))
+                                g.DrawString(names[i], fl, br, 14, y + cellH / 2f - 8);
+
+                            var cell = new Rectangle(labelW, y, cellW + 24, cellH);
+                            using (var pen = new Pen(Color.FromArgb(80, Theme.GridMajor), 1f))
+                                g.DrawRectangle(pen, cell);
+
+                            // 统一 scale 倍；只做上限约束，不做放大填充
+                            int dw = bmps[i].Width * scale, dh = bmps[i].Height * scale;
+                            int maxH = cell.Height - 10;
+                            if (dh > maxH)
+                            {
+                                // 超高时按**同一**比例缩小，宽度不会被拉伸
+                                float k = (float)maxH / dh;
+                                dw = (int)(dw * k);
+                                dh = maxH;
+                            }
+                            g.DrawImage(bmps[i], cell.X + 12, cell.Y + (cell.Height - dh) / 2f, dw, dh);
+                        }
+                    }
+                    bmp.Save(Path.Combine(dir, "wheel-states.png"), ImageFormat.Png);
+                }
+            }
+        }
+
+        private static void SetPrivate(object o, string field, object value)
+        {
+            var f = o.GetType().GetField(field,
+                System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic);
+            if (f == null)
+            {
+                Console.WriteLine("  提示：未找到字段 " + field + "，该状态可能无法精确渲染");
+                return;
+            }
+            f.SetValue(o, value);
+        }
+
+        private static object GetPrivate(object o, string field)
+        {
+            var f = o.GetType().GetField(field,
+                System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic);
+            return f == null ? "?" : f.GetValue(o);
         }
 
         /// <summary>

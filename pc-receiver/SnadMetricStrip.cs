@@ -61,8 +61,9 @@ namespace Snad
             if (n == 0) return;
 
             float colW = (float)ClientSize.Width / n;
-            var fLabel = Theme.Ui(7.5f);
-            var fValue = Theme.Metric(19f);
+            // 标签用等宽（属于读数系统），数值用数显字体（视觉重心，要厚重）
+            var fLabel = Theme.Label(7.5f);
+            var fValue = Theme.Readout(20f);
             var fUnit = Theme.Metric(8.5f);
 
             for (int i = 0; i < n; i++)

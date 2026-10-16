@@ -150,6 +150,7 @@ if (Test-Path 'SnadShot.cs') {
     foreach ($a in $guiRefs) { $shotArgs += ("/r:" + (Join-Path $fw $a)) }
     $shotArgs += @('SnadReceiver.cs', 'SnadProfile.cs', 'SnadBeacon.cs', 'SnadBeaconService.cs',
                    'SnadEq.cs', 'SnadEqForm.cs', 'SnadSpectrum.cs', 'SnadGui.cs',
+                   'SnadTheme.cs', 'SnadControls.cs', 'SnadGraph.cs', 'SnadMetricStrip.cs',
                    'SnadSecret.cs', 'SnadShot.cs')
     & $csc @shotArgs
     if ($LASTEXITCODE -ne 0) { throw "界面检查工具编译失败，csc 退出码 $LASTEXITCODE" }
