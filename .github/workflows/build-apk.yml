@@ -23,8 +23,29 @@ jobs:
           distribution: temurin
           java-version: '17'
 
-      - name: Set up Android SDK
-        uses: android-actions/setup-android@v3
+      # 不使用 android-actions/setup-android@v3：
+      # ubuntu-24.04 运行器已预装 Android SDK，而该 action 检测到预装 sdkmanager
+      # 版本不匹配后会执行 `sdkmanager tools`，该包在现代 SDK 中已不存在，导致
+      # "Warning: Failed to find package 'tools'" 并让整个 job 失败。
+      # 这里只做验证，缺什么再用 sdkmanager 明确安装。
+      - name: Verify preinstalled Android SDK
+        run: |
+          set -eux
+          echo "ANDROID_HOME=${ANDROID_HOME:-<unset>}"
+          echo "ANDROID_SDK_ROOT=${ANDROID_SDK_ROOT:-<unset>}"
+          SDK="${ANDROID_SDK_ROOT:-${ANDROID_HOME:-/usr/local/lib/android/sdk}}"
+          echo "SDK=$SDK"
+          ls -1 "$SDK" || true
+          if [ ! -d "$SDK/platforms" ]; then
+            echo "::error::SDK 中缺少 platforms 目录"
+            exit 1
+          fi
+          echo "已安装的 platforms:"; ls -1 "$SDK/platforms"
+          echo "已安装的 build-tools:"; ls -1 "$SDK/build-tools" || true
+          if [ ! -d "$SDK/platforms/android-35" ]; then
+            echo "android-35 缺失，尝试安装"
+            yes | "$SDK/cmdline-tools/latest/bin/sdkmanager" "platforms;android-35" "build-tools;35.0.0"
+          fi
 
       - name: Set up Gradle
         uses: gradle/actions/setup-gradle@v4
@@ -40,6 +61,7 @@ jobs:
         run: |
           set -eux
           APK=$(find app/build/outputs/apk/debug -name '*.apk' | head -n1)
+          test -n "$APK"
           cp "$APK" SNAD-debug.apk
           sha256sum SNAD-debug.apk | tee SNAD-debug.apk.sha256
           ls -la SNAD-debug.apk
@@ -63,5 +85,5 @@ jobs:
             --title "SNAD build ${GITHUB_RUN_NUMBER}" \
             --notes "自动构建。SHA256: ${{ steps.collect.outputs.sha }}" \
             SNAD-debug.apk SNAD-debug.apk.sha256
-          echo "### 下载地址" >> "$GITHUB_STEP_SUMMARY"
+          echo "### Download" >> "$GITHUB_STEP_SUMMARY"
           echo "https://github.com/${GITHUB_REPOSITORY}/releases/download/${TAG}/SNAD-debug.apk" >> "$GITHUB_STEP_SUMMARY"
