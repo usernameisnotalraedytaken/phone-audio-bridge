@@ -8,7 +8,10 @@
 # 用法：nohup bash ci-bg.sh > ci-bg.log 2>&1 &
 
 set -u
-cd "$(dirname "$0")"
+# push_via_api.py 在仓库根目录，不在本脚本所在目录。
+# 踩过一次：路径写错导致推送静默失败，CI 一直在看旧记录。
+REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+cd "$REPO_ROOT"
 
 REPO=usernameisnotalraedytaken/phone-audio-bridge
 export GH_TOKEN="$(gh auth token 2>/dev/null)"

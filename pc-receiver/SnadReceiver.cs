@@ -194,7 +194,12 @@ namespace Snad
             int port = DefaultPort;
             int logPort = DefaultPort + 1;
             bool listOnly = false;
-            LogVerbosity verbosity = LogVerbosity.None;
+            // 默认 verbose：启动阶段的信息（档位、设备选择、信标广播、缓冲换算）
+            // 是排查问题的第一手材料，默认就写下来。
+            // 之前默认 none 只在 WARN/ERROR 落盘，结果调试时连"信标广播已启动"
+            // 都看不到，只能去翻 stdout —— 默认值应该偏向可排查，而不是偏向省空间。
+            // 日常嫌吵可显式加 --log none。
+            LogVerbosity verbosity = LogVerbosity.Verbose;
             string profileOverride = null;   // --profile 覆盖配置文件中的选择
 
             for (int i = 0; i < args.Length; i++)
