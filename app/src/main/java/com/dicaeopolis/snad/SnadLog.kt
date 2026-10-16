@@ -60,23 +60,23 @@ object SnadLog {
             socket = try {
                 DatagramSocket()
             } catch (t: Throwable) {
-                error("SnadLog", "日志 socket 创建失败", t)
+                err("SnadLog", "日志 socket 创建失败", t)
                 null
             }
         } catch (t: Throwable) {
-            error("SnadLog", "日志目标地址解析失败 host=$host", t)
+            err("SnadLog", "日志目标地址解析失败 host=$host", t)
             this.host = null
         }
     }
 
     fun close() {
-        try { socket?.close() } catch (t: Throwable) { /* 关闭失败无需上报，但要留痕 */ warn("SnadLog", "close 异常: ${t.javaClass.simpleName}: ${t.message}") }
+        try { socket?.close() } catch (t: Throwable) { wrn("SnadLog", "close 异常: ${t.javaClass.simpleName}: ${t.message}") }
         socket = null
     }
 
-    fun i(tag: String, msg: String) = emit("INFO ", tag, msg, null)
-    fun w(tag: String, msg: String) = emit("WARN ", tag, msg, null)
-    fun e(tag: String, msg: String, t: Throwable? = null) = emit("ERROR", tag, msg, t)
+    fun info(tag: String, msg: String) = emit("INFO ", tag, msg, null)
+    fun wrn(tag: String, msg: String) = emit("WARN ", tag, msg, null)
+    fun err(tag: String, msg: String, t: Throwable? = null) = emit("ERROR", tag, msg, t)
 
     /** 记录一次失败但不抛出的操作，把"被吞掉的异常"变成可见记录。 */
     fun soft(tag: String, what: String, t: Throwable) {

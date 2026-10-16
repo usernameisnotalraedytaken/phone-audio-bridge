@@ -85,21 +85,21 @@ class AudioCaptureService : Service() {
         SnadLog.init(this)
 
         if (intent == null) {
-            SnadLog.e(TAG, "onStartCommand 收到 null intent（服务可能被系统重启），不做任何事")
+            SnadLog.err(TAG, "onStartCommand 收到 null intent（服务可能被系统重启），不做任何事")
             return START_NOT_STICKY
         }
 
-        SnadLog.i(TAG, "onStartCommand action=${intent.action} startId=$startId")
+        SnadLog.info(TAG, "onStartCommand action=${intent.action} startId=$startId")
 
         when (intent.action) {
             ACTION_STOP -> {
-                SnadLog.i(TAG, "收到停止指令")
+                SnadLog.info(TAG, "收到停止指令")
                 stopEverything("用户停止")
                 return START_NOT_STICKY
             }
             ACTION_START -> {
                 if (running.get()) {
-                    SnadLog.w(TAG, "服务已在运行，忽略本次重复启动")
+                    SnadLog.wrn(TAG, "服务已在运行，忽略本次重复启动")
                     return START_NOT_STICKY
                 }
                 val code = intent.getIntExtra(EXTRA_RESULT_CODE, 0)
@@ -108,7 +108,7 @@ class AudioCaptureService : Service() {
                 val host = intent.getStringExtra(EXTRA_HOST).orEmpty()
                 val port = intent.getIntExtra(EXTRA_PORT, SnadProtocol.DEFAULT_PORT)
 
-                SnadLog.i(TAG, "启动参数 host=$host port=$port resultCode=$code data=${data != null}")
+                SnadLog.info(TAG, "启动参数 host=$host port=$port resultCode=$code data=${data != null}")
 
                 if (data == null || code == 0) {
                     fail("缺少 MediaProjection 授权数据（resultCode=$code, data=${data != null}）。" +
@@ -124,7 +124,7 @@ class AudioCaptureService : Service() {
                 startForegroundCompat()
                 startCapture(code, data, host, port)
             }
-            else -> SnadLog.w(TAG, "未知 action=${intent.action}，忽略")
+            else -> SnadLog.wrn(TAG, "未知 action=${intent.action}，忽略")
         }
         return START_NOT_STICKY
     }
@@ -153,9 +153,9 @@ class AudioCaptureService : Service() {
             } else {
                 startForeground(NOTIF_ID, notif)
             }
-            SnadLog.i(TAG, "前台服务已启动（type=mediaProjection, sdk=${Build.VERSION.SDK_INT}）")
+            SnadLog.info(TAG, "前台服务已启动（type=mediaProjection, sdk=${Build.VERSION.SDK_INT}）")
         } catch (t: Throwable) {
-            SnadLog.e(TAG, "startForeground 失败，服务无法在后台存活", t)
+            SnadLog.err(TAG, "startForeground 失败，服务无法在后台存活", t)
             fail("启动前台服务失败：${t.javaClass.simpleName}: ${t.message}")
         }
     }
@@ -168,7 +168,7 @@ class AudioCaptureService : Service() {
         val proj = try {
             mpm.getMediaProjection(resultCode, resultData)
         } catch (t: Throwable) {
-            SnadLog.e(TAG, "getMediaProjection 抛异常", t)
+            SnadLog.err(TAG, "getMediaProjection 抛异常", t)
             fail("获取 MediaProjection 失败：${t.javaClass.simpleName}: ${t.message}")
             stopEverything("授权失败")
             return
@@ -179,7 +179,7 @@ class AudioCaptureService : Service() {
             return
         }
         projection = proj
-        SnadLog.i(TAG, "MediaProjection 获取成功")
+        SnadLog.info(TAG, "MediaProjection 获取成功")
 
         // 硬件侧仍需要 VirtualDisplay 才肯出数据；尺寸给最小，我们不要画面。
         try {
@@ -188,7 +188,7 @@ class AudioCaptureService : Service() {
                 android.hardware.display.DisplayManager.VIRTUAL_DISPLAY_FLAG_AUTO_MIRROR,
                 null, null, null
             )
-            SnadLog.i(TAG, "VirtualDisplay 创建成功（1x1，仅用于满足抓取前提）")
+            SnadLog.info(TAG, "VirtualDisplay 创建成功（1x1，仅用于满足抓取前提）")
         } catch (t: Throwable) {
             SnadLog.soft(TAG, "createVirtualDisplay（无画面需求，可继续）", t)
         }
@@ -200,7 +200,7 @@ class AudioCaptureService : Service() {
                 .addMatchingUsage(AudioAttributes.USAGE_UNKNOWN)
                 .build()
         } catch (t: Throwable) {
-            SnadLog.e(TAG, "构建 AudioPlaybackCaptureConfiguration 失败", t)
+            SnadLog.err(TAG, "构建 AudioPlaybackCaptureConfiguration 失败", t)
             fail("抓取配置失败：${t.javaClass.simpleName}: ${t.message}")
             stopEverything("配置失败")
             return
@@ -210,10 +210,10 @@ class AudioCaptureService : Service() {
             sampleRate, AudioFormat.CHANNEL_IN_STEREO, AudioFormat.ENCODING_PCM_16BIT
         )
         if (minBuf <= 0) {
-            SnadLog.w(TAG, "getMinBufferSize 返回异常值 $minBuf，改用 4096 兜底")
+            SnadLog.wrn(TAG, "getMinBufferSize 返回异常值 $minBuf，改用 4096 兜底")
         }
         val bufSize = max(if (minBuf > 0) minBuf * 2 else 8192, SnadProtocol.PAYLOAD_BYTES * 4)
-        SnadLog.i(TAG, "AudioRecord 参数：minBuf=$minBuf 实际缓冲=$bufSize " +
+        SnadLog.info(TAG, "AudioRecord 参数：minBuf=$minBuf 实际缓冲=$bufSize " +
                 "请求 ${sampleRate}Hz/2ch/16bit")
 
         val ar = try {
@@ -229,14 +229,14 @@ class AudioCaptureService : Service() {
                 .setAudioPlaybackCaptureConfig(cfg)
                 .build()
         } catch (t: Throwable) {
-            SnadLog.e(TAG, "AudioRecord 构建失败（厂商 ROM 可能限制内部音频抓取）", t)
+            SnadLog.err(TAG, "AudioRecord 构建失败（厂商 ROM 可能限制内部音频抓取）", t)
             fail("创建录音器失败：${t.javaClass.simpleName}: ${t.message}")
             stopEverything("录音器失败")
             return
         }
 
         if (ar.state != AudioRecord.STATE_INITIALIZED) {
-            SnadLog.e(TAG, "AudioRecord 状态非 INITIALIZED，state=${ar.state}（0=INITIALIZED,1=UNINITIALIZED）")
+            SnadLog.err(TAG, "AudioRecord 状态非 INITIALIZED，state=${ar.state}（0=INITIALIZED,1=UNINITIALIZED）")
             try { ar.release() } catch (t: Throwable) { SnadLog.soft(TAG, "释放未初始化的 AudioRecord", t) }
             fail("录音器未初始化（state=${ar.state}），可能是厂商 ROM 禁止内部音频捕获")
             stopEverything("初始化失败")
@@ -246,13 +246,13 @@ class AudioCaptureService : Service() {
         record = ar
         channels = ar.channelCount.coerceAtLeast(1)
         sampleRate = ar.sampleRate
-        SnadLog.i(TAG, "AudioRecord 就绪：实际 ${sampleRate}Hz / ${channels}ch " +
+        SnadLog.info(TAG, "AudioRecord 就绪：实际 ${sampleRate}Hz / ${channels}ch " +
                 "(请求 48000Hz/2ch，若不同说明设备没接受该格式)")
 
         val sock = try {
             DatagramSocket()
         } catch (t: Throwable) {
-            SnadLog.e(TAG, "UDP socket 创建失败", t)
+            SnadLog.err(TAG, "UDP socket 创建失败", t)
             fail("创建 UDP socket 失败：${t.javaClass.simpleName}: ${t.message}")
             try { ar.release() } catch (t2: Throwable) { SnadLog.soft(TAG, "释放 AudioRecord", t2) }
             stopEverything("socket 失败")
@@ -263,7 +263,7 @@ class AudioCaptureService : Service() {
         val dest = try {
             InetAddress.getByName(host)
         } catch (t: Throwable) {
-            SnadLog.e(TAG, "地址解析失败 host=$host", t)
+            SnadLog.err(TAG, "地址解析失败 host=$host", t)
             fail("电脑地址无法解析：$host")
             closeQuietly(ar, sock)
             stopEverything("地址无效")
@@ -290,10 +290,10 @@ class AudioCaptureService : Service() {
         try {
             ar.startRecording()
             if (ar.recordingState != AudioRecord.RECORDSTATE_RECORDING) {
-                SnadLog.e(TAG, "startRecording 后状态异常：recordingState=${ar.recordingState}")
+                SnadLog.err(TAG, "startRecording 后状态异常：recordingState=${ar.recordingState}")
                 report("error", "录音未真正启动（state=${ar.recordingState}）")
             }
-            SnadLog.i(TAG, "开始串流 -> $dest:$port  ${sampleRate}Hz/${channels}ch  " +
+            SnadLog.info(TAG, "开始串流 -> $dest:$port  ${sampleRate}Hz/${channels}ch  " +
                     "每包 ${pcm.size}B ≈ ${"%.1f".format(pcm.size * 1000.0 / (sampleRate * channels * 2))}ms")
             report("streaming", "$dest:$port  ${sampleRate}Hz/${channels}ch")
 
@@ -306,7 +306,7 @@ class AudioCaptureService : Service() {
                     val n = try {
                         ar.read(pcm, filled, pcm.size - filled)
                     } catch (t: Throwable) {
-                        SnadLog.e(TAG, "AudioRecord.read 抛异常", t)
+                        SnadLog.err(TAG, "AudioRecord.read 抛异常", t)
                         -1
                     }
                     if (n > 0) {
@@ -317,17 +317,17 @@ class AudioCaptureService : Service() {
                     readErrors++
                     // 前几次以及每 200 次记录一次，避免刷屏但绝不静默
                     if (readErrors <= 5 || readErrors % 200 == 0L) {
-                        SnadLog.w(TAG, "read 返回 $n（累计 $readErrors 次）。" +
+                        SnadLog.wrn(TAG, "read 返回 $n（累计 $readErrors 次）。" +
                                 "0=暂无数据且未溢出, ERROR_INVALID_OPERATION=-3, ERROR_BAD_VALUE=-2, ERROR_DEAD_OBJECT=-6")
                     }
                     if (n == AudioRecord.ERROR_DEAD_OBJECT) {
-                        SnadLog.e(TAG, "AudioRecord 已失效（ERROR_DEAD_OBJECT），停止并提示重新授权")
+                        SnadLog.err(TAG, "AudioRecord 已失效（ERROR_DEAD_OBJECT），停止并提示重新授权")
                         report("error", "录音对象已失效，请停止后重新开始")
                         running.set(false)
                         break
                     }
                     try { Thread.sleep(5) } catch (ie: InterruptedException) {
-                        SnadLog.w(TAG, "等待线程被中断：${ie.message}")
+                        SnadLog.wrn(TAG, "等待线程被中断：${ie.message}")
                         Thread.currentThread().interrupt()
                     }
                 }
@@ -347,7 +347,7 @@ class AudioCaptureService : Service() {
                     System.arraycopy(pcm, 0, buf, header.size, filled)
                     buf
                 } catch (t: Throwable) {
-                    SnadLog.e(TAG, "组包失败", t)
+                    SnadLog.err(TAG, "组包失败", t)
                     continue
                 }
 
@@ -356,7 +356,7 @@ class AudioCaptureService : Service() {
                     bytesSent += filled
                     packetsSent++
                 } catch (t: Throwable) {
-                    SnadLog.e(TAG, "UDP 发送失败（第 $packetsSent 包）", t)
+                    SnadLog.err(TAG, "UDP 发送失败（第 $packetsSent 包）", t)
                     report("error", "发送失败：${t.javaClass.simpleName}: ${t.message}")
                     // 网络类错误不致命，继续尝试；连续失败会在下面的周期日志里体现
                 }
@@ -364,7 +364,7 @@ class AudioCaptureService : Service() {
                 val now = SystemClock.elapsedRealtime()
                 if (now - lastLog >= 10_000) {
                     val kbps = bytesSent * 8.0 / 1000.0 / ((now - lastLog) / 1000.0)
-                    SnadLog.i(TAG, "周期统计：$packetsSent 包 / ${bytesSent / 1024} KB / ≈${"%.0f".format(kbps)} kbps" +
+                    SnadLog.info(TAG, "周期统计：$packetsSent 包 / ${bytesSent / 1024} KB / ≈${"%.0f".format(kbps)} kbps" +
                             " / read 异常 $readErrors 次")
                     bytesSent = 0
                     lastLog = now
@@ -372,10 +372,10 @@ class AudioCaptureService : Service() {
                 }
             }
         } catch (t: Throwable) {
-            SnadLog.e(TAG, "发送线程异常退出", t)
+            SnadLog.err(TAG, "发送线程异常退出", t)
             if (running.get()) report("error", "发送线程异常：${t.javaClass.simpleName}: ${t.message}")
         } finally {
-            SnadLog.i(TAG, "发送线程结束，累计 $packetsSent 包")
+            SnadLog.info(TAG, "发送线程结束，累计 $packetsSent 包")
             closeQuietly(ar, sock)
             record = null
             socket = null
@@ -391,7 +391,7 @@ class AudioCaptureService : Service() {
     }
 
     private fun fail(msg: String) {
-        SnadLog.e(TAG, "失败：$msg")
+        SnadLog.err(TAG, "失败：$msg")
         report("error", msg)
     }
 
@@ -407,7 +407,7 @@ class AudioCaptureService : Service() {
         SnadLog.close()
 
         if (wasRunning) {
-            SnadLog.i(TAG, "已停止（$reason）共 $packetsSent 包")
+            SnadLog.info(TAG, "已停止（$reason）共 $packetsSent 包")
             report("idle", "已停止，共发送 $packetsSent 包")
         }
         stopForegroundCompat()
@@ -451,7 +451,7 @@ class AudioCaptureService : Service() {
     }
 
     override fun onDestroy() {
-        SnadLog.i(TAG, "onDestroy")
+        SnadLog.info(TAG, "onDestroy")
         running.set(false)
         try { record?.release() } catch (t: Throwable) { SnadLog.soft(TAG, "onDestroy 释放 AudioRecord", t) }
         try { projection?.stop() } catch (t: Throwable) { SnadLog.soft(TAG, "onDestroy 停止 MediaProjection", t) }
