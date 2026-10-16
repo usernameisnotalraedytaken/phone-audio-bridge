@@ -21,8 +21,43 @@ namespace Snad
         // ---- 坐标轴范围 ----
         private const double FMin = 30.0;
         private const double FMax = 16000.0;
-        private const double DbTop = 0.0;
-        private const double DbBottom = SpectrumAnalyzer.FloorDb;   // -96
+
+        /// <summary>
+        /// dB 轴上下限。默认是频谱用的 0 ~ -96。
+        /// 均衡器窗口会把它改成 ±18 —— EQ 的增益范围只有 ±12dB，
+        /// 用 96dB 的刻度会让曲线挤在顶部一条窄带里，完全看不出形状。
+        /// </summary>
+        public double DbAxisTop = 0.0;
+        public double DbAxisBottom = SpectrumAnalyzer.FloorDb;
+
+        /// <summary>把 dB 轴设为均衡器用途（±range）。</summary>
+        public void UseEqAxis(double range = 18.0)
+        {
+            DbAxisTop = range;
+            DbAxisBottom = -range;
+            _dbTicks = null;
+            Invalidate();
+        }
+
+        private double[] _dbTicks;
+
+        /// <summary>当前轴范围下的主刻度（带标签）。跨度小时用更密的刻度。</summary>
+        private double[] CurrentDbTicks
+        {
+            get
+            {
+                if (_dbTicks != null) return _dbTicks;
+                double span = DbAxisTop - DbAxisBottom;
+                double step = span <= 12 ? 3 : (span <= 48 ? 6 : 12);
+                var list = new System.Collections.Generic.List<double>();
+                // 从 0 向两端取刻度，0 一定包含在内
+                for (double v = 0; v >= DbAxisBottom; v -= step) list.Add(v);
+                for (double v = step; v <= DbAxisTop; v += step) list.Add(v);
+                list.Sort();
+                _dbTicks = list.ToArray();
+                return _dbTicks;
+            }
+        }
 
         // ---- 边距：左侧留给 dB 标签，底部留给频率标签 ----
         private const int PadLeft = 44;
@@ -40,11 +75,8 @@ namespace Snad
         private static readonly string[] FreqLabels =
             { "30", "60", "125", "250", "500", "1k", "2k", "4k", "8k", "16kHz" };
 
-        /// <summary>dB 主刻度（带标签）。密度参照专业音频工具，12dB 一档。</summary>
-        private static readonly double[] DbTicks = { 0, -12, -24, -36, -48, -60, -72, -84 };
 
         /// <summary>dB 次刻度（不带标签，只画线）。</summary>
-        private static readonly double[] DbMinorTicks = { -6, -18, -30, -42, -54, -66, -78, -90 };
 
         private readonly SpectrumAnalyzer _an;
         private Equalizer _eq;
@@ -83,6 +115,15 @@ namespace Snad
         /// <summary>是否允许拖动频段节点。</summary>
         public bool AllowBandDrag = true;
 
+        /// <summary>
+        /// 是否绘制频谱。均衡器窗口里关掉它——那里只需要 EQ 曲线与栅格，
+        /// 叠一层频谱反而看不清曲线。
+        /// </summary>
+        public bool ShowSpectrum = true;
+
+        /// <summary>是否绘制 EQ 曲线。</summary>
+        public bool ShowEqCurve = true;
+
         private RectangleF Plot
         {
             get
@@ -113,7 +154,7 @@ namespace Snad
         private float DbToY(double db)
         {
             var p = Plot;
-            double t = (db - DbBottom) / (DbTop - DbBottom);
+            double t = (db - DbAxisBottom) / (DbAxisTop - DbAxisBottom);
             if (t < 0) t = 0; if (t > 1) t = 1;
             return (float)(p.Bottom - t * p.Height);
         }
@@ -132,10 +173,13 @@ namespace Snad
 
             DrawBackgroundGradient(g, p);
             DrawGrid(g, p);
-            DrawSpectrum(g, p);
-            DrawGridOverlay(g, p);          // 补画横栅格，避免被频谱填充盖住
+            if (ShowSpectrum)
+            {
+                DrawSpectrum(g, p);
+                DrawGridOverlay(g, p);      // 补画横栅格，避免被频谱填充盖住
+            }
             DrawAxisLabels(g, p);
-            if (_eq != null) DrawEqCurve(g, p);
+            if (ShowEqCurve && _eq != null) DrawEqCurve(g, p);
             DrawInteraction(g, p);
             DrawFrame(g, p);
         }
@@ -163,16 +207,10 @@ namespace Snad
                 using (var pen = new Pen(Theme.Grid, 1f))
                     g.DrawLine(pen, x, p.Top, x, p.Bottom);
             }
-            foreach (double db in DbTicks)
+            foreach (double db in CurrentDbTicks)
             {
                 float y = DbToY(db);
                 using (var pen = new Pen(db == 0 ? Theme.GridMajor : Theme.Grid, 1f))
-                    g.DrawLine(pen, p.Left, y, p.Right, y);
-            }
-            foreach (double db in DbMinorTicks)
-            {
-                float y = DbToY(db);
-                using (var pen = new Pen(Color.FromArgb(70, Theme.Grid), 1f))
                     g.DrawLine(pen, p.Left, y, p.Right, y);
             }
         }
@@ -180,7 +218,7 @@ namespace Snad
         /// <summary>在频谱填充之上重画横栅格，让刻度始终可见（否则被填充盖住）。</summary>
         private void DrawGridOverlay(Graphics g, RectangleF p)
         {
-            foreach (double db in DbTicks)
+            foreach (double db in CurrentDbTicks)
             {
                 float y = DbToY(db);
                 using (var pen = new Pen(Color.FromArgb(db == 0 ? 120 : 60, Theme.GridMajor), 1f))
@@ -206,7 +244,7 @@ namespace Snad
                 _smooth = new float[n];
                 _peakHold = new float[n];
                 _peakHoldFrames = new int[n];
-                for (int i = 0; i < n; i++) { _smooth[i] = (float)DbBottom; _peakHold[i] = (float)DbBottom; }
+                for (int i = 0; i < n; i++) { _smooth[i] = (float)DbAxisBottom; _peakHold[i] = (float)DbAxisBottom; }
             }
 
             int cols = Math.Max(24, (int)(p.Width / 4));   // 每 4px 一列，柱宽随窗口自适应
@@ -226,7 +264,7 @@ namespace Snad
                 // 峰值保持
                 if (next > _peakHold[bi]) { _peakHold[bi] = next; _peakHoldFrames[bi] = 45; }
                 else if (_peakHoldFrames[bi] > 0) _peakHoldFrames[bi]--;
-                else _peakHold[bi] += ((float)DbBottom - _peakHold[bi]) * 0.05f;
+                else _peakHold[bi] += ((float)DbAxisBottom - _peakHold[bi]) * 0.05f;
 
                 float y = DbToY(next);
                 pts[c] = new PointF(p.Left + (c + 0.5f) * (p.Width / cols), y);
@@ -269,7 +307,7 @@ namespace Snad
             {
                 double f = XToFreq(p.Left + (c + 0.5f) * (p.Width / cols));
                 int bi = FreqToBarIndex(f, n);
-                if (_peakHold[bi] <= DbBottom + 6) continue;
+                if (_peakHold[bi] <= DbAxisBottom + 6) continue;
                 float y = DbToY(_peakHold[bi]);
                 float x = p.Left + (c + 0.5f) * (p.Width / cols);
                 using (var pen = new Pen(Color.FromArgb(70, Theme.SpectrumPeak), 1f))
@@ -298,7 +336,7 @@ namespace Snad
 
             using (var br = new SolidBrush(Theme.TextTertiary))
             {
-                foreach (double db in DbTicks)
+                foreach (double db in CurrentDbTicks)
                 {
                     string s = db == 0 ? "0" : db.ToString("0");
                     var sz = g.MeasureString(s, fDb);
@@ -336,11 +374,9 @@ namespace Snad
                 float x = p.Left + i * (p.Width / (steps - 1));
                 double f = XToFreq(x);
                 double db = _eq.ResponseDb(f);
-                // 曲线显示范围 ±18dB 映射到绘图区上下留白内，超出部分贴边
-                float y = DbToY(db);
-                if (y < p.Top) y = p.Top;
-                if (y > p.Bottom) y = p.Bottom;
-                pts[i] = new PointF(x, y);
+                // DbToY 已按当前轴范围钳位；这里不必再夹一次，
+                // 否则轴范围一变（例如 EQ 窗口用 ±18）曲线会被压在边界上
+                pts[i] = new PointF(x, DbToY(db));
             }
 
             // 关闭时曲线压暗，明确区分"启用中"与"只是显示"
@@ -466,7 +502,7 @@ namespace Snad
             {
                 // 纵向拖动改增益。映射到 ±18dB 显示范围，手感与图上曲线一致。
                 var p = Plot;
-                double db = DbBottom + (p.Bottom - e.Y) / p.Height * (DbTop - DbBottom);
+                double db = DbAxisBottom + (p.Bottom - e.Y) / p.Height * (DbAxisTop - DbAxisBottom);
                 if (db > Equalizer.MaxGainDb) db = Equalizer.MaxGainDb;
                 if (db < Equalizer.MinGainDb) db = Equalizer.MinGainDb;
                 _eq.SetGain(_dragBand, db);

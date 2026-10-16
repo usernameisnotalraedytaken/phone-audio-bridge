@@ -660,15 +660,40 @@ namespace Snad
 
         public bool IsOpen { get { return _open; } }
 
+        /// <summary>
+        /// 滚动位置的合法区间。
+        ///
+        /// 高亮条固定在顶行，因此"第一行显示哪一项"就等于"选中哪一项"。
+        /// 为了让任何选中项都能滚到顶行、同时底部不留空行，区间取
+        /// [总数-可见行数, 总数-1]（列表比可见行数短时退化为 [0, 总数-1]）。
+        /// </summary>
+        private void OffsetRange(out double lo, out double hi)
+        {
+            int n = _items.Length;
+            if (n <= 0) { lo = 0; hi = 0; return; }
+            double maxStart = Math.Max(0, n - VisibleRows);
+            lo = maxStart;
+            hi = n - 1;
+            if (hi < lo) hi = lo;
+        }
+
+        private double ClampOffset(double v)
+        {
+            double lo, hi;
+            OffsetRange(out lo, out hi);
+            if (v < lo) v = lo;
+            if (v > hi) v = hi;
+            return v;
+        }
+
         public void Open()
         {
             if (_open || _items.Length == 0) return;
             _open = true;
 
-            // 展开时把滚动位置设为 0，即从列表第一项开始显示。
-            // 选中项会被定位到第一行（高亮条所在处），其余项在下方依次排开——
-            // 这样展开是"向下长出来"，不会把当前值顶到别处。
-            _offset = 0;
+            // 展开时让选中项落在第一行（高亮条所在处），其余项在下方依次排开。
+            // 这样"展开"是纯粹的向下长出，当前值始终停在原地。
+            _offset = ClampOffset(_index);
             Height = ExpandedHeight + 2;
             NotifyHeightChanged();
 
@@ -932,10 +957,7 @@ namespace Snad
             if (!_dragging || !_open) return;
             // 向上拖动 = 内容上移 = 索引变大，与触屏直觉一致
             double delta = (double)(_dragStartY - e.Y) / RowHeight;
-            double o = _dragStartOffset + delta;
-            double max = _items.Length - 1;
-            if (o < 0) o = 0; if (o > max) o = max;
-            _offset = o;
+            _offset = ClampOffset(_dragStartOffset + delta);
             Invalidate();
         }
 
@@ -948,8 +970,10 @@ namespace Snad
             _dragging = false;
             Capture = false;
 
-            // 松手吸附到最近一项
-            int target = (int)Math.Round(_offset);
+            // 松手吸附到最近一项。
+            // 高亮条固定在顶行，因此"滚到哪一行"就是选中哪一项——
+            // 两者必须收敛到同一个值，否则会出现"高亮的和选中的不是同一个"。
+            int target = (int)Math.Round(ClampOffset(_offset));
             if (target < 0) target = 0;
             if (target >= _items.Length) target = _items.Length - 1;
             _offset = target;
@@ -988,6 +1012,88 @@ namespace Snad
         {
             if (disposing) _anim.Dispose();
             base.Dispose(disposing);
+        }
+    }
+
+    /// <summary>
+    /// 可折叠的日志区。
+    ///
+    /// 日志是排查用的，正常使用时它只占地方——因此默认折叠，只留一条标题栏，
+    /// 点击标题栏展开/收起。标题栏同时显示行数，折叠时也知道有没有新日志。
+    /// </summary>
+    internal sealed class CollapsibleLog : Panel
+    {
+        private readonly LogStrip _log;
+        private readonly Label _header;
+        private bool _expanded;
+
+        /// <summary>展开后的高度。</summary>
+        public int ExpandedHeight = 130;
+
+        /// <summary>折叠时只留标题栏的高度。</summary>
+        public int CollapsedHeight = 26;
+
+        public CollapsibleLog()
+        {
+            BackColor = Theme.BgPanel;
+            _header = new Label
+            {
+                Dock = DockStyle.Top,
+                Height = CollapsedHeight,
+                BackColor = Theme.BgPanel,
+                ForeColor = Theme.TextTertiary,
+                Font = Theme.Label(8f),
+                TextAlign = ContentAlignment.MiddleLeft,
+                Padding = new Padding(12, 0, 12, 0),
+                Cursor = Cursors.Hand,
+                Text = "LOG  [+]  0 LINES"
+            };
+            _header.Click += (s, e) => Toggle();
+            Controls.Add(_header);
+
+            _log = new LogStrip { Visible = false, BackColor = Theme.BgPanel };
+            Controls.Add(_log);
+
+            Height = CollapsedHeight;
+            Resize += (s, e) => LayoutChildren();
+            LayoutChildren();
+        }
+
+        public bool Expanded { get { return _expanded; } }
+
+        public void Toggle()
+        {
+            _expanded = !_expanded;
+            _log.Visible = _expanded;
+            Height = _expanded ? ExpandedHeight : CollapsedHeight;
+            UpdateHeader();
+            LayoutChildren();
+            if (_expanded) _log.Focus();
+        }
+
+        public void Append(string line)
+        {
+            _log.Append(line);
+            UpdateHeader();
+        }
+
+        public void Clear()
+        {
+            _log.Clear();
+            UpdateHeader();
+        }
+
+        private void UpdateHeader()
+        {
+            _header.Text = "LOG  " + (_expanded ? "[−]" : "[+]") + "  " + _log.LineCount + " LINES";
+        }
+
+        private void LayoutChildren()
+        {
+            _log.Bounds = new Rectangle(
+                12, CollapsedHeight,
+                Math.Max(10, ClientSize.Width - 24),
+                Math.Max(10, ClientSize.Height - CollapsedHeight - 6));
         }
     }
 
@@ -1057,6 +1163,9 @@ namespace Snad
             _bar.Value = int.MaxValue;
             UpdateScrollMetrics();
         }
+
+        /// <summary>已记录的行数。折叠时用来在标题栏显示。</summary>
+        public int LineCount { get { return _lines.Count; } }
 
         private void UpdateScrollMetrics()
         {

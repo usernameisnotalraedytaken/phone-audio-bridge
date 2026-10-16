@@ -25,12 +25,11 @@ namespace Snad
         private FlatButton _eqBtn;
         private SpectrumGraph _graph;
         private MetricStrip _metrics;
-        private LogStrip _log;
+        private CollapsibleLog _logHost;
         private NotifyIcon _tray;
         private Panel _titleBar;
         private Panel _graphHost;
         private Panel _controlsRow;
-        private Panel _logHost;
         private Label _titleMain, _titleSub, _stateLabel, _rateLabel;
         private Panel _dot;
 
@@ -199,19 +198,10 @@ namespace Snad
             controls.Controls.AddRange(new Control[] { _profileBox, _deviceBox, _startBtn, _eqBtn });
             controls.Resize += (s, e) => LayoutControlRow();
 
-            // ---- 事件日志 ----
-            // TextBox 的 Dock=Fill 在固定高度的容器里不会撑满（它有自己的
-            // 首选高度），因此改为四边锚定 + 容器尺寸变化时同步大小。
-            var logHost = new Panel { Dock = DockStyle.Bottom, Height = 118, BackColor = Theme.BgPanel, Padding = new Padding(12, 8, 12, 8) };
-            _log = new LogStrip { BackColor = Theme.BgPanel };
-            logHost.Controls.Add(_log);
-            logHost.Resize += (s, e) =>
-            {
-                _log.Bounds = new Rectangle(
-                    logHost.Padding.Left, logHost.Padding.Top,
-                    Math.Max(10, logHost.ClientSize.Width - logHost.Padding.Horizontal),
-                    Math.Max(10, logHost.ClientSize.Height - logHost.Padding.Vertical));
-            };
+            // ---- 事件日志（默认折叠）----
+            // 日志是排查用的，正常使用时只占地方。折叠后只留一条标题栏，
+            // 点击展开；标题栏显示行数，折叠时也知道有没有新日志。
+            var logHost = new CollapsibleLog { BackColor = Theme.BgPanel };
 
             // ---- 组装 ----
             // 不用 Dock 排版面：WinForms 的停靠顺序由控件在集合里的次序决定，
@@ -796,9 +786,9 @@ namespace Snad
         /// <summary>写事件日志。所有运行期消息都汇总到这里，便于事后排查。</summary>
         private void AppendLog(string s)
         {
-            if (_log == null || _log.IsDisposed) return;
-            if (_log.InvokeRequired) { _log.BeginInvoke(new Action<string>(AppendLog), s); return; }
-            _log.Append(s);
+            if (_logHost == null || _logHost.IsDisposed) return;
+            if (_logHost.InvokeRequired) { _logHost.BeginInvoke(new Action<string>(AppendLog), s); return; }
+            _logHost.Append(s);
         }
 
         protected override void OnFormClosing(FormClosingEventArgs e)

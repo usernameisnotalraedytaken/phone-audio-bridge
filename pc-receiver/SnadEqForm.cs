@@ -1,10 +1,13 @@
-// 均衡器窗口：10 段推子 + 预设 + 前置增益 + 联动拖动。
+// 均衡器窗口。
 //
-// 为什么做成独立窗口而不是嵌在主界面里：主界面逻辑可用高度只有约 480 像素，
-// 已被频谱、波形、统计占满，塞不下 10 段竖向推子。
+// 形态参照 Cubase / FabFilter 那一类专业 DSP 插件：
+//   上半部是一张大的频响曲线图（节点可直接拖动），
+//   下半部是一排控制条（开关、前置、预设、逐段推子、读数）。
+// 曲线是视觉主体——插件里"图"就是界面，"控件"只是它的注脚。
 //
-// 改动直接作用于正在运行的 Equalizer 实例，因此拖动推子能实时听到变化，
-// 不需要重启接收器。
+// 文字一律英文。原因有二：
+//   1. Consolas 不含汉字，中英混排时中文会回退到别的字体，字重与行高都不一致；
+//   2. 专业插件的界面语言本来就是英文缩写（PREAMP / FLAT / BASS），更利落。
 
 using System;
 using System.Drawing;
@@ -14,64 +17,39 @@ namespace Snad
 {
     internal sealed class EqForm : Form
     {
-        private static readonly Color BgDark = Color.FromArgb(18, 20, 26);
-        private static readonly Color BgPanel = Color.FromArgb(26, 29, 36);
-        private static readonly Color BgBar = Color.FromArgb(36, 40, 50);
-        private static readonly Color FgMain = Color.FromArgb(226, 232, 240);
-        private static readonly Color FgDim = Color.FromArgb(146, 156, 172);
-        private static readonly Color Accent = Color.FromArgb(76, 194, 255);
-        private static readonly Color Warn = Color.FromArgb(255, 138, 92);
-        private static readonly Color Grid = Color.FromArgb(44, 49, 60);
-
-        private const int SliderMin = -12;
-        private const int SliderMax = 12;
-
-        // 尺寸：间距放宽，避免控件挤在一起（用户反馈"显得局促"）
-        private const int ColumnWidth = 72;
-        private const int SliderWidth = 40;
-        private const int SliderHeight = 300;
-        private const int TopRowHeight = 54;
-        private const int PresetRowHeight = 50;
-        private const int HintHeight = 56;
-        private const int BandLabelHeight = 22;
-        private const int ReadoutHeight = 24;
-        private const int BandGap = 8;
-
         private readonly Equalizer _eq;
         private readonly Action<string> _log;
 
-        private CheckBox _enable;
-        private CheckBox _couple;
-        private TrackBar[] _sliders;
-        private Label[] _valueLabels;
-        private NumericUpDown _preamp;
+        private SpectrumGraph _graph;
+        private FlatToggle _enable;
+        private FlatToggle _couple;
+        private FlatStepper _preamp;
         private Label _hint;
+        private EqFader[] _faders;
+        private Label[] _valueLabels;
 
         /// <summary>防止联动拖动时事件递归。</summary>
         private bool _adjusting;
 
-        /// <summary>
-        /// 联动强度：相邻频段跟随的比例按这个标准差衰减。
-        /// 1.1 表示隔一个频段约跟随 66%，隔两个约 19%。
-        /// </summary>
-        private double _coupleSigma = 1.1;
+        /// <summary>联动强度：相邻频段跟随比例按高斯衰减。sigma=1.1 时紧邻约跟随 66%。</summary>
+        private const double CoupleSigma = 1.1;
 
         public EqForm(Equalizer eq, Action<string> log)
         {
             _eq = eq;
             _log = log;
 
-            Text = "均衡器";
-            BackColor = BgDark;
-            ForeColor = FgMain;
-            Font = new Font("Microsoft YaHei UI", 9f);
-            // 不用 FixedToolWindow：它会按内容自动收缩，把显式设置的 ClientSize 绕过，
-            // 结果窗口比预设按钮区窄，最右侧按钮被裁（实测 758 宽装不下 808 的内容）。
+            Text = "SNAD  EQUALIZER";
+            BackColor = Theme.BgBase;
+            ForeColor = Theme.TextPrimary;
+            Font = Theme.Mono(9f);
+            // FixedToolWindow 会按内容自动收缩并绕过 ClientSize，导致最右控件被裁
             FormBorderStyle = FormBorderStyle.FixedSingle;
             MaximizeBox = false;
             MinimizeBox = false;
             StartPosition = FormStartPosition.CenterParent;
             ShowInTaskbar = false;
+            SetStyle(ControlStyles.OptimizedDoubleBuffer, true);
 
             BuildUi();
             SyncFromEq();
@@ -79,234 +57,224 @@ namespace Snad
 
         private void BuildUi()
         {
+            SuspendLayout();
+
             int bandCount = _eq.Bands.Count;
+            const int colW = 62;
+            const int faderH = 104;
+            const int readoutH = 18;
+            const int graphH = 300;
 
-            // ---- 第一行：启用 / 联动 / 前置增益 ----
-            var top = new Panel { Dock = DockStyle.Top, Height = TopRowHeight, BackColor = BgPanel, Padding = new Padding(16, 12, 16, 10) };
-
-            _enable = new CheckBox
+            // ---- 曲线图（视觉主体）----
+            _graph = new SpectrumGraph(new SpectrumAnalyzer())
             {
-                Text = "启用均衡器",
-                ForeColor = FgMain,
-                AutoSize = true,
-                Location = new Point(16, 17),
-                Checked = _eq.Enabled
+                Eq = _eq,
+                ShowSpectrum = false,      // 插件里只画 EQ 曲线与栅格，不叠频谱
+                AllowBandDrag = true
             };
+            // dB 轴改为 ±18：EQ 增益只有 ±12dB，沿用频谱的 0~-96 会把曲线
+            // 挤在顶部一条窄带里，形状完全看不出来
+            _graph.UseEqAxis(18.0);
+            _graph.BandChanged += (b, g) => { UpdateReadouts(); UpdateHint(); };
+            _graph.BandReset += b =>
+            {
+                _log("Band " + _eq.Bands[b].Label + " reset to 0");
+                SyncFromEq();
+            };
+
+            var graphHost = new Panel
+            {
+                Dock = DockStyle.Top,
+                Height = graphH,
+                BackColor = Theme.BgBase,
+                Padding = new Padding(10, 10, 10, 4)
+            };
+            graphHost.Controls.Add(_graph);
+            // 不依赖 Dock=Fill：嵌套容器里的 Fill 子控件实测拿不到尺寸（0x0），
+            // 因此显式按宿主客户区摆放。这与主界面日志区用的是同一套办法。
+            graphHost.Resize += (s, e) =>
+            {
+                _graph.Bounds = new Rectangle(
+                    graphHost.Padding.Left, graphHost.Padding.Top,
+                    Math.Max(10, graphHost.ClientSize.Width - graphHost.Padding.Horizontal),
+                    Math.Max(10, graphHost.ClientSize.Height - graphHost.Padding.Vertical));
+            };
+
+            // ---- 控制条 1：开关 + 前置 ----
+            var bar1 = new Panel { Dock = DockStyle.Top, Height = 40, BackColor = Theme.BgPanel, Padding = new Padding(12, 9, 12, 9) };
+
+            _enable = new FlatToggle("EQ ON") { Location = new Point(12, 9), Width = 90, Height = 22 };
             _enable.CheckedChanged += (s, e) =>
             {
                 _eq.Enabled = _enable.Checked;
-                _log("均衡器" + (_enable.Checked ? "已启用" : "已关闭"));
+                _graph.Invalidate();
+                _log("Equalizer " + (_enable.Checked ? "enabled" : "disabled"));
             };
-            top.Controls.Add(_enable);
+            bar1.Controls.Add(_enable);
 
-            // 联动拖动：拖一个推子时相邻推子按距离比例跟随，
-            // 用来整体调整一段频带，而不是逐段抠。
-            _couple = new CheckBox
-            {
-                Text = "联动拖动",
-                ForeColor = FgMain,
-                AutoSize = true,
-                Location = new Point(150, 17),
-                Checked = false
-            };
+            _couple = new FlatToggle("LINK") { Location = new Point(110, 9), Width = 84, Height = 22 };
             _couple.CheckedChanged += (s, e) =>
-                _log("联动拖动" + (_couple.Checked ? "已开启（拖一个推子会带动相邻频段）" : "已关闭"));
-            top.Controls.Add(_couple);
+                _log("Linked drag " + (_couple.Checked ? "on" : "off"));
+            bar1.Controls.Add(_couple);
 
             var preLabel = new Label
             {
-                Text = "前置",
-                ForeColor = FgDim,
+                Text = "PREAMP",
+                ForeColor = Theme.TextTertiary,
+                Font = Theme.Label(7.5f),
                 AutoSize = true,
-                Location = new Point(268, 19)
+                Location = new Point(216, 13)
             };
-            top.Controls.Add(preLabel);
+            bar1.Controls.Add(preLabel);
 
-            _preamp = new NumericUpDown
-            {
-                Minimum = -24,
-                Maximum = 12,
-                DecimalPlaces = 1,
-                Increment = 0.5M,
-                Width = 66,
-                Height = 26,
-                Location = new Point(306, 15),
-                BackColor = BgBar,
-                ForeColor = FgMain,
-                BorderStyle = BorderStyle.FixedSingle,
-                Value = (decimal)_eq.PreampDb
-            };
+            _preamp = new FlatStepper { Location = new Point(266, 8), Width = 96, Height = 24 };
+            _preamp.Configure(-24, 12, 0.5, 1, "dB");
+            _preamp.Value = _eq.PreampDb;
             _preamp.ValueChanged += (s, e) =>
             {
-                _eq.PreampDb = (double)_preamp.Value;
+                _eq.PreampDb = _preamp.Value;
+                _graph.Invalidate();
                 UpdateHint();
             };
-            top.Controls.Add(_preamp);
+            bar1.Controls.Add(_preamp);
 
-            var dbUnit = new Label
-            {
-                Text = "dB（补偿整体提升，避免削波）",
-                ForeColor = FgDim,
-                AutoSize = true,
-                Location = new Point(378, 19)
-            };
-            top.Controls.Add(dbUnit);
-
-            // ---- 第二行：预设 ----
+            // ---- 控制条 2：预设（等宽平铺，不留缺口）----
             var presets = new (string Name, double[] Gains)[]
             {
-                ("全平",     new double[10]),
-                ("低音增强", new double[] {  7,  5,  3,  1,  0,  0,  0,  0,  0,  0 }),
-                ("高音增强", new double[] {  0,  0,  0,  0,  0,  1,  3,  4,  5,  5 }),
-                ("人声突出", new double[] { -2, -1,  1,  3,  4,  3,  1,  0, -1, -1 }),
-                ("夜间小声", new double[] { -3, -2,  0,  2,  3,  2,  0, -2, -4, -5 }),
-                ("削低频",   new double[] { -8, -6, -3,  0,  0,  0,  0,  0,  0,  0 }),
+                ("FLAT",    new double[10]),
+                ("BASS",    new double[] {  7,  5,  3,  1,  0,  0,  0,  0,  0,  0 }),
+                ("TREBLE",  new double[] {  0,  0,  0,  0,  0,  1,  3,  4,  5,  5 }),
+                ("VOCAL",   new double[] { -2, -1,  1,  3,  4,  3,  1,  0, -1, -1 }),
+                ("NIGHT",   new double[] { -3, -2,  0,  2,  3,  2,  0, -2, -4, -5 }),
+                ("CUTLOW",  new double[] { -8, -6, -3,  0,  0,  0,  0,  0,  0,  0 }),
             };
 
-            var presetRow = new Panel { Dock = DockStyle.Top, Height = PresetRowHeight, BackColor = BgDark, Padding = new Padding(16, 8, 16, 8) };
-            int px = 16;
+            int contentW = 12 + bandCount * colW + 12;
+            int presetAreaW = contentW - 24;
+            int btnGap = 6;
+            int btnW = (presetAreaW - btnGap * (presets.Length - 1)) / presets.Length;
+
+            var bar2 = new Panel { Dock = DockStyle.Top, Height = 40, BackColor = Theme.BgBase, Padding = new Padding(12, 7, 12, 7) };
+            int bx = 12;
             foreach (var p in presets)
             {
-                var btn = new Button
-                {
-                    Text = p.Name,
-                    // 按钮留足宽度与间距。FixedToolWindow 会把窗口收缩到内容宽度，
-                    // 按钮挨太紧会让整个窗口显得局促（用户反馈"UI 显得局促"）。
-                    Width = 96,
-                    Height = 32,
-                    Location = new Point(px, 9),
-                    FlatStyle = FlatStyle.Flat,
-                    BackColor = BgBar,
-                    ForeColor = FgMain,
-                    UseVisualStyleBackColor = false,
-                    Tag = p.Gains
-                };
-                btn.FlatAppearance.BorderColor = Accent;
-                btn.FlatAppearance.MouseOverBackColor = Color.FromArgb(52, 60, 74);
+                var btn = new FlatButton(p.Name) { Width = btnW, Height = 26, Location = new Point(bx, 7) };
+                btn.Tag = p.Gains;
                 btn.Click += OnPresetClicked;
-                presetRow.Controls.Add(btn);
-                px += 104;
+                bar2.Controls.Add(btn);
+                bx += btnW + btnGap;
             }
 
-            // ---- 第三行：推子 ----
-            int sliderAreaWidth = bandCount * ColumnWidth;
-            var sliders = new Panel
+            // ---- 控制条 3：逐段推子 + 读数 ----
+            // 刻度由上方曲线图承担，推子上不再重复画刻度线——那是噪音。
+            var faderRow = new Panel
             {
-                Dock = DockStyle.Fill,
-                BackColor = BgDark,
-                Padding = new Padding(16, 10, 16, 8)
+                Dock = DockStyle.Top,
+                Height = faderH + readoutH + 22,
+                BackColor = Theme.BgPanel,
+                Padding = new Padding(12, 6, 12, 6)
             };
-            _sliders = new TrackBar[bandCount];
+            _faders = new EqFader[bandCount];
             _valueLabels = new Label[bandCount];
 
             for (int i = 0; i < bandCount; i++)
             {
-                int x = 16 + i * ColumnWidth;
+                int x = 12 + i * colW;
                 var band = _eq.Bands[i];
+
+                var fd = new EqFader
+                {
+                    Width = colW - 8,
+                    Height = faderH,
+                    Location = new Point(x + 4, 6),
+                    Tag = i
+                };
+                fd.SetRange(-12, 12);
+                fd.GainDb = band.GainDb;
+                fd.ValueChanged += OnFaderChanged;
+                faderRow.Controls.Add(fd);
+                _faders[i] = fd;
+
+                var vl = new Label
+                {
+                    Text = "0.0",
+                    ForeColor = Theme.TextTertiary,
+                    Font = Theme.Metric(9f),
+                    Width = colW,
+                    Height = readoutH,
+                    TextAlign = ContentAlignment.MiddleCenter,
+                    Location = new Point(x, 6 + faderH + 2)
+                };
+                faderRow.Controls.Add(vl);
+                _valueLabels[i] = vl;
 
                 var fl = new Label
                 {
                     Text = band.Label,
-                    ForeColor = FgDim,
-                    Width = ColumnWidth,
-                    Height = BandLabelHeight,
+                    ForeColor = Theme.TextTertiary,
+                    Font = Theme.Label(8f),
+                    Width = colW,
+                    Height = 16,
                     TextAlign = ContentAlignment.MiddleCenter,
-                    Location = new Point(x, 10)
+                    Location = new Point(x, 6 + faderH + readoutH + 2)
                 };
-                sliders.Controls.Add(fl);
-
-                var tb = new TrackBar
-                {
-                    Orientation = Orientation.Vertical,
-                    Minimum = SliderMin,
-                    Maximum = SliderMax,
-                    TickFrequency = 6,
-                    SmallChange = 1,
-                    LargeChange = 3,
-                    Width = SliderWidth,
-                    Height = SliderHeight,
-                    Location = new Point(x + (ColumnWidth - SliderWidth) / 2,
-                                         10 + BandLabelHeight + BandGap),
-                    BackColor = BgDark,
-                    TickStyle = TickStyle.Both,
-                    Value = (int)Math.Round(band.GainDb),
-                    Tag = i
-                };
-                tb.ValueChanged += OnSliderChanged;
-                sliders.Controls.Add(tb);
-                _sliders[i] = tb;
-
-                var vl = new Label
-                {
-                    Text = "0",
-                    ForeColor = FgMain,
-                    Width = ColumnWidth,
-                    Height = ReadoutHeight,
-                    TextAlign = ContentAlignment.MiddleCenter,
-                    Location = new Point(x, 10 + BandLabelHeight + BandGap + SliderHeight + 2)
-                };
-                sliders.Controls.Add(vl);
-                _valueLabels[i] = vl;
+                faderRow.Controls.Add(fl);
             }
 
-            // ---- 第四行：提示 ----
-            var bottom = new Panel { Dock = DockStyle.Bottom, Height = HintHeight, BackColor = BgPanel, Padding = new Padding(16, 10, 16, 10) };
+            // ---- 底部提示 ----
+            var hintHost = new Panel { Dock = DockStyle.Fill, BackColor = Theme.BgBase, Padding = new Padding(12, 6, 12, 8) };
             _hint = new Label
             {
                 Dock = DockStyle.Fill,
-                ForeColor = FgDim,
-                AutoSize = false,
+                ForeColor = Theme.TextTertiary,
+                Font = Theme.Metric(8.5f),
                 TextAlign = ContentAlignment.MiddleLeft
             };
-            bottom.Controls.Add(_hint);
+            hintHost.Controls.Add(_hint);
 
-            Controls.Add(sliders);
-            Controls.Add(bottom);
-            Controls.Add(presetRow);
-            Controls.Add(top);
+            // 添加顺序必须"从内到外"：Fill 最先加，之后才是各条 Top。
+            // WinForms 里后添加的控件先占边缘，若把 Fill 留到最后，
+            // 它会先占满整块，随后加入的 Top 条反而把它的空间挤掉——
+            // 实测把图区放在最后加，图区尺寸直接是 0x0。
+            Controls.Add(graphHost);
+            Controls.Add(hintHost);
+            Controls.Add(faderRow);
+            Controls.Add(bar2);
+            Controls.Add(bar1);
 
-            // 宽度要同时容纳推子区与预设按钮区，且不低于两者中的较大者。
-            int presetAreaRight = 16 + presets.Length * 104 + 8;
-            int sliderAreaRight = 16 + sliderAreaWidth + 16;
-            int wantW = Math.Max(sliderAreaRight, presetAreaRight);
-            int wantH = TopRowHeight + PresetRowHeight + HintHeight +
-                        10 + BandLabelHeight + BandGap + SliderHeight + 2 + ReadoutHeight + 10;
-            ClientSize = new Size(wantW, wantH);
-            MinimumSize = new Size(wantW + 16, wantH + 40);   // 加上边框与标题栏
+            ClientSize = new Size(contentW, graphH + 40 + 40 + (faderH + readoutH + 22) + 32);
+            MinimumSize = new Size(ClientSize.Width + 16, ClientSize.Height + 40);
+
+            ResumeLayout(true);
         }
 
         private void OnPresetClicked(object sender, EventArgs e)
         {
-            var btn = sender as Button;
+            var btn = sender as FlatButton;
             if (btn == null) return;
             var gains = btn.Tag as double[];
             if (gains == null) return;
 
             _eq.SetAllGains(gains);
             SyncFromEq();
-            _log("均衡器预设：" + btn.Text);
+            _log("Preset: " + btn.Text);
         }
 
         /// <summary>
         /// 推子变动。
         ///
-        /// 联动模式下：以被拖动的频段为中心，相邻频段按高斯权重跟随，
-        /// 形成一条平滑的调整曲线，而不是只动一个频段。
-        /// 权重按距离衰减（sigma=1.1 时，紧邻约 66%，隔一个约 19%）。
-        ///
-        /// 拖动会连续触发本事件，因此这里批量设值、最后统一重算一次系数，
-        /// 避免每个频段各自重算三角函数。
+        /// 联动模式下以被拖频段为中心，相邻频段按高斯权重跟随，形成平滑的调整曲线。
+        /// 拖动会连续触发本事件，因此批量设值后统一重算一次系数——
+        /// 若每段各自重算，10 个 biquad 的三角函数会被反复调用上百次。
         /// </summary>
-        private void OnSliderChanged(object sender, EventArgs e)
+        private void OnFaderChanged(object sender, EventArgs e)
         {
             if (_adjusting) return;
-            var tb = sender as TrackBar;
-            if (tb == null) return;
+            var fd = sender as EqFader;
+            if (fd == null) return;
 
-            int idx = (int)tb.Tag;
-            double oldGain = _eq.Bands[idx].GainDb;
-            double newGain = tb.Value;
-            double delta = newGain - oldGain;
+            int idx = (int)fd.Tag;
+            double delta = fd.GainDb - _eq.Bands[idx].GainDb;
             if (Math.Abs(delta) < 1e-9) return;
 
             _adjusting = true;
@@ -320,20 +288,20 @@ namespace Snad
                     else if (_couple.Checked)
                     {
                         double d = j - idx;
-                        w = Math.Exp(-(d * d) / (2.0 * _coupleSigma * _coupleSigma));
+                        w = Math.Exp(-(d * d) / (2.0 * CoupleSigma * CoupleSigma));
                     }
                     else w = 0.0;
 
                     if (w <= 0.01) continue;
-
-                    double target = _eq.Bands[j].GainDb + delta * w;
-                    _eq.SetGainNoRebuild(j, target);
-
-                    int v = (int)Math.Round(_eq.Bands[j].GainDb);
-                    if (v < SliderMin) v = SliderMin;
-                    if (v > SliderMax) v = SliderMax;
-                    if (_sliders[j].Value != v) _sliders[j].Value = v;
-                    _valueLabels[j].Text = v.ToString("+#0;-#0;0");
+                    _eq.SetGainNoRebuild(j, _eq.Bands[j].GainDb + delta * w);
+                    // 联动改到的频段，推子位置也要跟上，否则显示与实际不一致
+                    if (j != idx)
+                    {
+                        double g = _eq.Bands[j].GainDb;
+                        _adjusting = false;
+                        _faders[j].GainDb = g;
+                        _adjusting = true;
+                    }
                 }
                 _eq.RebuildAllFilters();
             }
@@ -341,30 +309,39 @@ namespace Snad
             {
                 _adjusting = false;
             }
+
+            UpdateReadouts();
+            _graph.Invalidate();
             UpdateHint();
         }
 
-        /// <summary>把 Equalizer 的当前状态同步到控件上（预设或外部改动后调用）。</summary>
+        /// <summary>把 Equalizer 的当前状态同步到所有控件与图上。</summary>
         private void SyncFromEq()
         {
             _adjusting = true;
             try
             {
-                for (int i = 0; i < _sliders.Length; i++)
-                {
-                    int v = (int)Math.Round(_eq.Bands[i].GainDb);
-                    if (v < SliderMin) v = SliderMin;
-                    if (v > SliderMax) v = SliderMax;
-                    if (_sliders[i].Value != v) _sliders[i].Value = v;
-                    _valueLabels[i].Text = v.ToString("+#0;-#0;0");
-                }
+                for (int i = 0; i < _faders.Length; i++) _faders[i].GainDb = _eq.Bands[i].GainDb;
             }
             finally
             {
                 _adjusting = false;
             }
             _enable.Checked = _eq.Enabled;
+            UpdateReadouts();
+            _graph.Invalidate();
             UpdateHint();
+        }
+
+        /// <summary>刷新数值标签。有增益的段用强调色，全平的段压暗——一眼看出哪些段动过。</summary>
+        private void UpdateReadouts()
+        {
+            for (int i = 0; i < _valueLabels.Length; i++)
+            {
+                double g = _eq.Bands[i].GainDb;
+                _valueLabels[i].Text = g.ToString("+0.0;-0.0;0.0");
+                _valueLabels[i].ForeColor = Math.Abs(g) < 0.05 ? Theme.TextTertiary : Theme.Accent;
+            }
         }
 
         /// <summary>
@@ -380,21 +357,20 @@ namespace Snad
                 if (_eq.Bands[i].GainDb > maxBoost) maxBoost = _eq.Bands[i].GainDb;
             double headroom = -_eq.PreampDb;
 
-            string s;
             if (maxBoost > 3 && headroom < maxBoost - 3)
             {
-                s = "提示：最大提升 " + maxBoost.ToString("F1") + " dB，建议把前置设为 -" +
-                    Math.Max(0, maxBoost - 3).ToString("F1") + " dB 左右，否则可能削波。";
-                _hint.ForeColor = Warn;
+                _hint.Text = "MAX BOOST " + maxBoost.ToString("F1") + " dB  ->  " +
+                             "SET PREAMP TO -" + Math.Max(0, maxBoost - 3).ToString("F1") +
+                             " dB TO AVOID CLIPPING";
+                _hint.ForeColor = Theme.Warning;
             }
             else
             {
-                s = "前置增益用于补偿整体提升，避免削波。";
-                if (_couple != null && _couple.Checked)
-                    s += "　联动拖动已开启：拖一个推子会带动相邻频段。";
-                _hint.ForeColor = FgDim;
+                _hint.Text = _couple.Checked
+                    ? "DRAG NODES ON THE CURVE OR THE FADERS   |   LINK ON: NEIGHBOURING BANDS FOLLOW"
+                    : "DRAG NODES ON THE CURVE OR THE FADERS   |   RIGHT-CLICK OR DOUBLE-CLICK A NODE TO RESET";
+                _hint.ForeColor = Theme.TextTertiary;
             }
-            _hint.Text = s;
         }
     }
 }

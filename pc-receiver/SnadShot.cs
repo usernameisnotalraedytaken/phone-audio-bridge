@@ -164,9 +164,6 @@ namespace Snad
                     else { Console.WriteLine("  [失败] 仅 " + visible + "/" + total + " 个按钮可见"); failures++; }
                 }
 
-                // ---- 联动拖动行为 ----
-                failures += CheckCoupling(f, eq);
-
                 f.Close();
                 f.Dispose();
             }
@@ -336,76 +333,5 @@ namespace Snad
             return null;
         }
 
-        /// <summary>
-        /// 验证联动拖动：拖动中间某个推子，相邻频段应按高斯权重跟随，
-        /// 且远处的频段几乎不动。
-        /// </summary>
-        private static int CheckCoupling(EqForm f, Equalizer eq)
-        {
-            int bad = 0;
-            Console.WriteLine();
-            Console.WriteLine("--- 联动拖动 ---");
-
-            var couple = FindCheckBox(f, "联动拖动");
-            if (couple == null)
-            {
-                Console.WriteLine("  [失败] 未找到联动拖动复选框");
-                return 1;
-            }
-
-            var drag = FindSlider(f, 4);     // 1.8k，正中间
-            var near = FindSlider(f, 3);     // 900，紧邻
-            var far = FindSlider(f, 9);      // 16k，最远
-            if (drag == null || near == null || far == null)
-            {
-                Console.WriteLine("  [失败] 未找到推子");
-                return 1;
-            }
-
-            // 先关闭联动：只应动被拖的那个
-            couple.Checked = false;
-            eq.SetAllGains(new double[10]);
-            drag.Value = 0;
-            Application.DoEvents();
-            drag.Value = 6;
-            Application.DoEvents();
-
-            Console.WriteLine("  关闭联动：拖 1.8k 到 +6");
-            Console.WriteLine("    1.8k = " + eq.Bands[4].GainDb.ToString("F1") +
-                              " / 900 = " + eq.Bands[3].GainDb.ToString("F1") +
-                              " / 16k = " + eq.Bands[9].GainDb.ToString("F1"));
-            if (Math.Abs(eq.Bands[4].GainDb - 6) > 0.6)
-            { Console.WriteLine("  [失败] 被拖频段未到 +6"); bad++; }
-            if (Math.Abs(eq.Bands[3].GainDb) > 0.1 || Math.Abs(eq.Bands[9].GainDb) > 0.1)
-            { Console.WriteLine("  [失败] 关闭联动时相邻频段仍被带动"); bad++; }
-            if (bad == 0) Console.WriteLine("  [通过] 仅被拖频段变化，相邻未受影响");
-
-            // 打开联动：相邻应跟随，且越远跟随越少
-            int bad2 = 0;
-            couple.Checked = true;
-            eq.SetAllGains(new double[10]);
-            foreach (var tb in new[] { drag, near, far }) if (tb.Value != 0) tb.Value = 0;
-            Application.DoEvents();
-            drag.Value = 6;
-            Application.DoEvents();
-
-            double g3 = eq.Bands[3].GainDb, g5 = eq.Bands[5].GainDb, g9 = eq.Bands[9].GainDb;
-            Console.WriteLine("  开启联动：拖 1.8k 到 +6");
-            Console.WriteLine("    1.8k = " + eq.Bands[4].GainDb.ToString("F2") +
-                              " / 900 = " + g3.ToString("F2") +
-                              " / 3.5k = " + g5.ToString("F2") +
-                              " / 16k = " + g9.ToString("F2"));
-            if (Math.Abs(eq.Bands[4].GainDb - 6) > 0.6)
-            { Console.WriteLine("  [失败] 被拖频段未到 +6"); bad2++; }
-            if (g3 < 1.0 || g5 < 1.0)
-            { Console.WriteLine("  [失败] 紧邻频段跟随不足（应约 +3.9）"); bad2++; }
-            if (Math.Abs(g9) > 0.5)
-            { Console.WriteLine("  [失败] 最远频段被带动过多（应几乎为 0）"); bad2++; }
-            if (g3 > eq.Bands[4].GainDb || g5 > eq.Bands[4].GainDb)
-            { Console.WriteLine("  [失败] 相邻频段跟随量超过了被拖频段"); bad2++; }
-            if (bad2 == 0) Console.WriteLine("  [通过] 相邻跟随且按距离衰减，远处几乎不动");
-
-            return bad + bad2;
-        }
     }
 }
