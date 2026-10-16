@@ -202,12 +202,17 @@ namespace Snad
             var s = strips[0] as MetricStrip;
             if (s == null || s.Count < 6) return;
 
-            s[0].Value = "148.0"; s[0].Bar = 0.37;     // 延迟 148ms
-            s[1].Value = "62.4"; s[1].Bar = 0.52;      // 缓冲 62ms / 容量 150ms
-            s[2].Value = "48107"; s[2].Bar = 1.0; s[2].HigherIsWorse = false;
-            s[3].Value = "48031"; s[3].Bar = 1.0; s[3].HigherIsWorse = false;
-            s[4].Value = "0"; s[4].Bar = 0;
-            s[5].Value = "0"; s[5].Bar = 0;
+            // 与 UpdateMetrics 用同一套语义：BarValue 是读数本身，BarMax 是量程。
+            // 只填比例（旧写法 Bar = 0..1）会把"超限"这类信息抹掉。
+            s[0].Value = "148.0"; s[0].BarMax = 400; s[0].BarValue = 148;      // 延迟 148ms / 容量 400ms
+            s[1].Value = "62.4"; s[1].BarMax = 120; s[1].BarValue = 62.4;      // 缓冲 62ms / 量程 120ms
+            s[2].Value = "48107"; s[2].DeviationBar = true; s[2].BarOrigin = 48000;
+            s[2].BarMax = 960; s[2].BarTolerance = 48; s[2].BarValue = 48107; s[2].HigherIsWorse = false;
+            s[3].Value = "48031"; s[3].DeviationBar = true; s[3].BarOrigin = 48000;
+            s[3].BarMax = 960; s[3].BarTolerance = 48; s[3].BarValue = 48031; s[3].HigherIsWorse = false;
+            // DROP / UNDER：数字是累计值，条是每秒新增（快照时给个非零值以便看出效果）
+            s[4].Value = "3488"; s[4].BarMax = 10; s[4].BarValue = 3.5; s[4].Alert = true;
+            s[5].Value = "10"; s[5].BarMax = 10; s[5].BarValue = 1.2; s[5].Alert = true;
 
             // 标题条的状态点与采样率也一并填上，否则渲染出来是 IDLE
             var labels = new List<Control>();

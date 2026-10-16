@@ -77,10 +77,44 @@ namespace Snad
         public int BlockFrames(int sampleRate) { return Math.Max(64, sampleRate * BlockMs / 1000); }
         public int LeadFrames(int sampleRate) { return Math.Max(1, sampleRate * LeadMs / 1000); }
 
-        /// <summary>按此 profile 估算的端到端延迟（毫秒），不含音频设备自身延迟。</summary>
+        /// <summary>
+        /// 按此 profile 估算的端到端延迟（毫秒）。
+        ///
+        /// 这是**估计值，不是实测值**——由档位参数算出，因此同一个档位每次
+        /// 显示的数字都一样。它的用途是横向比较不同档位的取舍
+        /// （缓冲越大越抗抖动、延迟越高），而不是反映当前网络状况。
+        /// 真正常变的部分只有抖动缓冲水位，那个在 BUFFER 列单独显示。
+        ///
+        /// 各项来源：
+        ///   TargetBufferMs          抖动缓冲目标水位（配置）
+        ///   BlockMs                 每次提交给 waveOut 的音频时长（配置）
+        ///   WaveOutBuffers × BlockMs 声卡侧在飞的数据量（配置）
+        ///   LeadMs                  时钟偏差余量（配置）
+        ///   AndroidCaptureMs        手机端采集缓冲（常数估计，协议未上报）
+        ///   NetworkMs               网络传输（常数估计，协议无 RTT）
+        /// </summary>
         public int EstimatedPipelineLatencyMs()
         {
-            return 21 + 8 + TargetBufferMs + BlockMs;
+            return AndroidCaptureMs + NetworkMs + TargetBufferMs + BlockMs
+                 + WaveOutBuffers * BlockMs + LeadMs;
+        }
+
+        /// <summary>
+        /// 估算用的常数项。手机端采集缓冲与网络传输目前无法实测
+        /// （协议里没有 RTT 交换，手机端也不上报采集时延），
+        /// 因此按典型值估计。要变成实测值需要扩展协议。
+        /// </summary>
+        public const int AndroidCaptureMs = 8;
+        public const int NetworkMs = 21;
+
+        /// <summary>延迟构成的明细，供界面或日志展示估计的依据。</summary>
+        public string LatencyBreakdown()
+        {
+            return "capture " + AndroidCaptureMs + " + net " + NetworkMs
+                 + " + jitter " + TargetBufferMs + " + block " + BlockMs
+                 + " + soundcard " + (WaveOutBuffers * BlockMs)
+                 + " + lead " + LeadMs
+                 + " = " + EstimatedPipelineLatencyMs() + " ms";
         }
 
         public override string ToString()

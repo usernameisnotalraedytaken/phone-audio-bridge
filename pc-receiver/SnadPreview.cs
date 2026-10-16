@@ -456,22 +456,16 @@ namespace Snad
             if (running)
             {
                 s[0].Label = "LATENCY"; s[0].Value = "148.0"; s[0].Unit = "ms";
-                s[0].Bar = 0.42; s[0].Tip = "端到端链路延迟估算，不含音频设备自身延迟";
 
                 s[1].Label = "BUFFER"; s[1].Value = "62.4"; s[1].Unit = "ms";
-                s[1].Bar = 0.52; s[1].Tip = "抖动缓冲当前水位，越接近容量越危险";
 
                 s[2].Label = "RX"; s[2].Value = "48107"; s[2].Unit = "fps";
-                s[2].Bar = 1.0; s[2].HigherIsWorse = false; s[2].Tip = "手机端送入的帧率";
 
                 s[3].Label = "TX"; s[3].Value = "48031"; s[3].Unit = "fps";
-                s[3].Bar = 1.0; s[3].HigherIsWorse = false; s[3].Tip = "实际写入声卡的帧率";
 
-                s[4].Label = "DROP"; s[4].Value = "0"; s[4].Unit = "帧";
-                s[4].Bar = 0; s[4].Tip = "缓冲溢出丢弃的帧数，非零说明水位偏高";
+                s[4].Label = "DROP"; s[4].Value = "0"; s[4].Unit = "frames";
 
-                s[5].Label = "UNDER"; s[5].Value = "0"; s[5].Unit = "次";
-                s[5].Bar = 0; s[5].Tip = "缓冲见底导致的欠载次数，非零说明水位偏低";
+                s[5].Label = "UNDER"; s[5].Value = "0"; s[5].Unit = "underruns";
             }
             else
             {

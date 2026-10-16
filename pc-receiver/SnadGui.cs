@@ -289,24 +289,23 @@ namespace Snad
         /// <summary>通道条的六项指标：固定标签与悬浮说明，数值由 OnUiTick 填。</summary>
         private void BuildMetricLabels()
         {
-            string[] labels = { "LATENCY", "BUFFER", "RX", "TX", "DROP", "UNDER" };
+            // 各列含义（不显示为悬停提示，只作维护说明）：
+            //   LATENCY  端到端估计延迟：采集 + 网络 + 抖动缓冲 + 音频块，不含声卡延迟
+            //   BUFFER   抖动缓冲水位。接近容量开始丢帧；接近零会欠载
+            //   RX       手机端到达的帧率，应与采样率一致
+            //   TX       实际写入声卡的帧率。持续低于 RX 说明消费端跟不上
+            //   DROP     缓冲溢出丢帧。非零说明水位过高或突发过大
+            //   UNDER    缓冲空导致的欠载。非零说明水位过低或调度抖动大
+            //   LATENCY  按档位参数估算的端到端延迟（EST.，非实测）。同档位恒定，
+            //            用于横向比较不同档位的取舍；真正常变的是 BUFFER
+            string[] labels = { "LATENCY EST.", "BUFFER", "RX", "TX", "DROP", "UNDER" };
             string[] units = { "ms", "ms", "fps", "fps", "frames", "underruns" };
-            string[] tips =
-            {
-                "Estimated end-to-end latency: capture + network + jitter buffer + audio block. Excludes sound card latency.",
-                "Jitter buffer level. Near capacity starts dropping frames; near zero causes underruns.",
-                "Frame rate arriving from the phone. Should match the sample rate.",
-                "Frame rate actually written to the sound card. Persistently below RX means the consumer cannot keep up.",
-                "Frames dropped from buffer overflow. Non-zero means the level is too high or bursts are too large.",
-                "Underruns from an empty buffer. Non-zero means the level is too low or scheduling jitter is high."
-            };
             for (int i = 0; i < _metrics.Count; i++)
             {
                 _metrics[i].Label = labels[i];
                 _metrics[i].Unit = units[i];
-                _metrics[i].Tip = tips[i];
                 _metrics[i].Value = "—";
-                _metrics[i].Bar = -1;
+                _metrics[i].BarValue = -1;      // 未运行时一律不画条
                 // RX/TX 是"达到采样率才好"，其余是越低越好
                 _metrics[i].HigherIsWorse = (i != 2 && i != 3);
             }
@@ -343,6 +342,14 @@ namespace Snad
             const int titleH = 40, controlsH = 92, logBarH = 26, channelRowH = 76;
             int channelH = channelRowH * StereoMeter.Channels + 8 * (StereoMeter.Channels + 1);
             int graphH = Math.Max(120, h - titleH - metricsH - channelH - controlsH - logBarH);
+
+            // 诊断行高分配
+            if (Environment.GetEnvironmentVariable("SNAD_LAYOUT_DEBUG") == "1")
+            {
+                Console.WriteLine("  [布局] 窗口 " + w + "x" + h +
+                                  "  标题 " + titleH + "  图 " + graphH + "  指标 " + metricsH +
+                                  "  声道 " + channelH + "  控制 " + controlsH + "  日志 " + logBarH);
+            }
 
             int y = 0;
             _titleBar.Bounds = new Rectangle(0, y, w, titleH);              y += titleH;
@@ -718,8 +725,10 @@ namespace Snad
 
             _startBtn.Text = "STOP";
             _eqBtn.Enabled = true;
-            AppendLog("Started: profile " + _active.Name + ", estimated link latency ~" +
-                      _active.EstimatedPipelineLatencyMs() + " ms (excludes sound card latency)");
+            AppendLog("Started: profile " + _active.Name);
+            // 把估计的构成写清楚：这是按档位参数算出来的，不是实测，
+            // 写明各项来源才不会被误当成测量结果。
+            AppendLog("Latency estimate: " + _active.LatencyBreakdown());
             UpdateRunState();
         }
 
@@ -762,7 +771,7 @@ namespace Snad
                 for (int i = 0; i < _metrics.Count; i++)
                 {
                     _metrics[i].Value = "—";
-                    _metrics[i].Bar = -1;
+                    _metrics[i].BarValue = -1;
                     _metrics[i].Alert = false;
                 }
                 _rateLabel.Text = "";
@@ -902,36 +911,109 @@ namespace Snad
         }
 
         /// <summary>把快照填进通道条。阈值与配色语义在这里统一决定。</summary>
+        // ---- DROP / UNDER 的窗口增量 ----
+        //
+        // 这两个是累计计数器（Interlocked 累加），不是瞬时值。
+        // 直接拿累计值画动态条毫无意义：它只增不减，条要么常亮要么常灭。
+        // 改为统计"最近一秒内新增了多少次"，这样突发能立刻看见、
+        // 平稳后自动归零。
+        private long _lastDropped, _lastUnderruns;
+        private int _lastCounterTick;
+        private double _dropRate, _underRate;      // 每秒新增次数
+
+        private void UpdateWindowedRates(SnadReceiver.Metrics m)
+        {
+            int now = Environment.TickCount;
+            if (_lastCounterTick == 0) { _lastCounterTick = now; _lastDropped = m.FramesDropped; _lastUnderruns = m.Underruns; return; }
+
+            int dt = now - _lastCounterTick;
+            if (dt < 500) return;                  // 半秒以内样本太少，先累积
+
+            long dDrop = m.FramesDropped - _lastDropped;
+            long dUnder = m.Underruns - _lastUnderruns;
+            // 计数器被重置（重开流）时不当作负增量
+            if (dDrop < 0) dDrop = 0;
+            if (dUnder < 0) dUnder = 0;
+
+            double perSec = 1000.0 / dt;
+            // 指数平滑，避免数字跳动
+            _dropRate += (dDrop * perSec - _dropRate) * 0.5;
+            _underRate += (dUnder * perSec - _underRate) * 0.5;
+
+            _lastDropped = m.FramesDropped;
+            _lastUnderruns = m.Underruns;
+            _lastCounterTick = now;
+        }
+
         private void UpdateMetrics(SnadReceiver.Metrics m)
         {
-            // 延迟：与 Profile 的估算口径一致（采集 + 网络 + 抖动缓冲 + 音频块）
-            int pipeline = 21 + 8 + m.TargetMs + m.BlockMs;
+            int sr = m.SampleRate > 0 ? m.SampleRate : 48000;
+
+            // 延迟：**估计值**，由当前档位的参数算出，不是实测。
+            //
+            // 之前这里写死 "21 + 8 + ..."，那两项既看不到来源、也改不动；
+            // 现在统一走 Profile.EstimatedPipelineLatencyMs()，
+            // 并在标签上标注 EST.，避免被当成实测读数。
+            // 它的用途是横向比较不同档位的取舍——同档位每次显示都一样。
+            int pipeline = _active != null
+                ? _active.EstimatedPipelineLatencyMs()
+                : (Profile.NetworkMs + Profile.AndroidCaptureMs + m.TargetMs + m.BlockMs);
             _metrics[0].Value = pipeline.ToString(CultureInfo.InvariantCulture);
             _metrics[0].Unit = "ms";
-            _metrics[0].Bar = Math.Min(1.0, pipeline / 400.0);
+            // 量程用档位声明的容量上限：越接近上限越糟
+            _metrics[0].BarMax = m.CapacityMs > 0 ? m.CapacityMs : 400;
+            _metrics[0].BarValue = pipeline;
+            _metrics[0].Alert = pipeline > _metrics[0].BarMax * 0.9;
 
-            // 缓冲水位：以容量为满刻度，接近容量即告警
-            double bufRatio = m.RingCapacityFrames > 0
-                ? (double)m.BufferFrames / m.RingCapacityFrames : 0;
+            // 缓冲水位：以目标水位为量程（而不是以容量为满刻度）。
+            // 以容量为满刻度时正常水位只占很小一截，看不出波动；
+            // 以目标为量程则"正好在水位上"≈ 满格，偏离一目了然。
+            int targetMs = m.TargetMs > 0 ? m.TargetMs : 80;
             _metrics[1].Value = m.BufferMs.ToString(CultureInfo.InvariantCulture);
             _metrics[1].Unit = "ms";
-            _metrics[1].Bar = Math.Min(1.0, bufRatio);
-            _metrics[1].Alert = bufRatio > 0.9;
+            _metrics[1].BarMax = targetMs * 1.5;      // 到 1.5 倍目标即超限
+            _metrics[1].BarValue = m.BufferMs;
+            _metrics[1].Alert = m.BufferMs > targetMs * 1.3 || m.BufferMs < targetMs * 0.4;
 
-            int sr = m.SampleRate > 0 ? m.SampleRate : 48000;
-            _metrics[2].Value = ((long)m.RateIn).ToString(CultureInfo.InvariantCulture);
-            _metrics[2].Bar = Math.Min(1.0, m.RateIn / sr);
+            // RX / TX：目标是标称采样率，因此用"偏离条"——
+            // 中间是目标，向右/向左表示高于/低于目标。
+            // 之前画成 RateIn/sr 的比例，那个值恒 ≥1，条永远顶满，
+            // 等于没有信息（用户实测指出）。
+            long rx = (long)m.RateIn, tx = (long)m.RateWritten;
+            _metrics[2].Value = rx.ToString(CultureInfo.InvariantCulture);
+            _metrics[2].DeviationBar = true;
+            _metrics[2].BarOrigin = sr;
+            _metrics[2].BarMax = sr * 0.02;           // 满量程 = 偏离标称 2%
+            _metrics[2].BarTolerance = sr * 0.001;    // 容差带 = 0.1%
+            _metrics[2].BarValue = rx;
+            _metrics[2].HigherIsWorse = false;
+            _metrics[2].Alert = Math.Abs(rx - sr) > sr * 0.01;
 
-            _metrics[3].Value = ((long)m.RateWritten).ToString(CultureInfo.InvariantCulture);
-            _metrics[3].Bar = Math.Min(1.0, m.RateWritten / sr);
+            _metrics[3].Value = tx.ToString(CultureInfo.InvariantCulture);
+            _metrics[3].DeviationBar = true;
+            _metrics[3].BarOrigin = sr;
+            _metrics[3].BarMax = sr * 0.02;
+            _metrics[3].BarTolerance = sr * 0.001;
+            _metrics[3].BarValue = tx;
+            _metrics[3].HigherIsWorse = false;
+            _metrics[3].Alert = Math.Abs(tx - sr) > sr * 0.01;
 
+            // DROP / UNDER：累计值用于数字，窗口增量用于条。
+            // 每 10 次/秒算满量程——到这个量级已经明显影响听感了。
+            UpdateWindowedRates(m);
             _metrics[4].Value = m.FramesDropped.ToString(CultureInfo.InvariantCulture);
-            _metrics[4].Bar = m.FramesDropped == 0 ? 0 : 1.0;
-            _metrics[4].Alert = m.FramesDropped > 0;
+            _metrics[4].Unit = "frames";
+            _metrics[4].BarMax = 10;
+            _metrics[4].BarValue = _dropRate;
+            _metrics[4].Alert = _dropRate >= 0.5;
+            _metrics[4].HigherIsWorse = true;
 
             _metrics[5].Value = m.Underruns.ToString(CultureInfo.InvariantCulture);
-            _metrics[5].Bar = m.Underruns == 0 ? 0 : 1.0;
-            _metrics[5].Alert = m.Underruns > 0;
+            _metrics[5].Unit = "underruns";
+            _metrics[5].BarMax = 10;
+            _metrics[5].BarValue = _underRate;
+            _metrics[5].Alert = _underRate >= 0.5;
+            _metrics[5].HigherIsWorse = true;
 
             _metrics.Invalidate();
         }
