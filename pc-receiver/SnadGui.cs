@@ -78,10 +78,14 @@ namespace Snad
             SetStyle(ControlStyles.OptimizedDoubleBuffer | ControlStyles.AllPaintingInWmPaint, true);
 
             // 尺寸按屏幕工作区自适应。
-            // 本机实测工作区 1280x720（PerMonitor DPI 感知），布局需要
-            // 标题 40 + 图 300 + 通道条 88 + 控件行 52 + 日志 110 + 边距 ≈ 630。
+            //
+            // 期望高度由布局的实际需要算出来，而不是写死一个数：
+            //   标题 40 + 指标条 92 + 声道条 + 控制行 92 + 日志状态行 26 + 图的可用高度
+            // 之前写死 640，结果声道条被挤到 30px——竖电平表完全没有纵向行程，
+            // 波形也被压扁。该由内容决定窗口多大，而不是反过来把内容压扁。
             var wa = Screen.PrimaryScreen != null ? Screen.PrimaryScreen.WorkingArea : new Rectangle(0, 0, 1280, 800);
-            int wantW = 960, wantH = 640;
+            int wantH = 40 + 92 + 26 + (76 * StereoMeter.Channels + 8 * (StereoMeter.Channels + 1)) + 280;
+            int wantW = 980;
             int w = Math.Min(wantW, Math.Max(720, wa.Width - 20));
             int h = Math.Min(wantH, Math.Max(480, wa.Height - 20));
             MinimumSize = new Size(Math.Min(720, wa.Width), Math.Min(480, wa.Height));
@@ -325,26 +329,20 @@ namespace Snad
             int h = ClientSize.Height;
             // 指标条高度由控件自己算（字体随 DPI 变化，写死的数会在高 DPI 下压行）
             int metricsH = _metrics != null ? _metrics.PreferredHeight : 92;
-            const int titleH = 40, controlsH = 92;   // controlsH 要容下滚轮的三行
-            const int logBarH = 26, graphMinH = 130, channelMinH = 64, channelWantH = 104;
 
             // 纵向分配（自上而下）：
             //   标题 / 频谱图(弹性) / 指标条 / 声道条 / 控制行 / 日志状态行
-            // 图与声道条共享弹性空间。声道条至少 64px——它是主要信息来源，
-            // 挤到 30px 时波形与电平表都看不清，等于白放。
-            int fixedH = titleH + metricsH + controlsH + logBarH;
-            int flexible = h - fixedH;
-
-            // 声道条优先拿够：它是主界面里唯一的实时音频信息，
-            // 图形与柱状表都需要纵向空间才看得清。
-            int channelH = Math.Min(channelWantH, Math.Max(channelMinH, flexible * 2 / 5));
-            if (channelH < channelWantH) channelH = Math.Max(channelMinH, flexible / 2);
-            int graphH = flexible - channelH;
-            if (graphH < graphMinH)
-            {
-                graphH = graphMinH;
-                channelH = Math.Max(0, flexible - graphH);
-            }
+            //
+            // 声道条与固定行取"需要的高度"，剩下的全部给频谱图。
+            // 频谱图是唯一真正弹性的区域——窗口拉大时该长的是它，
+            // 而不是去挤压声道条或指标条。
+            //
+            // 声道条高度是硬需求：竖电平表要有纵向行程、波形要有上下空间，
+            // 一条至少 76px。这个需求反过来决定窗口的最小高度（见 MinimumSize），
+            // 而不是把内容压扁去迁就某个窗口尺寸。
+            const int titleH = 40, controlsH = 92, logBarH = 26, channelRowH = 76;
+            int channelH = channelRowH * StereoMeter.Channels + 8 * (StereoMeter.Channels + 1);
+            int graphH = Math.Max(120, h - titleH - metricsH - channelH - controlsH - logBarH);
 
             int y = 0;
             _titleBar.Bounds = new Rectangle(0, y, w, titleH);              y += titleH;
@@ -360,8 +358,11 @@ namespace Snad
         }
 
         /// <summary>
-        /// 声道条布局：左右两条上下堆叠。
-        /// 横向每条都占满宽度，波形因此可以拉长，看形状更清楚。
+        /// 声道条布局：左右两条上下堆叠，每条占满宽度。
+        ///
+        /// 保持上下堆叠——L/R 并排会让每条只剩半宽，波形被截短，
+        /// 而且与"频谱在上、声道在下"的纵向信息流不一致。
+        /// 竖表带来的高度需求由 LayoutAll 里给声道条多分空间解决。
         /// </summary>
         private void LayoutChannels()
         {

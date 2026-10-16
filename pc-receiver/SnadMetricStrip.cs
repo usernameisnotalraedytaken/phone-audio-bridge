@@ -161,6 +161,7 @@ namespace Snad
                 float k = DeviceDpi / 96f;
                 float fLabelH = Theme.Label(7.5f).Height * k;
                 float fValueH = Theme.Readout(20f).Height * k;
+                // Theme 的字体已按 DPI 构建，Height 是实际行高
 
                 // 与实际绘制用同一组公式，避免"算出来的高度"与"画出来的高度"不一致
                 float need = fLabelH * 0.50f
