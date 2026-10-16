@@ -36,3 +36,7 @@ pc-receiver/SnadSecret.cs
 
 # 注意：app/.../SnadSecret.kt 是空密钥占位版，必须入库否则编译失败，
 # CI 会在构建时覆盖它（覆盖发生在工作区，不影响仓库内容）。
+
+# 基线存档目录含预共享密钥，绝不入库
+../SNAD-baseline-v*/
+SNAD-baseline-v*/
