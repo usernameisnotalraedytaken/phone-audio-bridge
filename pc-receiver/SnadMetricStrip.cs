@@ -89,48 +89,54 @@ namespace Snad
                 var main = it.Alert ? Theme.Warning : Theme.TextPrimary;
                 var sub = it.Alert ? Theme.Warning : Theme.TextTertiary;
 
-                // ---- 纵向排布 ----
+                // ---- 纵向排布：三行各占一行，互不侵入 ----
                 //
-                // 全部按字体实测高度自顶向下推，不写任何固定 y。
-                // 之前标签 y=8、数值 y=20、电平条 Height-20 都是硬编码：
-                // 控件一变矮就互相压上（实测把指标条从 88 改成 76 后，
-                // 标签、数值、单位、电平条四处重叠）。
-                // 硬编码的像素值在 144 DPI 缩放下本来也不该直接用。
+                //   第一行  标签 + 单位      LATENCY (ms)
+                //   第二行  数值             125
+                //   第三行  电平条           ▮▮▮▮▯▯▯
+                //
+                // 单位必须放在标签行，不能跟在数值右侧：数值宽度每帧都在变
+                // （"125" 与 "48" 宽度不同），单位会跟着左右跳；而电平条
+                // 从列左端铺到列右端，跟着数值走的单位必然被它压住
+                // （用户实测：ms 被蓝色电平条盖住并在抖动）。
+                // 单位固定在标题里就完全不动了。
+                //
+                // 行距按字体高度的比例给，不写死像素——144 DPI 下字体变大
+                // 而固定边距不变，会把三行挤在一起（这是本控件第二次栽在这上面）。
                 float padX = 12;
                 float fLabelH = fLabel.GetHeight(g);
                 float fValueH = fValue.GetHeight(g);
-                float fUnitH = fUnit.GetHeight(g);
                 const float barH = 6;
-                float gap = 2;
 
-                float labelY = 4;
-                float valY = labelY + fLabelH + 1;
-                float barY = ClientSize.Height - barH - 6;
+                float gap1 = fLabelH * 0.22f;      // 标签与数值之间
+                float gap2 = Math.Max(6f, fValueH * 0.18f);   // 数值与电平条之间
 
-                // 空间不足时优先压缩数值上方的空隙，而不是让它们重叠
-                if (valY + fValueH > barY - gap)
-                    valY = Math.Max(labelY + fLabelH, barY - gap - fValueH);
+                float labelY = fLabelH * 0.28f;
+                float valY = labelY + fLabelH + gap1;
+                // 电平条贴底，与底边留一点余量
+                float barY = ClientSize.Height - barH - Math.Max(4f, fLabelH * 0.25f);
 
+                // 空间不足时压缩数值上方的空隙，而不是让三行重叠
+                if (valY + fValueH > barY - gap2)
+                    valY = Math.Max(labelY + fLabelH, barY - gap2 - fValueH);
+
+                // ---- 第一行：标签 + 单位 ----
                 using (var br = new SolidBrush(Theme.TextTertiary))
+                {
                     g.DrawString(it.Label, fLabel, br, x + padX, labelY);
+                    if (!string.IsNullOrEmpty(it.Unit))
+                    {
+                        var szLab = g.MeasureString(it.Label, fLabel);
+                        g.DrawString("(" + it.Unit + ")", fLabel, br,
+                                     x + padX + szLab.Width + 3, labelY);
+                    }
+                }
 
-                // ---- 数值（大号等宽） ----
-                var szVal = g.MeasureString(it.Value, fValue);
+                // ---- 第二行：数值 ----
                 using (var br = new SolidBrush(main))
                     g.DrawString(it.Value, fValue, br, x + padX, valY);
 
-                // ---- 单位，紧贴数值右侧并与之底对齐 ----
-                if (!string.IsNullOrEmpty(it.Unit))
-                {
-                    // 数值右侧再留 3px，避免与数字最后一笔贴住
-                    float unitX = x + padX + szVal.Width + 1;
-                    float unitY = valY + fValueH - fUnitH - 2;
-                    if (unitY < valY) unitY = valY;
-                    using (var br = new SolidBrush(sub))
-                        g.DrawString(it.Unit, fUnit, br, unitX, unitY);
-                }
-
-                // ---- 电平条 ----
+                // ---- 第三行：电平条 ----
                 float barW = colW - padX * 2;
                 if (it.Bar >= 0 && barW > 8)
                     DrawBar(g, x + padX, barY, barW, barH, it);
@@ -151,8 +157,16 @@ namespace Snad
             {
                 using (var g = CreateGraphics())
                 {
-                    float h = 4 + Theme.Label(7.5f).GetHeight(g) + 1
-                            + Theme.Readout(20f).GetHeight(g) + 2 + 6 + 6;
+                    float fLabelH = Theme.Label(7.5f).GetHeight(g);
+                    float fValueH = Theme.Readout(20f).GetHeight(g);
+                    // 与实际绘制用同一组公式，避免"算出来的高度"与"画出来的高度"不一致
+                    float h = fLabelH * 0.28f
+                            + fLabelH
+                            + fLabelH * 0.22f
+                            + fValueH
+                            + Math.Max(6f, fValueH * 0.18f)
+                            + 6
+                            + Math.Max(4f, fLabelH * 0.25f);
                     return (int)Math.Ceiling(h);
                 }
             }
