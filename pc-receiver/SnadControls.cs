@@ -965,29 +965,30 @@ namespace Snad
             _pressed = true;
             _downX = e.X;
             _downY = e.Y;
-            // 必须在展开之前记录：OnMouseDown 里就会把 _open 置为 true，
-            // 事后再读就分不清"本来就是展开的"和"这次点开的"了。
             _wasOpenAtDown = _open;
-            Invalidate();
-
-            if (!_open)
-            {
-                // 收起态：按下即展开，并在展开后开始拖动。
-                // 这样"点一下就能直接拖"，不用先点开再拖第二次。
-                Open();
-                _dragging = true;
-                _dragStartY = e.Y;
-                _dragStartOffset = _offset;
-                Capture = true;
-                return;
-            }
-
             _dragging = true;
             _dragStartY = e.Y;
             _dragStartOffset = _offset;
             Capture = true;
             _anim.Stop();
+            Invalidate();
+
+            if (!_open)
+            {
+                // 收起态按下：展开，并允许紧接着拖动（不必点开再拖第二次）
+                Open();
+                Focus();                     // 让方向键能直接微调
+            }
         }
+
+        /// <summary>
+        /// 拖动灵敏度：每移动这么多像素才算一项。
+        ///
+        /// 不能直接用行高（约 24px）当分母——那几乎是一像素一项，
+        /// 手一抖就冲到列表尽头（实测"一下子就拖到底"）。
+        /// 取 14px/项，约为行高的 0.6 倍，手感接近 iOS 滚轮。
+        /// </summary>
+        private const double PixelsPerItem = 14.0;
 
         protected override void OnMouseMove(MouseEventArgs e)
         {
@@ -996,11 +997,21 @@ namespace Snad
             _lastY = e.Y;
             if (!_dragging || !_open) return;
             // 向上拖动 = 内容上移 = 索引变大，与触屏直觉一致
-            double delta = (double)(_dragStartY - e.Y) / RowHeight;
+            double delta = (double)(_dragStartY - e.Y) / PixelsPerItem;
             _offset = ClampOffset(_dragStartOffset + delta);
             Invalidate();
         }
 
+        /// <summary>
+        /// 松手。
+        ///
+        /// 两种情况：
+        ///   没有拖动（真是一次点击）→ 切换：收起态点开保持展开；展开态再点则收起。
+        ///   发生了拖动             → 只吸附到最近一项，**不收起**，
+        ///                            让用户能接着用方向键微调。
+        ///
+        /// 之前这里无条件收起，用起来是"粘滑"的：拖完手一松就没了。
+        /// </summary>
         protected override void OnMouseUp(MouseEventArgs e)
         {
             base.OnMouseUp(e);
@@ -1012,59 +1023,75 @@ namespace Snad
             _dragging = false;
             Capture = false;
 
-            // 松手吸附到最近一项。
-            // 高亮固定在正中，因此 _offset 就是中间那一项的序号，
-            // 两者必须收敛到同一个值，否则会出现"高亮的和选中的不是同一个"。
+            bool moved = Math.Abs(e.Y - _downY) > 3 || Math.Abs(e.X - _downX) > 3;
+            if (DebugGestures)
+                Console.WriteLine("    [手势] OnMouseUp: wasOpenAtDown=" + _wasOpenAtDown +
+                                  " moved=" + moved + " 位置 " + e.X + "," + e.Y +
+                                  " 按下于 " + _downX + "," + _downY);
+
+            if (!moved)
+            {
+                // 单纯的点击 = 切换。展开态下这意味着用户想收起。
+                if (_wasOpenAtDown) Close();
+                return;
+            }
+
+            // 拖动过：吸附到最近一项。高亮固定在正中，
+            // 因此 _offset 就是中间那一项的序号。
             int target = (int)Math.Round(ClampOffset(_offset));
             if (target < 0) target = 0;
             if (target >= _items.Length) target = _items.Length - 1;
             _offset = target;
             SelectedIndex = target;
             _anim.Start();
-
-            // 只有"本来展开、或这次拖动了"才算确认，才收起。
-            // 收起态按下只为展开：此时若也收起，表现就是点开一松手又关掉
-            // （实测正是如此——提前收起的其实是这里，不是 OnClick）。
-            bool moved = Math.Abs(e.Y - _downY) > 3 || Math.Abs(e.X - _downX) > 3;
-            if (DebugGestures)
-                Console.WriteLine("    [手势] OnMouseUp: wasOpenAtDown=" + _wasOpenAtDown +
-                                  " moved=" + moved + " 位置 " + e.X + "," + e.Y +
-                                  " 按下于 " + _downX + "," + _downY);
-            if (_wasOpenAtDown || moved) Close();
         }
 
         /// <summary>
-        /// 点击。
-        ///
-        /// 这里必须区分两种手势，否则"点开"会被自己立刻收起：
-        ///   点开     —— 按下与松开位置几乎相同，且按下时处于收起态
-        ///   点选确认 —— 按下时已展开，或期间发生了拖动
-        ///
-        /// 位置一律用事件里记下的 _lastX/_lastY，不读 Cursor.Position：
-        /// 控件未挂到窗口、或光标已移开时，反推出来的坐标是错的
-        /// （实测 OnMouseUp 判为未移动、OnClick 却判为移动了）。
+        /// 点击。展开态下**不做事**——收起由"再按一次"负责（见 OnMouseDown）。
+        /// 这里若也收起，就会出现"点开一瞬间又收起"。
         /// </summary>
         protected override void OnClick(EventArgs e)
         {
             base.OnClick(e);
-            if (_items.Length == 0) return;
+        }
 
-            bool moved = Math.Abs(_lastY - _downY) > 3 || Math.Abs(_lastX - _downX) > 3;
-            if (DebugGestures)
-                Console.WriteLine("    [手势] OnClick: wasOpenAtDown=" + _wasOpenAtDown +
-                                  " moved=" + moved + " open=" + _open +
-                                  " 松开于 " + _lastX + "," + _lastY);
+        /// <summary>方向键微调。展开后用键盘逐项调整，比拖动精确得多。</summary>
+        protected override bool IsInputKey(Keys keyData)
+        {
+            switch (keyData & Keys.KeyCode)
+            {
+                case Keys.Up:
+                case Keys.Down:
+                case Keys.PageUp:
+                case Keys.PageDown:
+                case Keys.Home:
+                case Keys.End:
+                    return true;   // 否则方向键会被窗体拿去切换焦点
+            }
+            return base.IsInputKey(keyData);
+        }
+
+        protected override void OnKeyDown(KeyEventArgs e)
+        {
+            base.OnKeyDown(e);
             if (!_open) return;
 
-            // 在收起态按下、且没有拖动 → 这是一次"点开"，保持展开
-            if (!_wasOpenAtDown && !moved) return;
-
-            int rowH = RowHeight;
-            float center = BarTop + BarHeight;
-            int delta = (int)Math.Round((_lastY - center) / rowH);
-            if (delta != 0) SelectedIndex = _index + delta;
-            // 点到正中间那一项时 delta 为 0，但那也是一次确认，同样要收起
-            Close();
+            switch (e.KeyCode)
+            {
+                case Keys.Up: SelectedIndex = _index - 1; break;
+                case Keys.Down: SelectedIndex = _index + 1; break;
+                case Keys.PageUp: SelectedIndex = _index - Math.Max(1, VisibleRows / 2); break;
+                case Keys.PageDown: SelectedIndex = _index + Math.Max(1, VisibleRows / 2); break;
+                case Keys.Home: SelectedIndex = 0; break;
+                case Keys.End: SelectedIndex = _items.Length - 1; break;
+                case Keys.Enter:
+                case Keys.Escape:
+                    Close();
+                    break;
+                default:
+                    return;
+            }
+            e.Handled = true;
         }
 
         /// <summary>手势诊断开关。排查"点开被自己收起"这类问题时打开。</summary>

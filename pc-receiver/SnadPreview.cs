@@ -199,74 +199,83 @@ namespace Snad
                                       "，控件中点 y=" + mid.ToString("F1") + "）");
                 }
 
-                // ---- 断言：点选后必须收起 ----
-                // 用户反馈"不管点哪里都看不到收起"——展开态是选择过程，
-                // 选完就该回到单行状态，否则会以为还要再点一次。
-                var w4 = new WheelSelector { Width = 200 };
-                w4.Items = items;
-                w4.SelectText("balanced");
-                w4.Open();
-                SetPrivate(w4, "_expand", 1.0);
-                bool openedOk = w4.IsOpen;
-                // 模拟真实序列：在偏下一行的位置按下、松开、Click
-                InvokeMouse(w4, "OnMouseDown", 100, 37);
-                InvokeMouse(w4, "OnMouseUp", 100, 37);
-                InvokeOnClick(w4);
-                if (!openedOk)
-                {
-                    Console.WriteLine("  [失败] 滚轮未能展开");
-                    bad++;
-                }
-                else if (w4.IsOpen)
-                {
-                    Console.WriteLine("  [失败] 点选后滚轮仍处于展开态（应收起）");
-                    bad++;
-                }
-                else
-                {
-                    Console.WriteLine("  [通过] 点选后自动收起，回到单行状态");
-                    if (w4.Height > 40)
-                    {
-                        Console.WriteLine("  [失败] 收起后高度仍为 " + w4.Height + "（应为单行高）");
-                        bad++;
-                    }
-                }
-
-                // ---- 断言：单纯"点开"不能自己收起 ----
-                // 真实踩过的坑：点开与点选是同一套手势。OnMouseDown 展开后，
-                // 紧接的 OnMouseUp / OnClick 若无条件收起，
-                // 表现就是"点一下展开一瞬间又收起"。
+                // ---- 断言：切换模型的三种行为 ----
+                // 交互模型（用户明确要求）：点一下展开并保持；
+                // 期间可拖动或按方向键修改；再点一下、或点别处才收起。
                 WheelSelector.DebugGestures = true;
-                var w5 = new WheelSelector { Width = 200 };
-                w5.Items = items;
-                w5.SelectText("balanced");
-                Console.WriteLine("  模拟单纯点开（按下与松开同一位置，无拖动）：");
-                InvokeMouse(w5, "OnMouseDown", 100, 12);   // 收起态按下即展开
-                bool openedByClick = w5.IsOpen;
-                InvokeMouse(w5, "OnMouseUp", 100, 12);     // 未移动
-                bool stillOpenAfterUp = w5.IsOpen;
-                InvokeOnClick(w5);
+
+                // (a) 点一下 -> 展开并保持
+                var wa = new WheelSelector { Width = 200 };
+                wa.Items = items;
+                wa.SelectText("balanced");
+                InvokeMouse(wa, "OnMouseDown", 100, 12);
+                InvokeMouse(wa, "OnMouseUp", 100, 12);
+                Console.WriteLine("  (a) 点一下：展开=" + wa.IsOpen + " 高度=" + wa.Height);
+                if (!wa.IsOpen)
+                {
+                    Console.WriteLine("  [失败] 点一下未能保持展开");
+                    bad++;
+                }
+                else Console.WriteLine("  [通过] 点一下展开并保持");
+
+                // (b) 拖动 -> 改变选择但**不收起**，且灵敏度合理
+                SetPrivate(wa, "_expand", 1.0);
+                int before = wa.SelectedIndex;
+                InvokeMouse(wa, "OnMouseDown", 100, 40);
+                InvokeMouse(wa, "OnMouseMove", 100, 40 - 14);   // 上移一项的距离
+                InvokeMouse(wa, "OnMouseUp", 100, 40 - 14);
+                Console.WriteLine("  (b) 拖动 14px：选中 " + before + " -> " + wa.SelectedIndex +
+                                  " 展开=" + wa.IsOpen);
+                if (wa.SelectedIndex == before)
+                {
+                    Console.WriteLine("  [失败] 拖动 14px 未改变选择（灵敏度过低）");
+                    bad++;
+                }
+                else if (!wa.IsOpen)
+                {
+                    Console.WriteLine("  [失败] 拖动后自动收起了（应保持展开以便继续微调）");
+                    bad++;
+                }
+                else Console.WriteLine("  [通过] 拖动改变选择且保持展开");
+
+                // (c) 拖动不会一下到底：14px 只应移动一项
+                var wc = new WheelSelector { Width = 200 };
+                wc.Items = new string[10];
+                for (int i = 0; i < 10; i++) wc.Items[i] = "item" + i;
+                wc.SelectedIndex = 5;
+                wc.Open();
+                SetPrivate(wc, "_expand", 1.0);
+                int c0 = wc.SelectedIndex;
+                InvokeMouse(wc, "OnMouseDown", 100, 60);
+                InvokeMouse(wc, "OnMouseMove", 100, 60 - 14);
+                InvokeMouse(wc, "OnMouseUp", 100, 60 - 14);
+                int steps = Math.Abs(wc.SelectedIndex - c0);
+                Console.WriteLine("  (c) 拖动 14px 跨越 " + steps + " 项（应为 1）");
+                if (steps != 1)
+                {
+                    Console.WriteLine("  [失败] 灵敏度异常：14px 跨越了 " + steps + " 项");
+                    bad++;
+                }
+                else Console.WriteLine("  [通过] 灵敏度合理：14px 恰好一项");
+
+                // (d) 展开态再点一下 -> 收起
+                var wd = new WheelSelector { Width = 200 };
+                wd.Items = items;
+                wd.SelectText("balanced");
+                wd.Open();
+                SetPrivate(wd, "_expand", 1.0);
+                InvokeMouse(wd, "OnMouseDown", 100, 30);
+                InvokeMouse(wd, "OnMouseUp", 100, 30);
+                Console.WriteLine("  (d) 展开态再点一下：展开=" + wd.IsOpen);
+                if (wd.IsOpen)
+                {
+                    Console.WriteLine("  [失败] 再点一下未能收起");
+                    bad++;
+                }
+                else Console.WriteLine("  [通过] 再点一下收起");
+
                 WheelSelector.DebugGestures = false;
 
-                if (!openedByClick)
-                {
-                    Console.WriteLine("  [失败] 按下未能展开");
-                    bad++;
-                }
-                else if (!stillOpenAfterUp)
-                {
-                    Console.WriteLine("  [失败] 松手就被收起（OnMouseUp 未区分点开与确认）");
-                    bad++;
-                }
-                else if (!w5.IsOpen)
-                {
-                    Console.WriteLine("  [失败] Click 后被收起（OnClick 未区分点开与确认）");
-                    bad++;
-                }
-                else
-                {
-                    Console.WriteLine("  [通过] 点开后保持展开，不会被自己的事件收起");
-                }
                 b1.Save(Path.Combine(dir, "wheel-1-idle.png"), ImageFormat.Png);
                 b2.Save(Path.Combine(dir, "wheel-2-hover.png"), ImageFormat.Png);
                 b3.Save(Path.Combine(dir, "wheel-3-open.png"), ImageFormat.Png);
