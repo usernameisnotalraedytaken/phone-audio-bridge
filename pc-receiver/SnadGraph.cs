@@ -320,34 +320,46 @@ namespace Snad
                 for (int i = 0; i < n; i++) { _smooth[i] = (float)DbAxisBottom; _peakHold[i] = (float)DbAxisBottom; }
             }
 
-            int cols = Math.Max(24, (int)(p.Width / 4));   // 每 4px 一列，柱宽随窗口自适应
-            var pts = new PointF[cols];
-            for (int c = 0; c < cols; c++)
+            // ---- 按柱计算，按频率位置绘制 ----
+            //
+            // 之前是按"每 4px 一列"（约 225 列）去采样 64 根柱：相邻像素列会落到
+            // 不同的柱上，连线就成了三角锯齿；同一根柱还被反复推进约 3.5 次，
+            // 平滑与峰值保持的速率都随柱宽变化（低频柱宽、被推进次数更多）。
+            //
+            // 改为每根柱只推进一次，再把柱值按各自的频率位置连成折线。
+            // 这样显示的抖动只来自数据本身，不再叠加采样方式的假象。
+            var pts = new PointF[n];
+            var pkPts = new PointF[n];
+            int pkCount = 0;
+
+            for (int i = 0; i < n; i++)
             {
-                // 列 -> 频率 -> 最近的频谱柱
-                double f = XToFreq(p.Left + (c + 0.5f) * (p.Width / cols));
-                int bi = FreqToBarIndex(f, n);
-                float target = (float)bars[bi];
+                // 柱的频率中心：频谱柱按对数分布，中心取几何平均更贴合
+                double f = FMin * Math.Pow(FMax / FMin, (i + 0.5) / n);
+                float x = FreqToX(f);
 
-                // 上升快、下落慢，看起来更自然
-                float cur = _smooth[bi];
+                float target = (float)bars[i];
+                float cur = _smooth[i];
                 float next = target > cur ? cur + (target - cur) * 0.55f : cur + (target - cur) * 0.18f;
-                _smooth[bi] = next;
+                _smooth[i] = next;
 
-                // 峰值保持
-                if (next > _peakHold[bi]) { _peakHold[bi] = next; _peakHoldFrames[bi] = 45; }
-                else if (_peakHoldFrames[bi] > 0) _peakHoldFrames[bi]--;
-                else _peakHold[bi] += ((float)DbAxisBottom - _peakHold[bi]) * 0.05f;
+                if (next > _peakHold[i]) { _peakHold[i] = next; _peakHoldFrames[i] = 45; }
+                else if (_peakHoldFrames[i] > 0) _peakHoldFrames[i]--;
+                else _peakHold[i] += ((float)DbAxisBottom - _peakHold[i]) * 0.05f;
 
-                float y = DbToY(next);
-                pts[c] = new PointF(p.Left + (c + 0.5f) * (p.Width / cols), y);
+                pts[i] = new PointF(x, DbToY(next));
+                if (_peakHold[i] > DbAxisBottom + 6)
+                {
+                    pkPts[pkCount] = new PointF(x, DbToY(_peakHold[i]));
+                    pkCount++;
+                }
             }
 
             // 填充：从曲线向下到基线，用纵向渐变让顶部自然淡出
-            var poly = new PointF[cols + 2];
-            Array.Copy(pts, poly, cols);
-            poly[cols] = new PointF(p.Right, p.Bottom);
-            poly[cols + 1] = new PointF(p.Left, p.Bottom);
+            var poly = new PointF[n + 2];
+            Array.Copy(pts, poly, n);
+            poly[n] = new PointF(p.Right, p.Bottom);
+            poly[n + 1] = new PointF(p.Left, p.Bottom);
 
             using (var lg = new LinearGradientBrush(
                 new RectangleF(p.Left, p.Top, p.Width, p.Height),
@@ -375,16 +387,17 @@ namespace Snad
                 g.DrawLines(pen, pts);
             }
 
-            // 峰值线：极淡，只在有明显信号时画
-            for (int c = 0; c < cols; c++)
+            // 峰值保持：连成一条折线，而不是散落的短横线。
+            // 早先按像素列画 2px 短横线，看起来是满地小尖尖，容易误认成频谱成分。
+            if (pkCount >= 2)
             {
-                double f = XToFreq(p.Left + (c + 0.5f) * (p.Width / cols));
-                int bi = FreqToBarIndex(f, n);
-                if (_peakHold[bi] <= DbAxisBottom + 6) continue;
-                float y = DbToY(_peakHold[bi]);
-                float x = p.Left + (c + 0.5f) * (p.Width / cols);
-                using (var pen = new Pen(Color.FromArgb(70, Theme.SpectrumPeak), 1f))
-                    g.DrawLine(pen, x, y, x, y + 2);
+                var pk = new PointF[pkCount];
+                Array.Copy(pkPts, pk, pkCount);
+                using (var pen = new Pen(Color.FromArgb(90, Theme.SpectrumPeak), 1f))
+                {
+                    pen.LineJoin = LineJoin.Round;
+                    g.DrawLines(pen, pk);
+                }
             }
         }
 
