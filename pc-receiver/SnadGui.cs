@@ -355,11 +355,14 @@ namespace Snad
             _eqBtn.Left = right - _eqBtn.Width;
             _startBtn.Left = _eqBtn.Left - 8 - _startBtn.Width;
 
-            // 设备滚轮吃掉左侧剩余空间，并保证不与按钮重叠。
-            int deviceLeft = _profileBox.Left + _profileBox.Width + 10;
-            int deviceMax = _startBtn.Left - 10 - deviceLeft;
+            // 设备滚轮吃掉左侧剩余的全部宽度。
+            // 之前写死了 280 上限，结果它与 START 之间留出一大片空白，
+            // 而设备名（"Voicemeeter VAIO3 Input (VB-Audio ...)"）却被截断——
+            // 该用的宽度没用上。这里改为撑满到按钮左侧。
+            int deviceLeft = _profileBox.Left + _profileBox.Width + 12;
+            int deviceMax = _startBtn.Left - 12 - deviceLeft;
             _deviceBox.Left = deviceLeft;
-            _deviceBox.Width = Math.Max(140, Math.Min(280, deviceMax));
+            _deviceBox.Width = Math.Max(140, deviceMax);
         }
 
         private static void CenterInRow(Control c, int midY)
@@ -467,6 +470,7 @@ namespace Snad
                 ? "Default output: " + _devices[defIdx].Name
                 : "Default output device not identified");
         }
+
 
         /// <summary>按名字找设备。默认设备名可能被截断（MMDevice 与 waveOut 的取名方式不同），
         /// 因此先精确匹配再退回前缀匹配。</summary>
