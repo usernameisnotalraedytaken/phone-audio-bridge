@@ -36,6 +36,8 @@ namespace Snad
             DbAxisTop = range;
             DbAxisBottom = -range;
             _dbTicks = null;
+            _dbGutter = -1;        // 刻度文字变了，留白要重算
+            _plotValid = false;
             Invalidate();
         }
 
@@ -59,11 +61,50 @@ namespace Snad
             }
         }
 
-        // ---- 边距：左侧留给 dB 标签，底部留给频率标签 ----
-        private const int PadLeft = 44;
+        // ---- 边距 ----
+        // 左侧必须容得下最宽的 dB 刻度标签，因此不能写死——标签宽度随
+        // 轴范围与单位变化（"0 dB" 就比 "0" 宽不少）。
+        // 写死 44 的结果是最宽的标签被挤出图区外，只剩尾巴（"0" 被挤掉）。
+        // 这里只留一个最小值，实际宽度由 MeasureDbGutter 现算。
+        private const int PadLeftMin = 34;
         private const int PadRight = 14;
         private const int PadTop = 14;
         private const int PadBottom = 26;
+
+        /// <summary>缓存左侧留白宽度，避免每帧测量。</summary>
+        private int _dbGutter = -1;
+        private double _dbGutterForTop = double.NaN, _dbGutterForBottom = double.NaN;
+
+        /// <summary>
+        /// 左侧留白 = 最宽刻度标签宽度 + 与图区的间隔。
+        /// 用当前 Graphics 实测，随轴范围与字体自动调整。
+        /// </summary>
+        private int MeasureDbGutter(Graphics g)
+        {
+            if (_dbGutter > 0 &&
+                Math.Abs(_dbGutterForTop - DbAxisTop) < 0.001 &&
+                Math.Abs(_dbGutterForBottom - DbAxisBottom) < 0.001)
+                return _dbGutter;
+
+            var f = Theme.Metric(8.5f);
+            double topTick = double.MinValue;
+            foreach (double db in CurrentDbTicks)
+                if (db > topTick) topTick = db;
+
+            float worst = 0;
+            foreach (double db in CurrentDbTicks)
+            {
+                string s = db == 0 ? "0" : db.ToString("0");
+                if (Math.Abs(db - topTick) < 0.001) s += " dB";
+                float w = g.MeasureString(s, f).Width;
+                if (w > worst) worst = w;
+            }
+
+            _dbGutter = Math.Max(PadLeftMin, (int)Math.Ceiling(worst) + 10);
+            _dbGutterForTop = DbAxisTop;
+            _dbGutterForBottom = DbAxisBottom;
+            return _dbGutter;
+        }
 
         // ---- 栅格刻度 ----
         private static readonly double[] FreqTicks = { 30, 60, 125, 250, 500, 1000, 2000, 4000, 8000, 16000 };
@@ -104,6 +145,7 @@ namespace Snad
                      ControlStyles.OptimizedDoubleBuffer | ControlStyles.ResizeRedraw, true);
             BackColor = Theme.BgBase;
             TabStop = false;
+            Resize += (s, e) => _plotValid = false;
         }
 
         public Equalizer Eq
@@ -124,28 +166,51 @@ namespace Snad
         /// <summary>是否绘制 EQ 曲线。</summary>
         public bool ShowEqCurve = true;
 
-        private RectangleF Plot
+        /// <summary>
+        /// 绘图区。
+        ///
+        /// 左侧留白按最宽刻度标签实测，因此需要 Graphics；鼠标事件里拿不到，
+        /// 所以绘制时把结果缓存进 _plot，OnPaint 之外的代码读缓存。
+        /// 缓存为空时用上次测得的留白宽度，再不行退回最小值。
+        /// </summary>
+        private RectangleF _plot;
+        private bool _plotValid;
+
+        private RectangleF PlotRect()
         {
-            get
+            if (_plotValid) return _plot;
+            int padLeft = _dbGutter > 0 ? _dbGutter : PadLeftMin;
+            float w = Math.Max(10, Width - padLeft - PadRight);
+            float h = Math.Max(10, Height - PadTop - PadBottom);
+            return new RectangleF(padLeft, PadTop, w, h);
+        }
+
+        private void RecomputePlot(Graphics g)
+        {
+            int padLeft = PadLeftMin;
+            if (g != null)
             {
-                float w = Math.Max(10, Width - PadLeft - PadRight);
-                float h = Math.Max(10, Height - PadTop - PadBottom);
-                return new RectangleF(PadLeft, PadTop, w, h);
+                try { padLeft = MeasureDbGutter(g); }
+                catch (Exception ex) { System.Diagnostics.Debug.WriteLine("测量 dB 留白失败：" + ex.Message); }
             }
+            float w = Math.Max(10, Width - padLeft - PadRight);
+            float h = Math.Max(10, Height - PadTop - PadBottom);
+            _plot = new RectangleF(padLeft, PadTop, w, h);
+            _plotValid = true;
         }
 
         // ---------------------------------------------------------------- 坐标映射
 
         private float FreqToX(double f)
         {
-            var p = Plot;
+            var p = PlotRect();
             double t = (Math.Log10(f) - Math.Log10(FMin)) / (Math.Log10(FMax) - Math.Log10(FMin));
             return (float)(p.Left + t * p.Width);
         }
 
         private double XToFreq(float x)
         {
-            var p = Plot;
+            var p = PlotRect();
             double t = (x - p.Left) / p.Width;
             if (t < 0) t = 0; if (t > 1) t = 1;
             return Math.Pow(10, Math.Log10(FMin) + t * (Math.Log10(FMax) - Math.Log10(FMin)));
@@ -153,7 +218,7 @@ namespace Snad
 
         private float DbToY(double db)
         {
-            var p = Plot;
+            var p = PlotRect();
             double t = (db - DbAxisBottom) / (DbAxisTop - DbAxisBottom);
             if (t < 0) t = 0; if (t > 1) t = 1;
             return (float)(p.Bottom - t * p.Height);
@@ -169,7 +234,9 @@ namespace Snad
             using (var bg = new SolidBrush(Theme.BgBase))
                 g.FillRectangle(bg, ClientRectangle);
 
-            var p = Plot;
+            // 先按 graphics 实测一次左留白，之后的坐标映射与命中测试都用这份结果
+            RecomputePlot(g);
+            var p = PlotRect();
 
             DrawBackgroundGradient(g, p);
             DrawGrid(g, p);
@@ -461,7 +528,7 @@ namespace Snad
         private int HitTestBand(Point pt)
         {
             if (_eq == null) return -1;
-            var p = Plot;
+            var p = PlotRect();
             if (pt.X < p.Left - 10 || pt.X > p.Right + 10) return -1;
 
             int best = -1;
@@ -507,7 +574,7 @@ namespace Snad
             if (_dragBand >= 0)
             {
                 // 纵向拖动改增益。映射到 ±18dB 显示范围，手感与图上曲线一致。
-                var p = Plot;
+                var p = PlotRect();
                 double db = DbAxisBottom + (p.Bottom - e.Y) / p.Height * (DbAxisTop - DbAxisBottom);
                 if (db > Equalizer.MaxGainDb) db = Equalizer.MaxGainDb;
                 if (db < Equalizer.MinGainDb) db = Equalizer.MinGainDb;
