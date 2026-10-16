@@ -1,0 +1,22 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">SNAD 音频桥</string>
+    <string name="title">SNAD 音频桥</string>
+    <string name="subtitle">把手机内部音频通过局域网送到电脑</string>
+
+    <string name="label_target">电脑地址</string>
+    <string name="hint_host">192.168.54.22</string>
+    <string name="label_port">端口</string>
+    <string name="label_rate">采样率</string>
+
+    <string name="btn_start">开始串流</string>
+    <string name="btn_stop">停止串流</string>
+    <string name="btn_copy_log">复制日志</string>
+    <string name="label_log">运行日志（同时发送到电脑 phone.log）</string>
+    <string name="log_empty">(等待日志…)</string>
+
+    <string name="status_idle">未开始</string>
+    <string name="status_waiting">等待授权…</string>
+    <string name="status_streaming">串流中</string>
+    <string name="status_error">出错</string>
+</resources>

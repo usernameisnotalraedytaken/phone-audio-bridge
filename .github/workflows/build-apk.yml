@@ -1,0 +1,67 @@
+name: build-apk
+
+on:
+  push:
+    branches: [ main, master ]
+  workflow_dispatch:
+
+permissions:
+  contents: write      # 自动创建 Release 需要
+
+jobs:
+  apk:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v4
+
+      - name: Build debug APK
+        run: |
+          set -eux
+          gradle wrapper --gradle-version 8.9 --no-daemon
+          ./gradlew :app:assembleDebug --no-daemon --stacktrace
+
+      - name: Collect APK + checksum
+        id: collect
+        run: |
+          set -eux
+          APK=$(find app/build/outputs/apk/debug -name '*.apk' | head -n1)
+          cp "$APK" SNAD-debug.apk
+          sha256sum SNAD-debug.apk | tee SNAD-debug.apk.sha256
+          ls -la SNAD-debug.apk
+          echo "sha=$(cut -d' ' -f1 SNAD-debug.apk.sha256)" >> "$GITHUB_OUTPUT"
+
+      - name: Upload as workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: SNAD-debug-apk
+          path: |
+            SNAD-debug.apk
+            SNAD-debug.apk.sha256
+
+      - name: Publish Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -eux
+          TAG="build-${GITHUB_RUN_NUMBER}"
+          gh release create "$TAG" \
+            --title "SNAD build ${GITHUB_RUN_NUMBER}" \
+            --notes "自动构建。SHA256: ${{ steps.collect.outputs.sha }}" \
+            SNAD-debug.apk SNAD-debug.apk.sha256
+          echo "### 下载地址" >> "$GITHUB_STEP_SUMMARY"
+          echo "https://github.com/${GITHUB_REPOSITORY}/releases/download/${TAG}/SNAD-debug.apk" >> "$GITHUB_STEP_SUMMARY"
