@@ -56,6 +56,9 @@ namespace Snad
         /// <summary>信标广播器。手机端据此自动发现本机，无需手填地址。</summary>
         private BeaconBroadcaster _beacon;
 
+        /// <summary>均衡器入口按钮。</summary>
+        private Button _eqBtn;
+
         private readonly SpectrumAnalyzer _analyzer = new SpectrumAnalyzer();
         private readonly object _audioGate = new object();
         private byte[] _pendingAudio;
@@ -192,7 +195,25 @@ namespace Snad
                 Location = new Point(496, 32)
             };
 
-            top.Controls.AddRange(new Control[] { lblProfile, _profileBox, lblDevice, _deviceBox, _startBtn, _statusLabel });
+            // 均衡器入口。做成独立窗口：主界面逻辑高度只有约 480 像素，
+            // 已被频谱、波形、统计占满，放不下 10 段竖向推子。
+            _eqBtn = new Button
+            {
+                Text = "均衡器",
+                Width = 88,
+                Height = 34,
+                Location = new Point(672, 24),
+                FlatStyle = FlatStyle.Flat,
+                BackColor = BgBar,
+                ForeColor = FgMain,
+                UseVisualStyleBackColor = false
+            };
+            _eqBtn.FlatAppearance.BorderColor = Accent;
+            _eqBtn.FlatAppearance.MouseOverBackColor = Color.FromArgb(52, 60, 74);
+            _eqBtn.FlatAppearance.MouseDownBackColor = Color.FromArgb(34, 40, 52);
+            _eqBtn.Click += OnOpenEq;
+
+            top.Controls.AddRange(new Control[] { lblProfile, _profileBox, lblDevice, _deviceBox, _startBtn, _statusLabel, _eqBtn });
 
             // ---- 底部统计 ----
             var bottom = new Panel { Dock = DockStyle.Bottom, Height = 116, BackColor = BgPanel, Padding = new Padding(10, 6, 10, 6) };
@@ -267,6 +288,11 @@ namespace Snad
             if (_profileBox.Items.Contains(selected)) _profileBox.SelectedItem = selected;
             else if (_profileBox.Items.Count > 0) _profileBox.SelectedIndex = 0;
 
+            // 把选中档位里保存的均衡器设置套到待用实例上，
+            // 这样上次调好的 EQ 在下次启动时自动恢复。
+            Profile sel;
+            if (_profiles.TryGetValue(selected, out sel)) ProfileLibrary.ApplyEq(sel, _idleEq);
+
             RefreshDevices();
         }
 
@@ -310,14 +336,29 @@ namespace Snad
         {
             string name = _profileBox.SelectedItem as string;
             if (name == null || !_profiles.ContainsKey(name)) return;
-            _active = _profiles[name];
+
+            // 换档位也换调音：不同用途需要不同 EQ（游戏突出脚步、音乐要平直），
+            // 因此每个档位各自保存一份均衡器设置。
+            var next = _profiles[name];
+
+            // 切走之前先把当前档位的 EQ 存下来，避免调好的设置丢失
+            if (_active != null && !ReferenceEquals(_active, next) && _profiles.ContainsKey(_active.Name))
+                ProfileLibrary.CaptureEq(_active, _receiver != null ? _receiver.Equalizer : _idleEq);
+
+            _active = next;
 
             // 正在运行则重启以应用新参数（缓冲尺寸需要重建）
             if (_receiver != null)
             {
                 AppendStatsLine("切换档位到 " + name + "，重启接收…");
                 StopReceiver();
+                // StopReceiver 会清空 _receiver，因此这里重新套用 EQ 到待用实例
+                ProfileLibrary.ApplyEq(_active, _idleEq);
                 StartReceiver();
+            }
+            else
+            {
+                ProfileLibrary.ApplyEq(_active, _idleEq);
             }
         }
 
@@ -394,6 +435,19 @@ namespace Snad
             _receiver = new SnadReceiver(dev, Program.DefaultPort, _active);
             _receiver.AudioBlockReady += OnAudioBlock;
 
+            // 把"未启动时调好的"均衡器设置复制给接收器，
+            // 这样先调 EQ 再点开始也能生效。
+            try
+            {
+                _receiver.Equalizer.SetAllGains(_idleEq.GetGains());
+                _receiver.Equalizer.PreampDb = _idleEq.PreampDb;
+                _receiver.Equalizer.Enabled = _idleEq.Enabled;
+            }
+            catch (Exception ex)
+            {
+                AppendStatsLine("复制均衡器设置失败：" + ex.Message);
+            }
+
             var r = _receiver;
             _rxThread = new Thread(() => { try { r.Run(); } catch (Exception ex) { AppendStatsLine("接收线程异常：" + ex.Message); } })
             {
@@ -457,6 +511,49 @@ namespace Snad
         }
 
         // ------------------------------------------------------------------ 音频与刷新
+
+        /// <summary>
+        /// 打开均衡器窗口。
+        /// _receiver 为空（未启动）时也能打开：此时改的是模板实例，
+        /// 启动后会被复制到接收器的均衡器上，因此可以先调好再开始。
+        /// </summary>
+        private void OnOpenEq(object sender, EventArgs e)
+        {
+            try
+            {
+                var eq = _receiver != null ? _receiver.Equalizer : _idleEq;
+                using (var f = new EqForm(eq, AppendStatsLine))
+                {
+                    f.ShowDialog(this);
+                }
+
+                // 关闭窗口时把设置写回当前档位并落盘，下次启动自动恢复。
+                // 只改 eq / eqpreamp / eqgains 三个键，不动文件里其他内容和注释。
+                string name = _profileBox.SelectedItem as string;
+                if (string.IsNullOrEmpty(name)) name = _active != null ? _active.Name : "balanced";
+
+                Profile p;
+                if (_profiles != null && _profiles.TryGetValue(name, out p))
+                {
+                    ProfileLibrary.CaptureEq(p, eq);
+                    ProfileLibrary.SaveEq(_cfgPath, name, eq);
+                }
+                else
+                {
+                    AppendStatsLine("未找到档位 " + name + "，均衡器设置未保存");
+                }
+            }
+            catch (Exception ex)
+            {
+                AppendStatsLine("打开均衡器失败：" + ex.GetType().Name + ": " + ex.Message);
+            }
+        }
+
+        /// <summary>
+        /// 未启动时使用的均衡器实例。启动后把它的设置复制给接收器的均衡器，
+        /// 这样"先调 EQ 再点开始"也能生效。
+        /// </summary>
+        private readonly Equalizer _idleEq = new Equalizer();
 
         private void OnAudioBlock(byte[] pcm, int sampleRate, int channels)
         {

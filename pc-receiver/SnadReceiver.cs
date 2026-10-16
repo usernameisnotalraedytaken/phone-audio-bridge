@@ -685,10 +685,13 @@ namespace Snad
         /// </summary>
         public static void Play(int deviceIndex, Func<int> getSampleRate, Func<int> getChannels,
                                 Func<byte[]> pull, CancellationToken token, Profile profile,
-                                Action<byte[], int, int> onBlock = null)
+                                Action<byte[], int, int> onBlock = null, Equalizer eq = null)
         {
             int sampleRate = getSampleRate();
             int channels = getChannels();
+
+            // 均衡器必须知道实际采样率才能算对系数（同一个频段在 44.1k 与 48k 下系数不同）
+            if (eq != null) eq.Configure(sampleRate, channels);
 
             IntPtr hwo = IntPtr.Zero;
             int hr = OpenDevice(out hwo, deviceIndex, sampleRate, channels);
@@ -736,6 +739,21 @@ namespace Snad
                         var data = pull();
                         if (data == null) continue;
                         var fitted = Fit(data, bufBytes);
+
+                        // 均衡器就地处理。放在提交与可视化回调之前，
+                        // 这样频谱画的就是实际听到的声音（包含 EQ 效果）。
+                        // Enabled 为 false 时 Process 立即返回，无额外开销。
+                        if (eq != null && eq.Enabled)
+                        {
+                            try { eq.Process(fitted, fitted.Length); }
+                            catch (Exception ex)
+                            {
+                                // EQ 出错不能拖垮播放：关掉它并报告一次
+                                eq.Enabled = false;
+                                Logger.Err("均衡器处理异常，已自动关闭", ex);
+                            }
+                        }
+
                         bufs[i].Submit(fitted);
                         // 通知 GUI：这块音频即将播放，可用于绘制波形/频谱。
                         // 回调抛异常不能影响播放，因此单独捕获并只提示有限次数。
@@ -1062,6 +1080,14 @@ namespace Snad
         private readonly Profile _profile;
 
         public Profile CurrentProfile { get { return _profile; } }
+
+        /// <summary>
+        /// 均衡器。由 GUI 或控制台在启动前配置；播放线程在提交音频前调用它。
+        /// 采样率由 WaveOut.Play 在打开设备时按实际值配置，因此这里不必预设。
+        /// </summary>
+        public Equalizer Equalizer { get { return _eq; } }
+
+        private readonly Equalizer _eq = new Equalizer();
 
         /// <summary>
         /// 每次向 waveOut 提交一块音频时触发，供 GUI 绘制波形/频谱。
@@ -1507,7 +1533,7 @@ namespace Snad
                     var buf = new byte[framesPerBuffer * 4];
                     _ring.Read(buf, framesPerBuffer, ratio);
                     return buf;
-                }, _cts.Token, _profile, AudioBlockReady);
+                }, _cts.Token, _profile, AudioBlockReady, Equalizer);
             }
             catch (OperationCanceledException)
             {

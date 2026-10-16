@@ -59,6 +59,18 @@ namespace Snad
         public int FormatWaitSec = 15;
         public int PrebufferWaitSec = 10;
 
+        // ---- 均衡器 ----
+        // 放在档位里而不是单独的配置文件：不同用途需要不同调音
+        // （游戏要突出脚步、音乐要平直），跟随档位切换更自然。
+        /// <summary>是否默认启用均衡器。默认关闭——可选效果不应擅自改变声音。</summary>
+        public bool EqEnabled = false;
+
+        /// <summary>各频段增益（dB）。空表示全平。频段顺序见 Equalizer 的构造。</summary>
+        public double[] EqGains = null;
+
+        /// <summary>前置增益（dB），用于补偿整体提升导致的削波。</summary>
+        public double EqPreampDb = 0;
+
         public int TargetFrames(int sampleRate) { return Math.Max(1, sampleRate * TargetBufferMs / 1000); }
         public int PrebufferFrames(int sampleRate) { return Math.Max(1, sampleRate * PrebufferMs / 1000); }
         public int RingCapacityFrames(int sampleRate) { return Math.Max(1024, sampleRate * RingCapacityMs / 1000); }
@@ -306,10 +318,185 @@ namespace Snad
                     else Logger.Warn("第 " + lineNo + " 行 prebufferwait 不是整数：" + val);
                     break;
 
+                case "eq":
+                    // 接受 on/off/true/false/1/0
+                    p.EqEnabled = IsTruthy(val);
+                    break;
+                case "eqpreamp":
+                    if (double.TryParse(val, NumberStyles.Float, CultureInfo.InvariantCulture, out dv))
+                        p.EqPreampDb = dv;
+                    else
+                        Logger.Warn("第 " + lineNo + " 行 eqpreamp 不是数字：" + val);
+                    break;
+                case "eqgains":
+                    // 逗号分隔的 dB 值，按频段顺序
+                    {
+                        var parts = val.Split(new[] { ',', ' ', '\t' }, StringSplitOptions.RemoveEmptyEntries);
+                        var gains = new double[parts.Length];
+                        bool ok = true;
+                        for (int i = 0; i < parts.Length; i++)
+                        {
+                            if (!double.TryParse(parts[i], NumberStyles.Float, CultureInfo.InvariantCulture, out gains[i]))
+                            { ok = false; break; }
+                        }
+                        if (ok && gains.Length > 0) p.EqGains = gains;
+                        else Logger.Warn("第 " + lineNo + " 行 eqgains 解析失败：" + val);
+                    }
+                    break;
+
                 default:
                     Logger.Warn("第 " + lineNo + " 行未知配置项：" + key);
                     break;
             }
+        }
+
+        /// <summary>把 on/off/true/false/1/0 之类的写法统一成布尔值。</summary>
+        private static bool IsTruthy(string v)
+        {
+            if (string.IsNullOrEmpty(v)) return false;
+            v = v.Trim().ToLowerInvariant();
+            return v == "on" || v == "true" || v == "yes" || v == "1" || v == "开";
+        }
+
+        /// <summary>
+        /// 把均衡器设置写回配置文件。
+        ///
+        /// 为什么只改这三个键而不是整份重写：receiver.cfg 带注释、用户可能手改过其他字段，
+        /// 整份重写会把这些都冲掉。这里只在对应位置就地替换或追加。
+        ///
+        /// 写入位置：当前选中档位所在的段落。若无 [profile:name] 段则写在文件顶层。
+        /// </summary>
+        public static void SaveEq(string path, string profileName, Equalizer eq)
+        {
+            if (string.IsNullOrEmpty(path) || eq == null) return;
+
+            string[] lines;
+            try
+            {
+                lines = File.Exists(path) ? File.ReadAllLines(path) : new string[0];
+            }
+            catch (Exception ex)
+            {
+                Logger.Err("读取配置失败，均衡器设置未保存：" + path, ex);
+                return;
+            }
+
+            var gains = eq.GetGains();
+            var sbGains = new StringBuilder();
+            for (int i = 0; i < gains.Length; i++)
+            {
+                if (i > 0) sbGains.Append(',');
+                sbGains.Append(gains[i].ToString("0.#", CultureInfo.InvariantCulture));
+            }
+
+            string targetSection = "[profile:" + profileName + "]";
+            var outLines = new List<string>(lines);
+            int sectionStart = -1, sectionEnd = outLines.Count;
+
+            for (int i = 0; i < outLines.Count; i++)
+            {
+                string t = outLines[i].Trim();
+                if (t.StartsWith("[") && t.EndsWith("]"))
+                {
+                    if (sectionStart >= 0) { sectionEnd = i; break; }
+                    if (string.Equals(t, targetSection, StringComparison.OrdinalIgnoreCase)) sectionStart = i;
+                }
+            }
+
+            bool sawEq = false, sawPreamp = false, sawGains = false;
+            int lo = sectionStart >= 0 ? sectionStart + 1 : 0;
+            int hi = sectionStart >= 0 ? sectionEnd : outLines.Count;
+
+            for (int i = lo; i < hi; i++)
+            {
+                string line = outLines[i];
+                string t = line.Trim();
+                if (t.StartsWith("#") || t.Length == 0) continue;
+                int eqIdx = t.IndexOf('=');
+                if (eqIdx <= 0) continue;
+                string key = t.Substring(0, eqIdx).Trim().ToLowerInvariant();
+
+                if (key == "eq")
+                {
+                    outLines[i] = "eq = " + (eq.Enabled ? "on" : "off");
+                    sawEq = true;
+                }
+                else if (key == "eqpreamp")
+                {
+                    outLines[i] = "eqpreamp = " + eq.PreampDb.ToString("0.#", CultureInfo.InvariantCulture);
+                    sawPreamp = true;
+                }
+                else if (key == "eqgains")
+                {
+                    outLines[i] = "eqgains = " + sbGains;
+                    sawGains = true;
+                }
+            }
+
+            if (sectionStart < 0)
+            {
+                // 该档位还没有自己的段落。
+                //
+                // 注意不能把这几个键插到已有段落内部——那样会改到别的档位的设置
+                // （实测踩过：为"自定义档"保存时，键被插进了上一个 [profile:] 段里，
+                //  结果既没建出新段，又污染了别的档位）。
+                // 因此这里新建一个段落，且放在文件末尾，避免插进任何现有段。
+                var block = new List<string>();
+                if (outLines.Count > 0 && outLines[outLines.Count - 1].Trim().Length != 0)
+                    block.Add("");
+                block.Add("# 此段落由均衡器窗口自动创建");
+                block.Add(targetSection);
+                block.Add("eq = " + (eq.Enabled ? "on" : "off"));
+                block.Add("eqpreamp = " + eq.PreampDb.ToString("0.#", CultureInfo.InvariantCulture));
+                block.Add("eqgains = " + sbGains);
+                outLines.AddRange(block);
+
+                try
+                {
+                    File.WriteAllLines(path, outLines.ToArray());
+                    Logger.Info("均衡器设置已保存到 " + path + "（新建档位 " + profileName + "，已写入 3 个键）");
+                }
+                catch (Exception ex)
+                {
+                    Logger.Err("写入配置失败，均衡器设置未保存：" + path, ex);
+                }
+                return;
+            }
+
+            // 已有段落：缺失的键追加到该段末尾，保持同一段内聚
+            var add = new List<string>();
+            if (!sawEq) add.Add("eq = " + (eq.Enabled ? "on" : "off"));
+            if (!sawPreamp) add.Add("eqpreamp = " + eq.PreampDb.ToString("0.#", CultureInfo.InvariantCulture));
+            if (!sawGains) add.Add("eqgains = " + sbGains);
+            if (add.Count > 0) outLines.InsertRange(sectionEnd, add);
+
+            try
+            {
+                File.WriteAllLines(path, outLines.ToArray());
+                Logger.Info("均衡器设置已保存到 " + path + "（档位 " + profileName + "）");
+            }
+            catch (Exception ex)
+            {
+                Logger.Err("写入配置失败，均衡器设置未保存：" + path, ex);
+            }
+        }
+
+        /// <summary>把档位里保存的均衡器设置套用到均衡器实例上。</summary>
+        public static void ApplyEq(Profile p, Equalizer eq)
+        {
+            if (p == null || eq == null) return;
+            if (p.EqGains != null && p.EqGains.Length > 0) eq.SetAllGains(p.EqGains);
+            eq.PreampDb = p.EqPreampDb;
+            eq.Enabled = p.EqEnabled;
+        }
+
+        /// <summary>把均衡器的当前设置存进档位对象（不落盘）。</summary>
+        public static void CaptureEq(Profile p, Equalizer eq)
+        {
+            if (p == null || eq == null) return;
+            p.EqGains = eq.GetGains();
+            p.EqPreampDb = eq.PreampDb;
+            p.EqEnabled = eq.Enabled;
         }
 
         /// <summary>写出带注释的默认配置，首次运行时生成，便于用户直接改。</summary>
@@ -336,6 +523,14 @@ namespace Snad
             sb.AppendLine("# ratiomin/max   读侧比率安全钳位");
             sb.AppendLine("# formatwait     等待首个包的秒数");
             sb.AppendLine("# prebufferwait  等待预填充的秒数");
+            sb.AppendLine();
+            sb.AppendLine("# ---- 均衡器 ----");
+            sb.AppendLine("# eq        是否启用（on/off）。默认 off，可选效果不擅自改变声音");
+            sb.AppendLine("# eqpreamp  前置增益(dB)，用于补偿整体提升导致的削波");
+            sb.AppendLine("# eqgains   各频段增益(dB)，逗号分隔，顺序为：");
+            sb.AppendLine("#           105, 240, 470, 900, 1.8k, 3.5k, 6k, 8k, 12k, 16k");
+            sb.AppendLine("#           范围 -12 ~ +12。105 与 12k 是搁架式，其余为峰值式");
+            sb.AppendLine("# 例：低音增强 eqgains = 7,5,3,1,0,0,0,0,0,0");
             sb.AppendLine();
             sb.AppendLine("# ---- 自定义档位示例（去掉 # 即可启用）----");
             sb.AppendLine("# [profile:gaming]");

@@ -91,7 +91,8 @@ Write-Host "csc : $csc"
 Write-Host "refs: $fw"
 
 # ---- 1) 控制台版（无 GUI，便于在无桌面环境或脚本中运行）----
-$consoleSources = @('SnadReceiver.cs', 'SnadProfile.cs', 'SnadBeacon.cs', 'SnadBeaconService.cs', 'SnadSecret.cs')
+$consoleSources = @('SnadReceiver.cs', 'SnadProfile.cs', 'SnadBeacon.cs', 'SnadBeaconService.cs',
+                    'SnadEq.cs', 'SnadSecret.cs')
 $consoleArgs = @('/nologo', '/target:exe', '/platform:x64', '/optimize+',
                  '/out:SnadReceiver.exe', '/define:CONSOLE_BUILD')
 foreach ($a in $coreRefs) { $consoleArgs += ("/r:" + (Join-Path $fw $a)) }
@@ -110,10 +111,42 @@ if (Test-Path 'SnadBeaconTest.cs') {
     if ($LASTEXITCODE -ne 0) { throw "信标验证工具编译失败，csc 退出码 $LASTEXITCODE" }
 }
 
+# ---- 1c) 均衡器 DSP 验证工具 ----
+if (Test-Path 'SnadEqTest.cs') {
+    $eqTestArgs = @('/nologo', '/target:exe', '/platform:x64', '/optimize+',
+                    '/main:Snad.EqTest', '/out:SnadEqTest.exe')
+    foreach ($a in $coreRefs) { $eqTestArgs += ("/r:" + (Join-Path $fw $a)) }
+    $eqTestArgs += @('SnadEq.cs', 'SnadEqTest.cs')
+    & $csc @eqTestArgs
+    if ($LASTEXITCODE -ne 0) { throw "均衡器验证工具编译失败，csc 退出码 $LASTEXITCODE" }
+}
+
+# ---- 1d) 均衡器界面自渲染检查工具 ----
+if (Test-Path 'SnadEqShot.cs') {
+    $eqShotArgs = @('/nologo', '/target:winexe', '/platform:x64', '/optimize+',
+                    '/main:Snad.EqShot', '/out:SnadEqShot.exe')
+    foreach ($a in $guiRefs) { $eqShotArgs += ("/r:" + (Join-Path $fw $a)) }
+    $eqShotArgs += @('SnadEq.cs', 'SnadEqForm.cs', 'SnadEqShot.cs')
+    & $csc @eqShotArgs
+    if ($LASTEXITCODE -ne 0) { throw "均衡器界面检查工具编译失败，csc 退出码 $LASTEXITCODE" }
+}
+
+# ---- 1e) 配置读写往返验证工具 ----
+if (Test-Path 'SnadConfigTest.cs') {
+    $cfgTestArgs = @('/nologo', '/target:exe', '/platform:x64', '/optimize+',
+                     '/main:Snad.ConfigTest', '/out:SnadConfigTest.exe')
+    foreach ($a in $coreRefs) { $cfgTestArgs += ("/r:" + (Join-Path $fw $a)) }
+    # 需要 SnadReceiver.cs 是因为 Logger 定义在其中；而它又引用 SnadSecret，
+    # 因此密钥单元也必须一起编译。
+    $cfgTestArgs += @('SnadReceiver.cs', 'SnadProfile.cs', 'SnadEq.cs', 'SnadSecret.cs', 'SnadConfigTest.cs')
+    & $csc @cfgTestArgs
+    if ($LASTEXITCODE -ne 0) { throw "配置验证工具编译失败，csc 退出码 $LASTEXITCODE" }
+}
+
 # ---- 2) GUI 版 ----
 if ($buildGui) {
     $guiSources = @('SnadReceiver.cs', 'SnadProfile.cs', 'SnadBeacon.cs', 'SnadBeaconService.cs',
-                    'SnadSecret.cs', 'SnadGui.cs', 'SnadSpectrum.cs')
+                    'SnadSecret.cs', 'SnadEq.cs', 'SnadEqForm.cs', 'SnadGui.cs', 'SnadSpectrum.cs')
     $missing = $guiSources | Where-Object { -not (Test-Path $_) }
     if ($missing.Count -eq 0) {
         $guiArgs = @('/nologo', '/target:winexe', '/platform:x64', '/optimize+',
