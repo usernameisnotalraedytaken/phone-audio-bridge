@@ -34,20 +34,54 @@ if (-not (Test-Path $csc)) {
 }
 
 $fw = 'C:\Windows\Microsoft.NET\Framework64\v4.0.30319'
-foreach ($asm in @('mscorlib.dll', 'System.dll', 'System.Core.dll')) {
+
+# WinForms 版（带 GUI）。缺 System.Windows.Forms 时退回控制台版。
+$guiRefs = @('mscorlib.dll', 'System.dll', 'System.Core.dll',
+             'System.Windows.Forms.dll', 'System.Drawing.dll')
+$buildGui = $true
+foreach ($asm in $guiRefs) {
+    if (-not (Test-Path (Join-Path $fw $asm))) { $buildGui = $false; break }
+}
+
+$coreRefs = @('mscorlib.dll', 'System.dll', 'System.Core.dll')
+foreach ($asm in $coreRefs) {
     if (-not (Test-Path (Join-Path $fw $asm))) { throw ("缺少参考程序集 " + (Join-Path $fw $asm)) }
 }
 
 Write-Host "csc : $csc"
 Write-Host "refs: $fw"
 
-& $csc /nologo /target:exe /platform:x64 /optimize+ `
-    /out:SnadReceiver.exe `
-    "/r:$fw\mscorlib.dll" "/r:$fw\System.dll" "/r:$fw\System.Core.dll" `
-    SnadReceiver.cs
+# ---- 1) 控制台版（无 GUI，便于在无桌面环境或脚本中运行）----
+$consoleSources = @('SnadReceiver.cs', 'SnadProfile.cs')
+$consoleArgs = @('/nologo', '/target:exe', '/platform:x64', '/optimize+',
+                 '/out:SnadReceiver.exe', '/define:CONSOLE_BUILD')
+foreach ($a in $coreRefs) { $consoleArgs += ("/r:" + (Join-Path $fw $a)) }
+$consoleArgs += $consoleSources
+& $csc @consoleArgs
+if ($LASTEXITCODE -ne 0) { throw "控制台版编译失败，csc 退出码 $LASTEXITCODE" }
 
-if ($LASTEXITCODE -ne 0) { throw "编译失败，csc 退出码 $LASTEXITCODE" }
+# ---- 2) GUI 版 ----
+if ($buildGui) {
+    $guiSources = @('SnadReceiver.cs', 'SnadProfile.cs', 'SnadGui.cs', 'SnadSpectrum.cs')
+    $missing = $guiSources | Where-Object { -not (Test-Path $_) }
+    if ($missing.Count -eq 0) {
+        $guiArgs = @('/nologo', '/target:winexe', '/platform:x64', '/optimize+',
+                     '/main:Snad.GuiEntry', '/out:SnadGui.exe')
+        # 嵌入应用图标：双击时不再显示 .NET 默认图标
+        if (Test-Path 'app.ico') { $guiArgs += '/win32icon:app.ico' }
+        foreach ($a in $guiRefs) { $guiArgs += ("/r:" + (Join-Path $fw $a)) }
+        $guiArgs += $guiSources
+        & $csc @guiArgs
+        if ($LASTEXITCODE -ne 0) { throw "GUI 版编译失败，csc 退出码 $LASTEXITCODE" }
+    } else {
+        Write-Host ("跳过 GUI 版，缺少源文件: " + ($missing -join ', '))
+    }
+}
 
 Get-Item SnadReceiver.exe | Select-Object Name, Length, LastWriteTime | Format-Table -AutoSize
+if (Test-Path SnadGui.exe) {
+    Get-Item SnadGui.exe | Select-Object Name, Length, LastWriteTime | Format-Table -AutoSize
+}
 Write-Host ""
-Write-Host ("编译成功。运行： " + (Join-Path $here "SnadReceiver.exe") + " --list   查看设备列表")
+Write-Host ("编译成功。控制台版： " + (Join-Path $here "SnadReceiver.exe"))
+if (Test-Path SnadGui.exe) { Write-Host ("            GUI 版： " + (Join-Path $here "SnadGui.exe")) }

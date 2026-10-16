@@ -149,6 +149,7 @@ namespace Snad
 
         private const uint TimerResolutionMs = 1;
 
+#if CONSOLE_BUILD
         private static int Main(string[] args)
         {
             try { Console.OutputEncoding = Encoding.UTF8; }
@@ -170,6 +171,7 @@ namespace Snad
             int logPort = DefaultPort + 1;
             bool listOnly = false;
             LogVerbosity verbosity = LogVerbosity.None;
+            string profileOverride = null;   // --profile 覆盖配置文件中的选择
 
             for (int i = 0; i < args.Length; i++)
             {
@@ -194,6 +196,10 @@ namespace Snad
                             else { Console.WriteLine("WARN  --log 只接受 none 或 verbose，收到: " + v); }
                         }
                         break;
+                    case "--profile": case "-P":
+                        if (i + 1 < args.Length) profileOverride = args[++i].Trim();
+                        else Console.WriteLine("WARN  --profile 需要跟一个档位名");
+                        break;
                     case "--help": case "-h": PrintUsage(); return 0;
                 }
             }
@@ -206,6 +212,24 @@ namespace Snad
             Logger.Info("======== SNAD 接收器启动 ========");
             Logger.Info("音频端口=" + port + "  日志端口=" + logPort + "  日志档位=" + verbosity +
                         "  日志文件=" + logPath);
+
+            // ---- 载入参数档位 ----
+            // 配置文件不存在时自动写出一份带注释的默认配置，便于用户直接修改。
+            string cfgPath = System.IO.Path.Combine(exeDir, "receiver.cfg");
+            if (!System.IO.File.Exists(cfgPath)) ProfileLibrary.WriteDefault(cfgPath);
+            string selectedProfile;
+            var profiles = ProfileLibrary.Load(cfgPath, out selectedProfile);
+            if (!string.IsNullOrEmpty(profileOverride))
+            {
+                if (profiles.ContainsKey(profileOverride)) selectedProfile = profileOverride;
+                else Logger.Warn("--profile 指定的档位不存在：" + profileOverride + "，改用 " + selectedProfile);
+            }
+            Profile active;
+            if (!profiles.TryGetValue(selectedProfile, out active)) active = profiles["balanced"];
+            Logger.Info("已载入 " + profiles.Count + " 个档位：" +
+                        string.Join(" / ", new List<string>(profiles.Keys).ToArray()));
+            foreach (var kv in profiles)
+                Logger.Info("  " + kv.Value);
 
             var devices = WaveOut.ListDevices();
             Logger.Info("可用输出设备共 " + devices.Count + " 个：");
@@ -290,7 +314,7 @@ namespace Snad
             Console.WriteLine("按 Ctrl+C 退出。");
             Console.WriteLine();
 
-            using (var receiver = new SnadReceiver(deviceIndex, port))
+            using (var receiver = new SnadReceiver(deviceIndex, port, active))
             {
                 Console.CancelKeyPress += (s, e) => { e.Cancel = true; receiver.Stop(); };
                 receiver.Run();
@@ -304,6 +328,7 @@ namespace Snad
             Console.WriteLine("已退出。");
             return 0;
         }
+#endif
 
         private static void PrintUsage()
         {
@@ -376,6 +401,9 @@ namespace Snad
         }
 
         private const uint WAVE_FORMAT_PCM = 1;
+
+        /// <summary>音频块回调的异常计数，只提示有限次数以免刷屏。</summary>
+        private static int _blockCbErrors;
         private const uint WHDR_DONE = 0x00000001;
         private const int WAVE_MAPPER = -1;
 
@@ -607,7 +635,8 @@ namespace Snad
         ///   3. pull 返回 null 表示暂无数据，本轮跳过而不是灌静音，避免欠载爆音。
         /// </summary>
         public static void Play(int deviceIndex, Func<int> getSampleRate, Func<int> getChannels,
-                                Func<byte[]> pull, CancellationToken token)
+                                Func<byte[]> pull, CancellationToken token, Profile profile,
+                                Action<byte[], int, int> onBlock = null)
         {
             int sampleRate = getSampleRate();
             int channels = getChannels();
@@ -628,10 +657,12 @@ namespace Snad
             // 原先只用 3 个 40 ms 缓冲配合 4 ms 轮询，一旦循环晚几毫秒就有多个
             // 缓冲同时在飞，而 Thread.Sleep 把补充循环整体串行化，补充速度跟不上
             // 回收速度，设备随即饿死——实测消费只有 18986 帧/s（应为 48000）。
+            // 缓冲池规模由 profile 决定：
+            //   低延迟档要少缓冲（在飞时延小），高品质档要多缓冲（抗调度抖动）。
             int bytesPerMs = Math.Max(1, sampleRate * channels * 2 / 1000);
-            int bufBytes = Math.Max(2048, bytesPerMs * 16);
-            const int slots = 16;
-            const int pollMs = 1;
+            int bufBytes = Math.Max(2048, bytesPerMs * Math.Max(2, profile.BlockMs));
+            int slots = Math.Max(2, profile.WaveOutBuffers);
+            int pollMs = Math.Max(1, profile.PollMs);
 
             var bufs = new Buf[slots];
             try
@@ -655,7 +686,19 @@ namespace Snad
                         if (!bufs[i].IsDone) continue;
                         var data = pull();
                         if (data == null) continue;
-                        bufs[i].Submit(Fit(data, bufBytes));
+                        var fitted = Fit(data, bufBytes);
+                        bufs[i].Submit(fitted);
+                        // 通知 GUI：这块音频即将播放，可用于绘制波形/频谱。
+                        // 回调抛异常不能影响播放，因此单独捕获并只提示有限次数。
+                        if (onBlock != null)
+                        {
+                            try { onBlock(fitted, sampleRate, channels); }
+                            catch (Exception ex)
+                            {
+                                if (_blockCbErrors++ < 3)
+                                    Logger.Warn("音频块回调异常（第 " + _blockCbErrors + " 次）：" + ex.Message);
+                            }
+                        }
                         writes++;
                         didWork = true;
                     }
@@ -963,6 +1006,38 @@ namespace Snad
         private int _prebufferFrames;
         private volatile bool _ringReady;      // 环形缓冲已按实际采样率建好
 
+        /// <summary>
+        /// 当前生效的参数档位。所有影响延迟与音质的取值都由此提供，
+        /// 不写死在代码里——换场景只需换 profile 或改 receiver.cfg。
+        /// </summary>
+        private readonly Profile _profile;
+
+        public Profile CurrentProfile { get { return _profile; } }
+
+        /// <summary>
+        /// 每次向 waveOut 提交一块音频时触发，供 GUI 绘制波形/频谱。
+        /// 参数为立体声交错 PCM16LE。
+        /// </summary>
+        public event Action<byte[], int, int> AudioBlockReady;
+
+        /// <summary>供 GUI 轮询的实时指标快照。</summary>
+        public sealed class Metrics
+        {
+            public int SampleRate;
+            public int Channels;
+            public long Packets;
+            public double Kbps;
+            public int BufferFrames;
+            public int BufferMs;
+            public int RingCapacityFrames;
+            public double RateIn, RateWritten, RateRead;
+            public double ReadCallsPerSec;
+            public long FramesDropped, Underruns, Interpolated, SeqGaps, SeqMissing;
+            public long ShortPkt, BadMagic, BadVersion, BadPayload;
+            public int TargetMs, CapacityMs, BlockMs, WaveOutBuffers;
+            public string ProfileName;
+        }
+
         private readonly CancellationTokenSource _cts = new CancellationTokenSource();
 
         private volatile int _sampleRate = 48000;
@@ -975,11 +1050,51 @@ namespace Snad
         private long _seqGaps, _seqMissing;
         private long _framesIn;            // 从网络收到的累计帧数（包级，未丢）
         private long _lastFramesIn, _lastFramesWritten, _lastFramesRead, _lastReadCalls;
+        // 最近一次统计周期的速率，供 GUI 快照读取（避免 GUI 自己再算一遍）。
+        // 注意不能标 volatile：C# 不允许 volatile double（64 位读写非原子）。
+        // 这些值每 5 秒才更新一次，GUI 读到略旧的值无影响。
+        private double _lastRateIn, _lastRateWritten, _lastRateRead, _lastRateCalls, _lastKbps;
 
-        public SnadReceiver(int deviceIndex, int port)
+        public SnadReceiver(int deviceIndex, int port, Profile profile)
         {
             _deviceIndex = deviceIndex;
             _port = port;
+            _profile = profile ?? new Profile();
+            Logger.Info("生效档位：" + _profile);
+        }
+
+        /// <summary>采集一份实时指标，供 GUI 显示。</summary>
+        public Metrics Snapshot()
+        {
+            var m = new Metrics
+            {
+                SampleRate = _sampleRate,
+                Channels = _channels,
+                Packets = Interlocked.Read(ref _packets),
+                BufferFrames = _ringReady ? _ring.AvailableFrames : 0,
+                RingCapacityFrames = _ringReady ? _ring.CapacityFrames : _profile.RingCapacityFrames(_sampleRate),
+                FramesDropped = _ringReady ? _ring.FramesDropped : 0,
+                Underruns = _ringReady ? _ring.UnderrunEvents : 0,
+                Interpolated = _ringReady ? _ring.InterpolatedFrames : 0,
+                SeqGaps = _seqGaps,
+                SeqMissing = _seqMissing,
+                ShortPkt = Interlocked.Read(ref _shortPkt),
+                BadMagic = Interlocked.Read(ref _badMagic),
+                BadVersion = Interlocked.Read(ref _badVersion),
+                BadPayload = Interlocked.Read(ref _badPayload),
+                TargetMs = _profile.TargetBufferMs,
+                CapacityMs = _profile.RingCapacityMs,
+                BlockMs = _profile.BlockMs,
+                WaveOutBuffers = _profile.WaveOutBuffers,
+                ProfileName = _profile.Name,
+            };
+            m.BufferMs = m.SampleRate > 0 ? m.BufferFrames * 1000 / m.SampleRate : 0;
+            m.RateIn = _lastRateIn;
+            m.RateWritten = _lastRateWritten;
+            m.RateRead = _lastRateRead;
+            m.ReadCallsPerSec = _lastRateCalls;
+            m.Kbps = _lastKbps;
+            return m;
         }
 
         public void Stop()
@@ -1152,10 +1267,10 @@ namespace Snad
                             _channels = ch > 0 ? ch : 2;
 
                             // 环形缓冲按实际采样率换算，避免把 48000 写死。
-                            // 只有首次（或采样率变化时）才重建，避免中途清空已缓冲的数据。
-                            int capFrames = _sampleRate * 150 / 1000;
+                            // 尺寸全部由 profile 提供，并按实际采样率换算，不写死 48000。
+                            int capFrames = _profile.RingCapacityFrames(_sampleRate);
                             _ring = new SampleRing(capFrames);
-                            _prebufferFrames = _sampleRate * 60 / 1000;
+                            _prebufferFrames = _profile.PrebufferFrames(_sampleRate);
                             _formatLogged = true;
                             _ringReady = true;   // 此刻起 _ring 才可被安全访问
 
@@ -1163,10 +1278,13 @@ namespace Snad
                                 "流格式确定：{0} Hz / {1} 声道 / 16 bit，第一个包来自 {2}",
                                 _sampleRate, _channels, remote));
                             Logger.Info(string.Format(
-                                "缓冲按实际采样率换算：容量 {0} 帧（{1} ms）、预填充 {2} 帧（{3} ms）、每块 {4} 帧（16 ms）",
+                                "档位 {0}：容量 {1} 帧（{2} ms）、预填充 {3} 帧（{4} ms）、" +
+                                "每块 {5} 帧（{6} ms）、waveOut {7} 个、预计链路延迟约 {8} ms",
+                                _profile.Name,
                                 _ring.CapacityFrames, _ring.CapacityFrames * 1000 / _sampleRate,
                                 _prebufferFrames, _prebufferFrames * 1000 / _sampleRate,
-                                Math.Max(64, _sampleRate * 16 / 1000)));
+                                _profile.BlockFrames(_sampleRate), _profile.BlockMs,
+                                _profile.WaveOutBuffers, _profile.EstimatedPipelineLatencyMs()));
                             if (rate != 48000)
                                 Logger.Warn("手机采样率 " + rate + " Hz（非 48000），已按实际值处理");
                         }
@@ -1246,6 +1364,12 @@ namespace Snad
                             _lastFramesWritten = fWr;
                             _lastFramesRead = fRd;
                             _lastReadCalls = rc;
+                            // 同时写入快照字段供 GUI 读取
+                            _lastRateIn = rateIn;
+                            _lastRateWritten = rateWr;
+                            _lastRateRead = rateRd;
+                            _lastRateCalls = rateCalls;
+                            _lastKbps = kbps;
                             lastReport = now;
                             lastBytes = b;
                         }
@@ -1268,10 +1392,10 @@ namespace Snad
                 while (!_cts.IsCancellationRequested && !_ringReady)
                 {
                     Thread.Sleep(10);
-                    if ((DateTime.UtcNow - waitFmt).TotalSeconds > 15)
+                    if ((DateTime.UtcNow - waitFmt).TotalSeconds > _profile.FormatWaitSec)
                     {
-                        Logger.Warn("等待首个数据包超过 15 秒仍未收到，播放线程退出。" +
-                                    "请确认手机端已开始串流、且与本机在同一网络。");
+                        Logger.Warn("等待首个数据包超过 " + _profile.FormatWaitSec + " 秒仍未收到，" +
+                                    "播放线程退出。请确认手机端已开始串流、且与本机在同一网络。");
                         return;
                     }
                 }
@@ -1285,19 +1409,29 @@ namespace Snad
                 while (!_cts.IsCancellationRequested && _ring.AvailableFrames < _prebufferFrames)
                 {
                     Thread.Sleep(10);
-                    if ((DateTime.UtcNow - waitStart).TotalSeconds > 10)
+                    if ((DateTime.UtcNow - waitStart).TotalSeconds > _profile.PrebufferWaitSec)
                     {
-                        Logger.Warn("预填充等待超过 10 秒，仅攒到 " + _ring.AvailableFrames +
-                                    " 帧（目标 " + _prebufferFrames + "），先起播（仍可能欠载）");
+                        Logger.Warn("预填充等待超过 " + _profile.PrebufferWaitSec + " 秒，仅攒到 " +
+                                    _ring.AvailableFrames + " 帧（目标 " + _prebufferFrames +
+                                    "），先起播（仍可能欠载）");
                         break;
                     }
                 }
                 Logger.Info(string.Format("预填充完成，可用 {0} 帧（约 {1} ms），开始播放",
                             _ring.AvailableFrames, _ring.AvailableFrames * 1000 / _sampleRate));
 
-                // 播放完全由 waveOut 时钟驱动，每次固定取 16 ms，
-                // 与"包到达"解耦——这是消除欠载补零的关键。
-                int framesPerBuffer = Math.Max(64, _sampleRate * 16 / 1000);
+                // 每块时长、缓冲个数、轮询间隔、水位与漂移摆幅全部取自 profile，
+                // 因此换场景只需换档位，不必改代码。
+                int framesPerBuffer = _profile.BlockFrames(_sampleRate);
+                int targetFrames = _profile.TargetFrames(_sampleRate);
+                double gain = _profile.DriftGain;
+                double range = _profile.DriftRange;
+
+                Logger.Info(string.Format(
+                    "播放参数：每块 {0} 帧（{1} ms）、目标水位 {2} 帧（{3} ms）、" +
+                    "漂移摆幅 ±{4}%、增益 {5}",
+                    framesPerBuffer, framesPerBuffer * 1000 / _sampleRate,
+                    targetFrames, _profile.TargetBufferMs, range * 100, gain));
 
                 WaveOut.Play(_deviceIndex, () => _sampleRate, () => _channels, () =>
                 {
@@ -1315,16 +1449,16 @@ namespace Snad
                     // 标定过程：50 ms 时水位落在 41-67 ms，55 秒内出现 7 次欠载
                     // （丢帧 3129 帧），说明余量不足以吸收 Windows 线程调度抖动；
                     // 120 ms 则从未欠载但延迟偏高。80 ms 是两者之间的折中。
-                    int targetFrames = _sampleRate * 80 / 1000;
                     int avail = _ring.AvailableFrames;
-                    double ratio = 1.0 + (avail - targetFrames) / (double)Math.Max(1, targetFrames) * 0.05;
-                    if (ratio > 1.08) ratio = 1.08;
-                    if (ratio < 0.92) ratio = 0.92;
+                    double ratio = 1.0 + (avail - targetFrames) / (double)Math.Max(1, targetFrames) * gain;
+                    double hi = 1.0 + range, lo = 1.0 - range;
+                    if (ratio > hi) ratio = hi;
+                    if (ratio < lo) ratio = lo;
 
                     var buf = new byte[framesPerBuffer * 4];
                     _ring.Read(buf, framesPerBuffer, ratio);
                     return buf;
-                }, _cts.Token);
+                }, _cts.Token, _profile, AudioBlockReady);
             }
             catch (OperationCanceledException)
             {
