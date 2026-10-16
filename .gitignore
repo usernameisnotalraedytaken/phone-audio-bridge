@@ -25,3 +25,7 @@ pc-receiver/*.head-clean.cs
 # 系统
 .DS_Store
 Thumbs.db
+pc-receiver/receiver.cfg
+pc-receiver/shot-gui.ps1
+pc-receiver/diag-dpi.ps1
+pc-receiver/run-receiver-direct.ps1
