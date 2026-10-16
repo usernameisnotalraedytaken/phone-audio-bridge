@@ -15,6 +15,15 @@ $OutputEncoding = [Console]::OutputEncoding = New-Object System.Text.UTF8Encodin
 $here = Split-Path -Parent $MyInvocation.MyCommand.Path
 Set-Location $here
 
+# 若接收器正在运行，它会锁住 exe，导致 csc 报 CS2012 无法写入。
+# 先停掉再编译；编译后不自动重启（由调用方决定用什么参数启动）。
+$running = Get-Process SnadReceiver -ErrorAction SilentlyContinue
+if ($running) {
+    Write-Host ("停止正在运行的接收器 pid=" + (($running | ForEach-Object { $_.Id }) -join ','))
+    $running | Stop-Process -Force
+    Start-Sleep -Milliseconds 800
+}
+
 $csc = 'C:\Program Files (x86)\Microsoft Visual Studio\18\BuildTools\MSBuild\Current\Bin\Roslyn\csc.exe'
 if (-not (Test-Path $csc)) {
     # 退回到其它可能位置

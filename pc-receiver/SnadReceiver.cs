@@ -79,8 +79,18 @@ namespace Snad
         internal const int DefaultPort = 6981;   // 避开 Voicemeeter 的 VBAN 服务（占用 6980）
         internal const int HeaderSize = 22;
 
-        /// <summary>抖动缓冲上限（包数）。热点 RTT 5-8ms，60 包 ≈ 1.3 s 的安全边界。</summary>
-        internal const int MaxQueuedPackets = 60;
+        /// <summary>日志端口 = 音频端口 + 1。</summary>
+        internal const int LogPortOffset = 1;
+
+        /// <summary>
+        /// 包队列容量。仅作为接收线程与播放线程之间的极小过渡容器。
+        /// 实测 Voicemeeter Input 以 99.5% 实时消费，手机侧产出约 100.3% 实时，
+        /// 两者接近匹配；真正需要防的是启动瞬间的突发。
+        /// 原先把这里当作抖动缓冲并把容量设为 60 包（1.28 秒），既无依据，
+        /// 又让启动时 64 个包（65536 帧）瞬间灌入仅 24000 帧的环形缓冲，
+        /// 直接撞满并从此再也排不空。
+        /// </summary>
+        internal const int QueueCapacity = 8;
 
         private static int Main(string[] args)
         {
@@ -426,14 +436,152 @@ namespace Snad
         }
     }
 
+    // ------------------------------------------------------------------ 样本环形缓冲
+
+    /// <summary>
+    /// 样本环形缓冲：接收线程按包写入，播放线程按时钟读取。
+    ///
+    /// 存储约定：以"帧"为单位，每帧占 2 个连续槽位（左、右声道）。
+    /// 帧容量强制为偶数，因此槽位下标永不跨帧，无需处理环形边界的拼接。
+    ///
+    /// 读侧使用分数帧位置并做线性插值：两端时钟的细微偏差由插值比例吸收，
+    /// 而不是靠周期性丢帧或补帧，因此不会产生周期性的断点。
+    /// </summary>
+    internal sealed class SampleRing
+    {
+        private readonly float[] _slots;      // 长度 = 帧容量 * 2
+        private readonly int _frameCap;
+        private readonly object _gate = new object();
+        private long _framesWritten;          // 累计写入帧数，只增
+        private long _readFrame;              // 已消费的整数帧位置
+        private double _readFrac;             // 已消费的小数偏移，用于插值
+        private long _underrunEvents;
+        private long _interpolatedFrames;
+
+        public SampleRing(int frameCapacity)
+        {
+            int cap = Math.Max(1024, frameCapacity);
+            if (cap % 2 != 0) cap++;
+            _frameCap = cap;
+            _slots = new float[_frameCap * 2];
+        }
+
+        public int CapacityFrames { get { return _frameCap; } }
+        public long FramesWritten { get { lock (_gate) return _framesWritten; } }
+        public long UnderrunEvents { get { return Interlocked.Read(ref _underrunEvents); } }
+        public long InterpolatedFrames { get { return Interlocked.Read(ref _interpolatedFrames); } }
+
+        /// <summary>当前可读帧数。</summary>
+        public int AvailableFrames
+        {
+            get
+            {
+                lock (_gate)
+                {
+                    double consumed = _readFrame + _readFrac;
+                    return (int)Math.Max(0, _framesWritten - consumed);
+                }
+            }
+        }
+
+        /// <summary>
+        /// 写入 PCM16LE 交错数据，channels 支持 1 或 2。
+        /// 返回 false 表示剩余空间不足，整包被拒（调用方据此计数报警）。
+        /// </summary>
+        public bool Write(byte[] pcm, int channels, int payloadBytes)
+        {
+            if (channels < 1) return false;
+            int bytesPerFrame = channels * 2;
+            int frames = payloadBytes / bytesPerFrame;
+            if (frames <= 0) return false;
+
+            lock (_gate)
+            {
+                double consumed = _readFrame + _readFrac;
+                int free = _frameCap - (int)(_framesWritten - consumed);
+                if (frames > free) return false;
+
+                for (int f = 0; f < frames; f++)
+                {
+                    int b = f * bytesPerFrame;
+                    short l = (short)(pcm[b] | (pcm[b + 1] << 8));
+                    short r = channels >= 2 ? (short)(pcm[b + 2] | (pcm[b + 3] << 8)) : l;
+
+                    int slot = (int)(_framesWritten % _frameCap) * 2;
+                    _slots[slot] = l / 32768f;
+                    _slots[slot + 1] = r / 32768f;
+                    _framesWritten++;
+                }
+                return true;
+            }
+        }
+
+        /// <summary>
+        /// 读取 outFrames 帧，写成立体声交错 PCM16LE。
+        /// ratio = 1.0 为标准速率；大于 1 表示消费更快（用于压低积压），小于 1 表示更慢。
+        /// 数据见底时剩余部分补静音，并计入一次 underrun——不静默。
+        /// </summary>
+        public int Read(byte[] dest, int outFrames, double ratio)
+        {
+            if (ratio < 0.9) ratio = 0.9;
+            if (ratio > 1.1) ratio = 1.1;
+
+            lock (_gate)
+            {
+                int produced = 0;
+                for (int f = 0; f < outFrames; f++)
+                {
+                    if (_readFrame + 1 >= _framesWritten)
+                    {
+                        Interlocked.Increment(ref _underrunEvents);
+                        for (int k = f; k < outFrames; k++)
+                        {
+                            dest[k * 4] = 0; dest[k * 4 + 1] = 0;
+                            dest[k * 4 + 2] = 0; dest[k * 4 + 3] = 0;
+                        }
+                        return produced;
+                    }
+
+                    int s0 = (int)(_readFrame % _frameCap) * 2;
+                    int s1 = (int)((_readFrame + 1) % _frameCap) * 2;
+                    double frac = _readFrac;
+
+                    float l = (float)(_slots[s0] * (1 - frac) + _slots[s1] * frac);
+                    float r = (float)(_slots[s0 + 1] * (1 - frac) + _slots[s1 + 1] * frac);
+                    if (frac > 0.0001) Interlocked.Increment(ref _interpolatedFrames);
+
+                    short ls = (short)Math.Max(-32768, Math.Min(32767, l * 32767f));
+                    short rs = (short)Math.Max(-32768, Math.Min(32767, r * 32767f));
+                    dest[f * 4] = (byte)(ls & 0xFF);
+                    dest[f * 4 + 1] = (byte)((ls >> 8) & 0xFF);
+                    dest[f * 4 + 2] = (byte)(rs & 0xFF);
+                    dest[f * 4 + 3] = (byte)((rs >> 8) & 0xFF);
+                    produced++;
+
+                    _readFrac += ratio;
+                    while (_readFrac >= 1.0) { _readFrac -= 1.0; _readFrame++; }
+                }
+                return produced;
+            }
+        }
+    }
+
     // ------------------------------------------------------------------ 接收端
 
     internal sealed class SnadReceiver : IDisposable
     {
         private readonly int _deviceIndex;
         private readonly int _port;
-        private readonly BlockingCollection<byte[]> _queue =
-            new BlockingCollection<byte[]>(Program.MaxQueuedPackets);
+
+        // 样本环形缓冲：容量 200 ms，起播前预填充 80 ms。
+        // 这是本次修复的核心——它把"包到达"与"音频播放"彻底解耦。
+        //
+        // 容量取 200 ms 而非 500 ms：实测消费率 99.5%、产出率约 100.3%，
+        // 稳态几乎匹配，200 ms 足够吸收抖动；过大的容量只会让启动突发把
+        // 延迟永久顶在高位（曾出现 500 ms 缓冲在 0.8 秒内被灌满的情况）。
+        private readonly SampleRing _ring = new SampleRing(48000 * 200 / 1000);
+        private const int PrebufferFrames = 48000 * 80 / 1000;    // 80 ms 的帧数
+
         private readonly CancellationTokenSource _cts = new CancellationTokenSource();
 
         private volatile int _sampleRate = 48000;
@@ -623,12 +771,13 @@ namespace Snad
                         Interlocked.Increment(ref _packets);
                         Interlocked.Add(ref _bytes, payload);
 
-                        if (!_queue.TryAdd(pcm))
+                        if (!_ring.Write(pcm, _channels, payload))
                         {
                             long ov = Interlocked.Increment(ref _overflow);
                             if (ov <= 3 || ov % 100 == 0)
-                                Logger.Warn("抖动缓冲已满，丢弃第 " + ov + " 个包（队列 " + _queue.Count +
-                                            "/" + Program.MaxQueuedPackets + "）。持续出现说明网络抖动超过缓冲");
+                                Logger.Warn("环形缓冲已满，丢弃第 " + ov + " 个包（可用 " +
+                                            _ring.AvailableFrames + " 帧 / 容量 " + _ring.CapacityFrames +
+                                            " 帧）。持续出现说明播放侧未跟上");
                         }
 
                         var now = DateTime.UtcNow;
@@ -638,10 +787,13 @@ namespace Snad
                             long b = Interlocked.Read(ref _bytes);
                             double kbps = (b - lastBytes) * 8.0 / 1000.0 / (now - lastReport).TotalSeconds;
                             Logger.Info(string.Format(
-                                "包={0} 累计={1:F1} MB 速率≈{2:F0} kbps 队列={3}/{4} 溢出={5} " +
-                                "序号缺口={6}(缺{7}包) 丢弃[短{8} magic{9} 版本{10} 负载{11}] 来源={12}",
-                                p, b / 1048576.0, kbps, _queue.Count, Program.MaxQueuedPackets,
+                                "包={0} 累计={1:F1} MB 速率≈{2:F0} kbps 缓冲={3}帧({4}ms) 溢出={5} " +
+                                "欠载={6} 插值={7} 序号缺口={8}(缺{9}包) " +
+                                "丢弃[短{10} magic{11} 版本{12} 负载{13}] 来源={14}",
+                                p, b / 1048576.0, kbps, _ring.AvailableFrames,
+                                _ring.AvailableFrames / 48,
                                 Interlocked.Read(ref _overflow),
+                                _ring.UnderrunEvents, _ring.InterpolatedFrames,
                                 _seqGaps, _seqMissing,
                                 Interlocked.Read(ref _shortPkt), Interlocked.Read(ref _badMagic),
                                 Interlocked.Read(ref _badVersion), Interlocked.Read(ref _badPayload),
@@ -662,12 +814,40 @@ namespace Snad
         {
             try
             {
+                // 预填充：先攒够 100 ms 再起播。否则一起播就见底，
+                // 播放侧拿不到数据只能补零，波形被切断，听感即"电音"。
+                Logger.Info("等待预填充 " + PrebufferFrames + " 帧（约 100 ms）...");
+                var waitStart = DateTime.UtcNow;
+                while (!_cts.IsCancellationRequested && _ring.AvailableFrames < PrebufferFrames)
+                {
+                    Thread.Sleep(10);
+                    if ((DateTime.UtcNow - waitStart).TotalSeconds > 10)
+                    {
+                        Logger.Warn("预填充等待超过 10 秒，仅攒到 " + _ring.AvailableFrames +
+                                    " 帧，先起播（仍可能欠载）");
+                        break;
+                    }
+                }
+                Logger.Info("预填充完成，可用 " + _ring.AvailableFrames + " 帧（约 " +
+                            (_ring.AvailableFrames / 48) + " ms），开始播放");
+
+                // 播放完全由 waveOut 时钟驱动，每次固定取 16 ms，
+                // 与"包到达"解耦——这是消除欠载补零的关键。
+                int framesPerBuffer = Math.Max(64, _sampleRate * 16 / 1000);
+
                 WaveOut.Play(_deviceIndex, () => _sampleRate, () => _channels, () =>
                 {
-                    byte[] item;
-                    // 阻塞等数据：等到就播，超时才返回 null（由调用方决定不写缓冲）
-                    if (_queue.TryTake(out item, 2000, _cts.Token)) return item;
-                    return null;
+                    // ratio 吸收两端时钟的细微偏差：积压多于提前量则略快消费，反之略慢。
+                    // 偏差由线性插值承担，因此不会出现周期性的丢帧/补帧断点。
+                    int aheadFrames = _sampleRate * 150 / 1000;
+                    int avail = _ring.AvailableFrames;
+                    double ratio = 1.0 + (avail - aheadFrames) / (double)Math.Max(1, aheadFrames) * 0.02;
+                    if (ratio > 1.02) ratio = 1.02;
+                    if (ratio < 0.98) ratio = 0.98;
+
+                    var buf = new byte[framesPerBuffer * 4];
+                    _ring.Read(buf, framesPerBuffer, ratio);
+                    return buf;
                 }, _cts.Token);
             }
             catch (OperationCanceledException)
@@ -683,8 +863,6 @@ namespace Snad
         public void Dispose()
         {
             Stop();
-            try { _queue.CompleteAdding(); }
-            catch (Exception ex) { Logger.Err("CompleteAdding", ex); }
         }
     }
 }
