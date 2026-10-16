@@ -9,23 +9,21 @@ app/build/
 pc-receiver/*.exe
 pc-receiver/*.ico
 
-# 运行期产物与日志
+# 运行期生成与日志
 *.log
 receiver.log
 phone.log
 gui-startup.log
 recv*.txt
 probe-http-hits.txt
+pc-receiver/receiver.cfg
 
 # 调试与探测残留
 pc-receiver/_vmprobe/
 pc-receiver/*.corrupt-backup
 pc-receiver/*.head-clean.cs
+pc-receiver/shot-gui.ps1
 
 # 系统
 .DS_Store
 Thumbs.db
-pc-receiver/receiver.cfg
-pc-receiver/shot-gui.ps1
-pc-receiver/diag-dpi.ps1
-pc-receiver/run-receiver-direct.ps1
