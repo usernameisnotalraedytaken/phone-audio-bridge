@@ -168,7 +168,12 @@ namespace Snad
             // ---- 控制条 1：开关 + 前置 ----
             var bar1 = new Panel { Dock = DockStyle.Top, Height = 40, BackColor = Theme.BgPanel, Padding = new Padding(12, 9, 12, 9) };
 
-            _enable = new FlatToggle("EQ ON") { Location = new Point(12, 9), Width = 90, Height = 22 };
+            // 位置按实测宽度依次排布，不写死坐标。
+            // 写死宽度会让 "EQ ON" 被切成 "EQ O"（末字符超出控件边界）。
+            int bx1 = 12;
+
+            _enable = new FlatToggle("EQ ON") { Location = new Point(bx1, 9), Height = 24 };
+            _enable.FitToContent();
             _enable.CheckedChanged += (s, e) =>
             {
                 _eq.Enabled = _enable.Checked;
@@ -176,11 +181,14 @@ namespace Snad
                 _log("Equalizer " + (_enable.Checked ? "enabled" : "disabled"));
             };
             bar1.Controls.Add(_enable);
+            bx1 += _enable.Width + 16;
 
-            _couple = new FlatToggle("LINK") { Location = new Point(110, 9), Width = 84, Height = 22 };
+            _couple = new FlatToggle("LINK") { Location = new Point(bx1, 9), Height = 24 };
+            _couple.FitToContent();
             _couple.CheckedChanged += (s, e) =>
                 _log("Linked drag " + (_couple.Checked ? "on" : "off"));
             bar1.Controls.Add(_couple);
+            bx1 += _couple.Width + 22;
 
             var preLabel = new Label
             {
@@ -188,11 +196,13 @@ namespace Snad
                 ForeColor = Theme.TextTertiary,
                 Font = Theme.Label(7.5f),
                 AutoSize = true,
-                Location = new Point(216, 13)
+                Location = new Point(bx1, 15)
             };
             bar1.Controls.Add(preLabel);
+            // AutoSize 标签在加入父容器后才算得出宽度，因此这里用字体测量
+            bx1 += (int)Math.Ceiling(preLabel.Font.GetHeight() * 3.4) + 10;
 
-            _preamp = new FlatStepper { Location = new Point(266, 8), Width = 96, Height = 24 };
+            _preamp = new FlatStepper { Location = new Point(bx1, 8), Width = 96, Height = 26 };
             _preamp.Configure(-24, 12, 0.5, 1, "dB");
             _preamp.Value = _eq.PreampDb;
             _preamp.ValueChanged += (s, e) =>

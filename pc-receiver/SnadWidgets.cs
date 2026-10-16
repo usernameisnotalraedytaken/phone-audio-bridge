@@ -216,6 +216,23 @@ namespace Snad
         protected override void OnMouseLeave(EventArgs e) { base.OnMouseLeave(e); _hover = false; Invalidate(); }
         protected override void OnMouseDown(MouseEventArgs e) { base.OnMouseDown(e); Checked = !Checked; }
 
+        /// <summary>
+        /// 按内容宽度撑开。复选块是 "[x] " + 文本，两部分都要算进去。
+        ///
+        /// 之前由调用方写死宽度（如 Width = 90），而 "EQ ON" 在等宽 9pt 下
+        /// 连同 "[x] " 需要更宽，于是显示成 "EQ O"——末字符被切掉。
+        /// 让控件自己量，调用方就不必猜。凡是"文字 + 固定前缀"的控件都该这样。
+        /// </summary>
+        public void FitToContent()
+        {
+            using (var g = CreateGraphics())
+            {
+                string box = "[x] ";
+                float w = g.MeasureString(box, Font).Width + g.MeasureString(Text, Font).Width;
+                Width = (int)Math.Ceiling(w) + 8;
+            }
+        }
+
         protected override void OnPaint(PaintEventArgs e)
         {
             var g = e.Graphics;
