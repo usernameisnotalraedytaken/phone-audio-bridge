@@ -5,15 +5,22 @@ build/
 local.properties
 app/build/
 
+# 编译产物（源码可重建：build.ps1 / make-icon.ps1）
+pc-receiver/*.exe
+pc-receiver/*.ico
+
 # 运行期产物与日志
 *.log
 receiver.log
 phone.log
+gui-startup.log
 recv*.txt
 probe-http-hits.txt
 
-# 编译出的可执行文件（源码可重建）
-pc-receiver/*.exe
+# 调试与探测残留
+pc-receiver/_vmprobe/
+pc-receiver/*.corrupt-backup
+pc-receiver/*.head-clean.cs
 
 # 系统
 .DS_Store
