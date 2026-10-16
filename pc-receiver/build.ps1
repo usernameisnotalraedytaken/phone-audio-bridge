@@ -67,14 +67,8 @@ if ($buildGui) {
     if ($missing.Count -eq 0) {
         $guiArgs = @('/nologo', '/target:winexe', '/platform:x64', '/optimize+',
                      '/main:Snad.GuiEntry', '/out:SnadGui.exe')
-        # /win32icon 把图标写进 exe 资源，供资源管理器显示（WinForms 不会自动采用它）；
-        # /resource 再把同一个 ico 作为托管资源嵌入，使程序能取到各尺寸的原生图标。
-        # 只用 ExtractAssociatedIcon 的话拿到的是 32x32，标题栏需要 16x16，会缩放发虚。
-        if (Test-Path 'app.ico') {
-            $guiArgs += '/win32icon:app.ico'
-            $guiArgs += '/resource:app.ico,AppIcon.ico'
-            Write-Host "图标：win32icon + 嵌入资源 AppIcon.ico"
-        }
+        # 嵌入应用图标：双击时不再显示 .NET 默认图标
+        if (Test-Path 'app.ico') { $guiArgs += '/win32icon:app.ico' }
         foreach ($a in $guiRefs) { $guiArgs += ("/r:" + (Join-Path $fw $a)) }
         $guiArgs += $guiSources
         & $csc @guiArgs

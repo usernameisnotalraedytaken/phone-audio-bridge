@@ -61,41 +61,23 @@ namespace Snad
         private System.Windows.Forms.Timer _uiTimer;
 
         /// <summary>
-        /// 取出应用图标。
+        /// 从 exe 自身内嵌资源取出应用图标。
         ///
-        /// 优先从嵌入的托管资源 AppIcon.ico 加载：该 ico 内含 16/24/32/48/64/128/256
-        /// 七个尺寸，WinForms 会按标题栏与小托盘图标各自需要的尺寸取原生版本，边缘清晰。
-        /// 若资源缺失，退回 ExtractAssociatedIcon——注意它只返回单一 32x32，
-        /// 用于标题栏（16x16）时会缩放发虚。
+        /// 说明：/win32icon 只是把图标写进 exe 资源（供资源管理器显示），
+        /// WinForms 窗口并不会自动采用它，必须显式赋给 Form.Icon 与 NotifyIcon.Icon。
+        /// 此前两处都没设，所以标题栏与托盘一直是系统默认图标。
         /// </summary>
         private static Icon LoadAppIcon()
         {
             try
             {
-                var asm = System.Reflection.Assembly.GetExecutingAssembly();
-                using (var s = asm.GetManifestResourceStream("AppIcon.ico"))
-                {
-                    if (s != null)
-                    {
-                        var ico = new Icon(s);
-                        if (ico != null) return ico;
-                    }
-                }
-                System.Diagnostics.Debug.WriteLine("未找到嵌入资源 AppIcon.ico，退回 ExtractAssociatedIcon");
-            }
-            catch (Exception ex)
-            {
-                System.Diagnostics.Debug.WriteLine("加载嵌入图标失败: " + ex.Message);
-            }
-            try
-            {
-                var extracted = Icon.ExtractAssociatedIcon(
-                    System.Reflection.Assembly.GetExecutingAssembly().Location);
+                string exe = System.Reflection.Assembly.GetExecutingAssembly().Location;
+                var extracted = Icon.ExtractAssociatedIcon(exe);
                 if (extracted != null) return extracted;
             }
             catch (Exception ex)
             {
-                System.Diagnostics.Debug.WriteLine("提取关联图标失败: " + ex.Message);
+                System.Diagnostics.Debug.WriteLine("提取应用图标失败: " + ex.Message);
             }
             return SystemIcons.Application;
         }
