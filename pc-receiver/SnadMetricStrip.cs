@@ -108,10 +108,10 @@ namespace Snad
                 float fValueH = fValue.GetHeight(g);
                 const float barH = 6;
 
-                float gap1 = fLabelH * 0.22f;      // 标签与数值之间
-                float gap2 = Math.Max(6f, fValueH * 0.18f);   // 数值与电平条之间
+                float gap1 = fLabelH * 0.34f;      // 标签与数值之间
+                float gap2 = Math.Max(8f, fValueH * 0.26f);   // 数值与电平条之间
 
-                float labelY = fLabelH * 0.28f;
+                float labelY = fLabelH * 0.50f;    // 顶部留白
                 float valY = labelY + fLabelH + gap1;
                 // 电平条贴底，与底边留一点余量
                 float barY = ClientSize.Height - barH - Math.Max(4f, fLabelH * 0.25f);
@@ -155,20 +155,26 @@ namespace Snad
         {
             get
             {
-                using (var g = CreateGraphics())
-                {
-                    float fLabelH = Theme.Label(7.5f).GetHeight(g);
-                    float fValueH = Theme.Readout(20f).GetHeight(g);
-                    // 与实际绘制用同一组公式，避免"算出来的高度"与"画出来的高度"不一致
-                    float h = fLabelH * 0.28f
-                            + fLabelH
-                            + fLabelH * 0.22f
-                            + fValueH
-                            + Math.Max(6f, fValueH * 0.18f)
-                            + 6
-                            + Math.Max(4f, fLabelH * 0.25f);
-                    return (int)Math.Ceiling(h);
-                }
+                // 按 DeviceDpi 量，而不是 CreateGraphics()：
+                // 后者拿到的是屏幕 DC，其 DPI 与窗体实际绘制用的不一定是同一个
+                // （高 DPI 下会量偏小，画出来就压行）。
+                float k = DeviceDpi / 96f;
+                float fLabelH = Theme.Label(7.5f).Height * k;
+                float fValueH = Theme.Readout(20f).Height * k;
+
+                // 与实际绘制用同一组公式，避免"算出来的高度"与"画出来的高度"不一致
+                float need = fLabelH * 0.50f
+                           + fLabelH
+                           + fLabelH * 0.34f
+                           + fValueH
+                           + Math.Max(8f, fValueH * 0.26f)
+                           + 6
+                           + Math.Max(4f, fLabelH * 0.25f);
+
+                // 再加一成余量。之前算的是"刚好装下"，一像素不剩，
+                // 视觉上就是挤在一起（用户反馈"纵向还是太挤"）。
+                // 界面留白不是浪费，是让信息可读。
+                return (int)Math.Ceiling(need * 1.14f) + 6;
             }
         }
 
