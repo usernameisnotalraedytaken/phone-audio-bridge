@@ -59,6 +59,12 @@ namespace Snad
             _eq = eq;
             _log = log;
 
+            // 确保滤波器已按某个采样率算过系数。
+            // Equalizer 有 48000 的默认值，因此这里通常已是可用的；
+            // 但接收器若用 44100，MainForm 会在打开本窗口前先 Configure 成实际值，
+            // 那时这里不能再用默认值覆盖回去——所以只在未配置时才设。
+            if (_eq.SampleRate <= 0) _eq.Configure(48000, 2);
+
             Text = "SNAD  EQUALIZER";
             // 复用主窗口的内嵌图标。不设的话标题栏是系统默认图标，
             // 与主窗口看起来像两个不相干的程序。

@@ -130,7 +130,18 @@ namespace Snad
 
         private readonly List<EqBand> _bands = new List<EqBand>();
         private readonly List<Biquad> _filters = new List<Biquad>();
-        private int _sampleRate;
+        /// <summary>
+        /// 当前采样率。
+        ///
+        /// 默认 48000，不能是 0。此前初值为 0，而 ResponseDb 与 Rebuild 都在
+        /// _sampleRate &lt;= 0 时直接返回——于是：
+        ///   ResponseDb 恒返回 0  →  曲线永远是一条直线
+        ///   Rebuild 不执行       →  滤波器系数根本没算
+        /// 而 Configure 只在 WaveOut.Play 里被调用，也就是说"未开始播放时
+        /// 打开均衡器窗口"必然看到一条直线（实测正是用户报的现象）。
+        /// 给一个合理的默认值，未配置时也能正确显示与试听。
+        /// </summary>
+        private int _sampleRate = 48000;
         private int _channels;
         private double _preampDb;
         private double _preampLinear = 1.0;

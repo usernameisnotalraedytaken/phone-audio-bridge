@@ -720,6 +720,18 @@ namespace Snad
             try
             {
                 var eq = _receiver != null ? _receiver.Equalizer : _idleEq;
+
+                // 用接收器的实际采样率配置一次，让曲线与实际听到的一致
+                // （同一频段在 44.1k 与 48k 下系数不同）。
+                // 未开始播放时退回 48k —— EQ 的频响本来就只取决于滤波器参数，
+                // 与是否在放音无关，这里只是把"实际值"告诉它。
+                int sr = 0;
+                try { if (_receiver != null) sr = _receiver.Snapshot().SampleRate; }
+                catch (Exception ex) { AppendLog("Read sample rate failed: " + ex.Message); }
+                if (sr <= 0) sr = 48000;
+                try { eq.Configure(sr, 2); }
+                catch (Exception ex) { AppendLog("EQ configure failed: " + ex.Message); }
+
                 using (var f = new EqForm(eq, AppendLog))
                 {
                     f.ShowDialog(this);

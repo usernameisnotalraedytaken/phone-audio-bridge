@@ -34,6 +34,12 @@ namespace Snad
                 eq.PreampDb = -4;
                 eq.Enabled = true;
 
+                // ---- 断言：未经 Configure 的实例也必须能算出频响 ----
+                // 这是漏测过的真实缺陷：_sampleRate 初值为 0 时 ResponseDb 直接
+                // 返回 0，曲线永远是一条直线，而 Configure 只在开始播放时才被调用。
+                // 之前的测试预先调了 Configure，因此测的不是真实路径。
+                failures += CheckWorksWithoutConfigure();
+
                 var f = new EqForm(eq, m => Console.WriteLine("  [log] " + m));
 
                 // 必须真正显示窗口，DrawToBitmap 才会画到子控件。
@@ -219,6 +225,61 @@ namespace Snad
             if (!ok) { Console.WriteLine("  [失败] 预设未同时作用到推子与数据"); bad++; }
             else Console.WriteLine("  [通过] 预设同时作用到推子与数据");
 
+            return bad;
+        }
+
+        /// <summary>
+        /// 断言：全新构造、未调用 Configure 的 Equalizer 也能算出正确频响。
+        ///
+        /// 这条针对一个真实漏测：_sampleRate 初值为 0 时 ResponseDb 直接返回 0，
+        /// 于是"未开始播放就打开均衡器"必然看到一条直线。而 Configure 只在
+        /// WaveOut.Play 里被调用——EQ 的频响本就与是否放音无关，不该有此依赖。
+        /// </summary>
+        private static int CheckWorksWithoutConfigure()
+        {
+            int bad = 0;
+            Console.WriteLine();
+            Console.WriteLine("--- 未 Configure 的实例也应能算频响 ---");
+
+            var eq = new Equalizer();          // 故意不调 Configure
+            eq.Enabled = true;
+
+            // 先取全平时的基准，再设增益比较——这样与滤波器类型无关。
+            // （105Hz 是低架滤波器，架上增益 +12 时转折频率处恰为 +6，即一半，
+            //   这是搁架的定义；直接期望 +12 会误判。）
+            double baseLow = eq.ResponseDb(60);
+            eq.SetGain(0, 12);                 // 低频架拉满
+            Application.DoEvents();
+
+            double low60 = eq.ResponseDb(60);
+            double low2000 = eq.ResponseDb(2000);
+            Console.WriteLine("  SampleRate=" + eq.SampleRate +
+                              "  60Hz: 基准 " + baseLow.ToString("F1") + " -> " + low60.ToString("F1") +
+                              "   2kHz: " + low2000.ToString("F1"));
+
+            if (eq.SampleRate <= 0)
+            {
+                Console.WriteLine("  [失败] 采样率为 " + eq.SampleRate + "，未初始化");
+                bad++;
+            }
+            // 60Hz 在低架的通带内，应接近 +12
+            if (low60 - baseLow < 8)
+            {
+                Console.WriteLine("  [失败] 低频提升未反映到频响上（曲线会是直线）");
+                bad++;
+            }
+            // 2kHz 远离该架，应几乎不受影响——说明曲线不是整体平移
+            if (Math.Abs(low2000 - eq.ResponseDb(2000)) > 0.01)
+            {
+                Console.WriteLine("  [失败] 远端频响不稳定");
+                bad++;
+            }
+            if (Math.Abs(low2000) > 1.5)
+            {
+                Console.WriteLine("  [失败] 2kHz 被低频架影响过多（应为 0）");
+                bad++;
+            }
+            if (bad == 0) Console.WriteLine("  [通过] 无需 Configure 即可算出正确频响");
             return bad;
         }
 
