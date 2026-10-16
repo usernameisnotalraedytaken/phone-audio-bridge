@@ -152,7 +152,7 @@ if (Test-Path 'SnadEqShot.cs') {
                     '/main:Snad.EqShot', '/out:SnadEqShot.exe')
     foreach ($a in $guiRefs) { $eqShotArgs += ("/r:" + (Join-Path $fw $a)) }
     $eqShotArgs += @('SnadEq.cs', 'SnadEqForm.cs', 'SnadEqShot.cs',
-                     'SnadTheme.cs', 'SnadControls.cs', 'SnadWidgets.cs', 'SnadWordmark.cs', 'SnadGraph.cs',
+                     'SnadTheme.cs', 'SnadControls.cs', 'SnadWidgets.cs', 'SnadWordmark.cs', 'SnadChannelStrip.cs', 'SnadLogView.cs', 'SnadStereo.cs', 'SnadLogForm.cs', 'SnadGraph.cs',
                      'SnadMetricStrip.cs', 'SnadSpectrum.cs')
     & $csc @eqShotArgs
     if ($LASTEXITCODE -ne 0) { throw "均衡器界面检查工具编译失败，csc 退出码 $LASTEXITCODE" }
@@ -177,7 +177,7 @@ if (Test-Path 'SnadShot.cs') {
     foreach ($a in $guiRefs) { $shotArgs += ("/r:" + (Join-Path $fw $a)) }
     $shotArgs += @('SnadReceiver.cs', 'SnadProfile.cs', 'SnadBeacon.cs', 'SnadBeaconService.cs',
                    'SnadEq.cs', 'SnadEqForm.cs', 'SnadSpectrum.cs', 'SnadGui.cs',
-                   'SnadTheme.cs', 'SnadControls.cs', 'SnadWidgets.cs', 'SnadWordmark.cs', 'SnadGraph.cs', 'SnadMetricStrip.cs',
+                   'SnadTheme.cs', 'SnadControls.cs', 'SnadWidgets.cs', 'SnadWordmark.cs', 'SnadChannelStrip.cs', 'SnadLogView.cs', 'SnadStereo.cs', 'SnadLogForm.cs', 'SnadGraph.cs', 'SnadMetricStrip.cs',
                    'SnadSecret.cs', 'SnadShot.cs')
     & $csc @shotArgs
     if ($LASTEXITCODE -ne 0) { throw "界面检查工具编译失败，csc 退出码 $LASTEXITCODE" }
@@ -198,7 +198,7 @@ if (Test-Path 'SnadPreview.cs') {
     $prevArgs = @('/nologo', '/target:winexe', '/platform:x64', '/optimize+',
                   '/main:Snad.Preview', '/out:SnadPreview.exe')
     foreach ($a in $guiRefs) { $prevArgs += ("/r:" + (Join-Path $fw $a)) }
-    $prevArgs += @('SnadTheme.cs', 'SnadControls.cs', 'SnadWidgets.cs', 'SnadWordmark.cs', 'SnadGraph.cs', 'SnadMetricStrip.cs',
+    $prevArgs += @('SnadTheme.cs', 'SnadControls.cs', 'SnadWidgets.cs', 'SnadWordmark.cs', 'SnadChannelStrip.cs', 'SnadLogView.cs', 'SnadStereo.cs', 'SnadLogForm.cs', 'SnadGraph.cs', 'SnadMetricStrip.cs',
                    'SnadSpectrum.cs', 'SnadEq.cs', 'SnadPreview.cs')
     & $csc @prevArgs
     if ($LASTEXITCODE -ne 0) { throw "UI 预览工具编译失败，csc 退出码 $LASTEXITCODE" }
@@ -208,7 +208,7 @@ if (Test-Path 'SnadPreview.cs') {
 if ($buildGui) {
     $guiSources = @('SnadReceiver.cs', 'SnadProfile.cs', 'SnadBeacon.cs', 'SnadBeaconService.cs',
                     'SnadSecret.cs', 'SnadEq.cs', 'SnadEqForm.cs',
-                    'SnadTheme.cs', 'SnadControls.cs', 'SnadWidgets.cs', 'SnadWordmark.cs', 'SnadGraph.cs', 'SnadMetricStrip.cs',
+                    'SnadTheme.cs', 'SnadControls.cs', 'SnadWidgets.cs', 'SnadWordmark.cs', 'SnadChannelStrip.cs', 'SnadLogView.cs', 'SnadStereo.cs', 'SnadLogForm.cs', 'SnadGraph.cs', 'SnadMetricStrip.cs',
                     'SnadGui.cs', 'SnadSpectrum.cs')
     $missing = $guiSources | Where-Object { -not (Test-Path $_) }
     if ($missing.Count -eq 0) {

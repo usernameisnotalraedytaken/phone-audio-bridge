@@ -89,34 +89,72 @@ namespace Snad
                 var main = it.Alert ? Theme.Warning : Theme.TextPrimary;
                 var sub = it.Alert ? Theme.Warning : Theme.TextTertiary;
 
-                // ---- 标签 ----
+                // ---- 纵向排布 ----
+                //
+                // 全部按字体实测高度自顶向下推，不写任何固定 y。
+                // 之前标签 y=8、数值 y=20、电平条 Height-20 都是硬编码：
+                // 控件一变矮就互相压上（实测把指标条从 88 改成 76 后，
+                // 标签、数值、单位、电平条四处重叠）。
+                // 硬编码的像素值在 144 DPI 缩放下本来也不该直接用。
                 float padX = 12;
+                float fLabelH = fLabel.GetHeight(g);
+                float fValueH = fValue.GetHeight(g);
+                float fUnitH = fUnit.GetHeight(g);
+                const float barH = 6;
+                float gap = 2;
+
+                float labelY = 4;
+                float valY = labelY + fLabelH + 1;
+                float barY = ClientSize.Height - barH - 6;
+
+                // 空间不足时优先压缩数值上方的空隙，而不是让它们重叠
+                if (valY + fValueH > barY - gap)
+                    valY = Math.Max(labelY + fLabelH, barY - gap - fValueH);
+
                 using (var br = new SolidBrush(Theme.TextTertiary))
-                    g.DrawString(it.Label, fLabel, br, x + padX, 8);
+                    g.DrawString(it.Label, fLabel, br, x + padX, labelY);
 
                 // ---- 数值（大号等宽） ----
                 var szVal = g.MeasureString(it.Value, fValue);
-                float valY = 20;
                 using (var br = new SolidBrush(main))
                     g.DrawString(it.Value, fValue, br, x + padX, valY);
 
-                // ---- 单位，紧贴数值右侧 ----
+                // ---- 单位，紧贴数值右侧并与之底对齐 ----
                 if (!string.IsNullOrEmpty(it.Unit))
                 {
-                    float unitX = x + padX + szVal.Width - 2;
-                    float unitY = valY + szVal.Height - fUnit.GetHeight(g) - 2;
+                    // 数值右侧再留 3px，避免与数字最后一笔贴住
+                    float unitX = x + padX + szVal.Width + 1;
+                    float unitY = valY + fValueH - fUnitH - 2;
+                    if (unitY < valY) unitY = valY;
                     using (var br = new SolidBrush(sub))
                         g.DrawString(it.Unit, fUnit, br, unitX, unitY);
                 }
 
                 // ---- 电平条 ----
-                float barY = ClientSize.Height - 20;
                 float barW = colW - padX * 2;
                 if (it.Bar >= 0 && barW > 8)
-                    DrawBar(g, x + padX, barY, barW, 6, it);
+                    DrawBar(g, x + padX, barY, barW, barH, it);
                 else
                     using (var pen = new Pen(Color.FromArgb(90, Theme.Line), 1f))
-                        g.DrawLine(pen, x + padX, barY + 3, x + padX + barW, barY + 3);
+                        g.DrawLine(pen, x + padX, barY + barH / 2, x + padX + barW, barY + barH / 2);
+            }
+        }
+
+        /// <summary>
+        /// 面板绘制一格所需的最小高度。
+        /// 主界面据此分配指标条高度，避免外部写死一个"看着差不多"的数
+        /// （写死 76 就压上了）。
+        /// </summary>
+        public int PreferredHeight
+        {
+            get
+            {
+                using (var g = CreateGraphics())
+                {
+                    float h = 4 + Theme.Label(7.5f).GetHeight(g) + 1
+                            + Theme.Readout(20f).GetHeight(g) + 2 + 6 + 6;
+                    return (int)Math.Ceiling(h);
+                }
             }
         }
 

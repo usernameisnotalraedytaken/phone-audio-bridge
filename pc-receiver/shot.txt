@@ -1,0 +1,16 @@
+﻿2026-10-17 03:32:19.745 INFO  配置载入：C:\Users\26347\Downloads\bluetooth\phone-audio-bridge\pc-receiver\receiver.cfg（3 个档位，选中 balanced）
+  已注入合成立体声：左 220Hz(带谐波) 右 330Hz
+主界面 960x640 -> C:\Users\26347\Downloads\bluetooth\bt-probe\k\main.png
+
+--- 指标条内部排布 ---
+  实测需要高度 63px，实际分配 63px
+  [通过] 高度足够
+  标签 y 4~16   数值 y 17~49   电平条 y 51~57
+  [通过] 标签 / 数值 / 电平条互不重叠
+  自绘按钮 2 个，滚轮选择器 2 个，通道条 1 个，频谱图 1 个
+    滚轮 "balanced" 位置 12,518 尺寸 150x23 展开中=False
+    滚轮 "SYSTEM DEFAULT" 位置 174,518 尺寸 562x23 展开中=False
+  [通过] 关键控件都在窗口内且尺寸正常
+均衡器 664x628 -> C:\Users\26347\Downloads\bluetooth\bt-probe\k\eq.png
+
+界面检查通过

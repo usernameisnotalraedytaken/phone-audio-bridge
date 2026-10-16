@@ -52,6 +52,11 @@ namespace Snad
                 // 因此填入典型运行值，并往频谱分析器喂一段合成音频。
                 FillSyntheticMetrics(f);
                 FeedSyntheticSpectrum(f);
+                FeedSyntheticStereo(f);
+                // 注入数据不会改变窗口尺寸，因此布局不必重跑；
+                // 但若此前有控件按默认尺寸创建、尚未经过一次布局，
+                // 这里补一次，保证截图反映的是真实排版。
+                InvokeLayoutAll(f);
                 Pump(30);        // 让频谱的缓动收敛到位
 
                 string p = Path.Combine(dir, "main.png");
@@ -69,6 +74,8 @@ namespace Snad
                 CollectByType(f, typeof(WheelSelector), combos);
                 CollectByType(f, typeof(MetricStrip), strips);
                 CollectByType(f, typeof(SpectrumGraph), graphs);
+
+            if (CheckMetricStripLayout(f) > 0) failures++;
 
             Console.WriteLine("  自绘按钮 " + buttons.Count + " 个，滚轮选择器 " + combos.Count +
                                   " 个，通道条 " + strips.Count + " 个，频谱图 " + graphs.Count + " 个");
@@ -220,6 +227,120 @@ namespace Snad
         /// 走真实通路（Feed -> FFT -> BarsDb），不是往数据里塞假数字——
         /// 后者验证不了绘制路径。泛音列 + 宽带噪声能产生自然的谱形与高频滚降。
         /// </summary>
+        /// <summary>
+        /// 给声道条喂一段合成音频，否则截图里电平表与波形是空的，
+        /// 无法判断它们画得对不对。左右给不同幅度与波形，
+        /// 也好确认两路是独立工作的（而不是同一份数据画两遍）。
+        /// </summary>
+        /// <summary>
+        /// 断言指标条内部三行（标签 / 数值 / 电平条）互不重叠。
+        ///
+        /// 这条针对一个真实缺陷：指标条的纵向位置原本是硬编码的
+        /// （标签 y=8、数值 y=20、电平条 Height-20），把面板高度从 88 改成 76
+        /// 后四处内容直接压在一起。改为按字体实测排布之后，
+        /// 这里用一个独立断言把"不重叠"固定下来，避免以后再被某个常量改动破坏。
+        /// </summary>
+        private static int CheckMetricStripLayout(Control root)
+        {
+            int bad = 0;
+            Console.WriteLine();
+            Console.WriteLine("--- 指标条内部排布 ---");
+
+            var list = new List<Control>();
+            CollectByType(root, typeof(MetricStrip), list);
+            var ms = list.Count > 0 ? list[0] as MetricStrip : null;
+            if (ms == null) { Console.WriteLine("  [跳过] 未找到指标条"); return 0; }
+
+            int need = ms.PreferredHeight;
+            Console.WriteLine("  实测需要高度 " + need + "px，实际分配 " + ms.Height + "px");
+            if (ms.Height < need)
+            {
+                Console.WriteLine("  [失败] 分配高度不足 " + (need - ms.Height) +
+                                  "px，内容会被压缩或重叠");
+                bad++;
+            }
+            else Console.WriteLine("  [通过] 高度足够");
+
+            // 用与实际绘制相同的公式推三行的纵向区间，检查是否分得开
+            using (var g = ms.CreateGraphics())
+            {
+                float fLabelH = Theme.Label(7.5f).GetHeight(g);
+                float fValueH = Theme.Readout(20f).GetHeight(g);
+                const float barH = 6;
+
+                float labelTop = 4, labelBot = labelTop + fLabelH;
+                float valTop = labelBot + 1;
+                float barTop = ms.Height - barH - 6;
+                float valBot = valTop + fValueH;
+                if (valTop + fValueH > barTop - 2)
+                    valTop = Math.Max(labelBot, barTop - 2 - fValueH);
+                valBot = valTop + fValueH;
+
+                Console.WriteLine("  标签 y " + labelTop.ToString("F0") + "~" + labelBot.ToString("F0") +
+                                  "   数值 y " + valTop.ToString("F0") + "~" + valBot.ToString("F0") +
+                                  "   电平条 y " + barTop.ToString("F0") + "~" + (barTop + barH).ToString("F0"));
+
+                if (valTop < labelBot - 0.5f)
+                {
+                    Console.WriteLine("  [失败] 数值与标签重叠");
+                    bad++;
+                }
+                else if (barTop < valBot - 0.5f)
+                {
+                    Console.WriteLine("  [失败] 电平条与数值重叠");
+                    bad++;
+                }
+                else Console.WriteLine("  [通过] 标签 / 数值 / 电平条互不重叠");
+            }
+            return bad;
+        }
+
+        /// <summary>让主窗口按当前尺寸重新排版一次。</summary>
+        private static void InvokeLayoutAll(Control root)
+        {
+            var m = root.GetType().GetMethod("LayoutAll",
+                System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic);
+            if (m == null) { Console.WriteLine("  提示：未找到 LayoutAll"); return; }
+            try { m.Invoke(root, null); }
+            catch (Exception ex) { Console.WriteLine("  提示：LayoutAll 调用失败：" + ex.Message); }
+        }
+
+        private static void FeedSyntheticStereo(Control root)
+        {
+            var fi = root.GetType().GetField("_stereo",
+                System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic);
+            if (fi == null) { Console.WriteLine("  提示：未找到 _stereo，声道条将为空"); return; }
+            var st = fi.GetValue(root) as StereoMeter;
+            if (st == null) return;
+
+            const int frames = 1024, sr = 48000;
+            var pcm = new byte[frames * 2 * 2];
+            double ph1 = 0, ph2 = 0;
+            st.Reset(sr, 2);
+
+            // 左：幅度较高、含二次谐波（波形不对称，看得出形状差异）
+            // 右：幅度较低、纯正弦
+            for (int k = 0; k < 80; k++)
+            {
+                for (int i = 0; i < frames; i++)
+                {
+                    double l = 0.55 * Math.Sin(ph1) + 0.18 * Math.Sin(2 * ph1);
+                    double r = 0.28 * Math.Sin(ph2);
+                    ph1 += 2 * Math.PI * 220 / sr;
+                    ph2 += 2 * Math.PI * 330 / sr;
+
+                    int sl = (int)(l * 32767); if (sl > 32767) sl = 32767; if (sl < -32768) sl = -32768;
+                    int sr2 = (int)(r * 32767); if (sr2 > 32767) sr2 = 32767; if (sr2 < -32768) sr2 = -32768;
+
+                    int b = i * 4;
+                    pcm[b] = (byte)(sl & 0xFF); pcm[b + 1] = (byte)((sl >> 8) & 0xFF);
+                    pcm[b + 2] = (byte)(sr2 & 0xFF); pcm[b + 3] = (byte)((sr2 >> 8) & 0xFF);
+                }
+                st.Feed(pcm, pcm.Length, 2, sr);
+            }
+            Console.WriteLine("  已注入合成立体声：左 220Hz(带谐波) 右 330Hz");
+        }
+
         private static void FeedSyntheticSpectrum(Control root)
         {
             // _analyzer 是 MainForm 的私有字段，这里用反射取；

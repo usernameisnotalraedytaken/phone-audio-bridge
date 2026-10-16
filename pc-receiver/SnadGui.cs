@@ -25,7 +25,12 @@ namespace Snad
         private FlatButton _eqBtn;
         private SpectrumGraph _graph;
         private MetricStrip _metrics;
-        private CollapsibleLog _logHost;
+        private Panel _logBar;                 // 底部一行状态，点击弹出日志窗口
+        private Label _logCountLabel;
+        private readonly System.Text.StringBuilder _logBuffer = new System.Text.StringBuilder();
+        private StereoMeter _stereo;
+        private ChannelStrip[] _channelStrips;
+        private Panel _channelHost;
         private NotifyIcon _tray;
         private Panel _titleBar;
         private Panel _graphHost;
@@ -192,31 +197,58 @@ namespace Snad
             controls.Controls.AddRange(new Control[] { _profileBox, _deviceBox, _startBtn, _eqBtn });
             controls.Resize += (s, e) => LayoutControlRow();
 
-            // ---- 事件日志（默认折叠）----
-            // 日志是排查用的，正常使用时只占地方。折叠后只留一条标题栏，
-            // 点击展开；标题栏显示行数，折叠时也知道有没有新日志。
-            var logHost = new CollapsibleLog { BackColor = Theme.BgPanel };
+            // ---- 底部日志状态行 ----
+            // 日志从"占一整块区域的可折叠面板"改为"一行状态 + 弹窗看全文"。
+            // 原因：日志是排查用的，正常使用时不该占掉屏幕面积，
+            // 而那块面积本该显示左右声道电平——那是音频工具的核心信息。
+            _logBar = new Panel { BackColor = Theme.BgPanel, Cursor = Cursors.Hand };
+            _logCountLabel = new Label
+            {
+                Text = "LOG  0 LINES",
+                ForeColor = Theme.TextTertiary,
+                Font = Theme.Label(8f),
+                AutoSize = true,
+                BackColor = Color.Transparent,
+                Location = new Point(12, 0)
+            };
+            _logBar.Controls.Add(_logCountLabel);
+            _logBar.Click += (s, e) => OpenLogWindow();
+            _logCountLabel.Click += (s, e) => OpenLogWindow();
+
+            // ---- 声道条区域：左右声道的波形与电平 ----
+            _stereo = new StereoMeter();
+            _channelHost = new Panel { BackColor = Theme.BgPanel };
+            _channelStrips = new ChannelStrip[StereoMeter.Channels];
+            for (int c = 0; c < _channelStrips.Length; c++)
+            {
+                _channelStrips[c] = new ChannelStrip(c, _stereo)
+                {
+                    ChannelName = c == 0 ? "L" : "R"
+                };
+                _channelHost.Controls.Add(_channelStrips[c]);
+            }
 
             // ---- 组装 ----
             // 不用 Dock 排版面：WinForms 的停靠顺序由控件在集合里的次序决定，
             // 实测 BringToFront 无法可靠改变布局顺序，通道条会跑到图上面
             // （与 K 方向相反）。这里改为显式摆放，位置全部由 LayoutAll 算出。
             Controls.Add(graphHost);
-            Controls.Add(logHost);
+            Controls.Add(_channelHost);
+            Controls.Add(_logBar);
             Controls.Add(controls);
             Controls.Add(_metrics);
             Controls.Add(_titleBar);
 
             _graphHost = graphHost;
             _controlsRow = controls;
-            _logHost = logHost;
 
             // 每一块都不再自行停靠，统一由 LayoutAll 定位
             _titleBar.Dock = DockStyle.None;
             _metrics.Dock = DockStyle.None;
             controls.Dock = DockStyle.None;
             graphHost.Dock = DockStyle.None;
-            logHost.Dock = DockStyle.None;
+            _channelHost.Dock = DockStyle.None;
+            _logBar.Dock = DockStyle.None;
 
             Resize += (s, e) => LayoutAll();
             LayoutAll();
@@ -291,26 +323,92 @@ namespace Snad
 
             int w = ClientSize.Width;
             int h = ClientSize.Height;
-            const int titleH = 40, metricsH = 88, controlsH = 92;   // controlsH 要容下滚轮的三行
-            const int logMinH = 90, graphMinH = 150;
+            // 指标条高度由控件自己算（字体随 DPI 变化，写死的数会在高 DPI 下压行）
+            int metricsH = _metrics != null ? _metrics.PreferredHeight : 92;
+            const int titleH = 40, controlsH = 92;   // controlsH 要容下滚轮的三行
+            const int logBarH = 26, graphMinH = 130, channelMinH = 64, channelWantH = 104;
 
-            // 两块弹性区域：图优先，日志保底
-            int fixedH = titleH + metricsH + controlsH;
+            // 纵向分配（自上而下）：
+            //   标题 / 频谱图(弹性) / 指标条 / 声道条 / 控制行 / 日志状态行
+            // 图与声道条共享弹性空间。声道条至少 64px——它是主要信息来源，
+            // 挤到 30px 时波形与电平表都看不清，等于白放。
+            int fixedH = titleH + metricsH + controlsH + logBarH;
             int flexible = h - fixedH;
-            int graphH = flexible / 2 + 60;           // 图约占弹性部分的六成
-            if (graphH < graphMinH) graphH = graphMinH;
-            int logH = flexible - graphH;
-            if (logH < logMinH) { logH = logMinH; graphH = Math.Max(graphMinH, flexible - logMinH); }
 
-            _titleBar.Bounds = new Rectangle(0, 0, w, titleH);
-            _graphHost.Bounds = new Rectangle(0, titleH, w, graphH);
-            _metrics.Bounds = new Rectangle(0, titleH + graphH, w, metricsH);
-            _controlsRow.Bounds = new Rectangle(0, titleH + graphH + metricsH, w, controlsH);
-            _logHost.Bounds = new Rectangle(0, titleH + graphH + metricsH + controlsH, w,
-                                            Math.Max(10, h - (titleH + graphH + metricsH + controlsH)));
+            // 声道条优先拿够：它是主界面里唯一的实时音频信息，
+            // 图形与柱状表都需要纵向空间才看得清。
+            int channelH = Math.Min(channelWantH, Math.Max(channelMinH, flexible * 2 / 5));
+            if (channelH < channelWantH) channelH = Math.Max(channelMinH, flexible / 2);
+            int graphH = flexible - channelH;
+            if (graphH < graphMinH)
+            {
+                graphH = graphMinH;
+                channelH = Math.Max(0, flexible - graphH);
+            }
+
+            int y = 0;
+            _titleBar.Bounds = new Rectangle(0, y, w, titleH);              y += titleH;
+            _graphHost.Bounds = new Rectangle(0, y, w, Math.Max(10, graphH)); y += Math.Max(10, graphH);
+            _metrics.Bounds = new Rectangle(0, y, w, metricsH);             y += metricsH;
+            _channelHost.Bounds = new Rectangle(0, y, w, channelH);         y += channelH;
+            _controlsRow.Bounds = new Rectangle(0, y, w, controlsH);        y += controlsH;
+            _logBar.Bounds = new Rectangle(0, y, w, Math.Max(10, h - y));
 
             LayoutTitleBar();
             LayoutControlRow();
+            LayoutChannels();
+        }
+
+        /// <summary>
+        /// 声道条布局：左右两条上下堆叠。
+        /// 横向每条都占满宽度，波形因此可以拉长，看形状更清楚。
+        /// </summary>
+        private void LayoutChannels()
+        {
+            if (_channelHost == null || _channelStrips == null) return;
+
+            int n = _channelStrips.Length;
+            int w = _channelHost.ClientSize.Width;
+            int h = _channelHost.ClientSize.Height;
+            const int pad = 8;
+            int rowH = Math.Max(20, (h - pad * (n + 1)) / Math.Max(1, n));
+
+            int y = pad;
+            for (int i = 0; i < n; i++)
+            {
+                _channelStrips[i].Bounds = new Rectangle(pad, y,
+                    Math.Max(40, w - pad * 2), rowH);
+                y += rowH + pad;
+            }
+
+            if (_logCountLabel != null && _logBar != null)
+                _logCountLabel.Top = Math.Max(0, (_logBar.ClientSize.Height - _logCountLabel.Height) / 2);
+        }
+
+        /// <summary>
+        /// 打开日志窗口。
+        /// 内容从内存缓冲取，而不是从控件读——控件只是视图，
+        /// 窗口随时可开可关，内容不能跟着控件走。
+        /// </summary>
+        private void OpenLogWindow()
+        {
+            try
+            {
+                using (var f = new LogForm(GetLogText))
+                {
+                    f.Icon = LoadAppIcon();
+                    f.ShowDialog(this);
+                }
+            }
+            catch (Exception ex)
+            {
+                AppendLog("Failed to open log window: " + ex.GetType().Name + ": " + ex.Message);
+            }
+        }
+
+        private string GetLogText()
+        {
+            lock (_logBuffer) return _logBuffer.ToString();
         }
 
         /// <summary>标题条右侧的状态点、状态文字与采样率贴右对齐。</summary>
@@ -776,7 +874,12 @@ namespace Snad
             if (pcm != null)
             {
                 _analyzer.Feed(pcm, bytes, ch, rate);
+                if (_stereo != null) _stereo.Feed(pcm, bytes, ch, rate);
                 _graph.Invalidate();
+                // 声道条按 UI 节拍重绘，不随音频块——音频块远快于刷新率，
+                // 每块都重绘会白白占满 CPU。
+                if (_channelStrips != null)
+                    foreach (var cs in _channelStrips) cs.Invalidate();
             }
 
             if (_receiver == null) return;
@@ -833,11 +936,45 @@ namespace Snad
         }
 
         /// <summary>写事件日志。所有运行期消息都汇总到这里，便于事后排查。</summary>
+        /// <summary>
+        /// 追加一条日志。
+        ///
+        /// 内容进内存缓冲，界面只更新行数——日志弹窗随时打开都能看到全部历史，
+        /// 而主界面为此只占一行。行数上限防止长期运行把内存吃光。
+        /// </summary>
+        private const int LogMaxLines = 4000;
+
         private void AppendLog(string s)
         {
-            if (_logHost == null || _logHost.IsDisposed) return;
-            if (_logHost.InvokeRequired) { _logHost.BeginInvoke(new Action<string>(AppendLog), s); return; }
-            _logHost.Append(s);
+            if (IsDisposed) return;
+            if (InvokeRequired) { BeginInvoke(new Action<string>(AppendLog), s); return; }
+
+            string line = DateTime.Now.ToString("HH:mm:ss.fff", CultureInfo.InvariantCulture) + "  " + s;
+            lock (_logBuffer)
+            {
+                _logBuffer.AppendLine(line);
+                // 超限时砍掉前半——只保留最近的，旧日志对排查已无意义
+                if (_logBuffer.Length > LogMaxLines * 40)
+                {
+                    int cut = _logBuffer.Length - LogMaxLines * 30;
+                    int nl = _logBuffer.ToString().IndexOf('\n', cut);
+                    if (nl > 0) _logBuffer.Remove(0, nl + 1);
+                }
+            }
+
+            if (_logCountLabel != null && !_logCountLabel.IsDisposed)
+                _logCountLabel.Text = "LOG  " + CountLogLines() + " LINES   [ click to view ]";
+        }
+
+        private int CountLogLines()
+        {
+            lock (_logBuffer)
+            {
+                int n = 0;
+                for (int i = 0; i < _logBuffer.Length; i++)
+                    if (_logBuffer[i] == '\n') n++;
+                return n;
+            }
         }
 
         protected override void OnFormClosing(FormClosingEventArgs e)
