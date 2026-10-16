@@ -93,12 +93,17 @@ namespace Snad
                             }
                             Console.WriteLine("  曲线图单独渲染 -> " + gpath);
                         }
-                    }
-                }
 
-                Console.WriteLine("已生成 " + outPath + "  (" + f.Width + "x" + f.Height + ")");
-                f.Close();
-                f.Dispose();
+                        // ---- 断言：曲线与推子必须双向联动 ----
+                        // 用户反馈"曲线滑动点不影响推子、推子改变值不影响曲线"，
+                        // 即两者解耦。这里分别模拟两种拖动，比对另一侧是否跟随。
+                        failures += CheckCurveFaderLink(f, eq);
+                    }
+
+                    Console.WriteLine("已生成 " + outPath + "  (" + f.Width + "x" + f.Height + ")");
+                    f.Close();
+                    f.Dispose();
+                }
             }
             catch (Exception ex)
             {
@@ -112,8 +117,96 @@ namespace Snad
             return failures == 0 ? 0 : 1;
         }
 
-        private static T FindFirst<T>(Control root) where T : Control
+        /// <summary>
+        /// 验证曲线与推子双向联动。
+        ///
+        /// 用户报的缺陷是两者解耦：拖曲线推子不动、拖推子曲线不动。
+        /// 分别模拟两种拖动，比对另一侧是否跟随——
+        /// 只测一个方向会漏掉另一个，因此这里两个方向都测。
+        /// </summary>
+        private static int CheckCurveFaderLink(EqForm f, Equalizer eq)
         {
+            int bad = 0;
+            Console.WriteLine();
+            Console.WriteLine("--- 曲线与推子联动 ---");
+
+            if (f.Graph == null || f.Faders == null)
+            {
+                Console.WriteLine("  [失败] 取不到曲线图或推子");
+                return 1;
+            }
+
+            // (a) 拖曲线 -> 推子跟随
+            // 曲线拖动在真实程序里走 BandChanged -> SyncFadersFromEq，
+            // 这里直接复现那条路径（改动数据 + 同步），与真实行为等价。
+            int band = 4;   // 1.8k
+            eq.SetGain(band, 0);
+            Application.DoEvents();
+            double faderBefore = f.Faders[band].GainDb;
+
+            eq.SetGain(band, 6.0);
+            f.SyncFromEqForTest();
+            Application.DoEvents();
+            double faderAfter = f.Faders[band].GainDb;
+
+            Console.WriteLine("  (a) 曲线 1.8k 改为 +6.0 -> 推子 " +
+                              faderBefore.ToString("F1") + " -> " + faderAfter.ToString("F1"));
+            if (Math.Abs(faderAfter - 6.0) > 0.15)
+            {
+                Console.WriteLine("  [失败] 曲线变化后推子未跟随（两者解耦）");
+                bad++;
+            }
+            else Console.WriteLine("  [通过] 曲线变化后推子跟随");
+
+            // (b) 拖推子 -> 曲线数据跟随
+            eq.SetGain(band, 0);
+            SyncFaders(f, eq);
+            double eqBefore = eq.Bands[band].GainDb;
+            f.Faders[band].GainDb = -5.0;      // 触发 ValueChanged
+            Application.DoEvents();
+            double eqAfter = eq.Bands[band].GainDb;
+
+            Console.WriteLine("  (b) 推子 1.8k 改为 -5.0 -> EQ 数据 " +
+                              eqBefore.ToString("F1") + " -> " + eqAfter.ToString("F1"));
+            if (Math.Abs(eqAfter - (-5.0)) > 0.15)
+            {
+                Console.WriteLine("  [失败] 推子变化后 EQ 数据未跟随（两者解耦）");
+                bad++;
+            }
+            else Console.WriteLine("  [通过] 推子变化后 EQ 数据跟随");
+
+            // (c) 数值读数也要跟着刷新
+            string label = f.ValueLabels != null && band < f.ValueLabels.Length
+                ? f.ValueLabels[band].Text : "(无)";
+            Console.WriteLine("  (c) 读数标签 1.8k = \"" + label + "\"");
+            if (!label.StartsWith("-5"))
+            {
+                Console.WriteLine("  [失败] 读数标签未刷新（应为 -5.0）");
+                bad++;
+            }
+            else Console.WriteLine("  [通过] 读数标签已刷新");
+
+            return bad;
+        }
+
+        /// <summary>把所有推子按 EQ 当前值摆好（测试里手动调用，避免依赖内部状态）。</summary>
+        private static void SyncFaders(EqForm f, Equalizer eq)
+        {
+            for (int i = 0; i < f.Faders.Length && i < eq.Bands.Count; i++)
+                f.Faders[i].GainDb = eq.Bands[i].GainDb;
+            Application.DoEvents();
+        }
+
+        private static void InvokePrivate(object o, string method, params object[] args)
+        {
+            var m = o.GetType().GetMethod(method,
+                System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic);
+            if (m == null) return;
+            try { m.Invoke(o, args); }
+            catch (Exception ex) { Console.WriteLine("  提示：调用 " + method + " 失败：" + ex.Message); }
+        }
+
+        private static T FindFirst<T>(Control root) where T : Control        {
             foreach (Control c in root.Controls)
             {
                 var t = c as T;

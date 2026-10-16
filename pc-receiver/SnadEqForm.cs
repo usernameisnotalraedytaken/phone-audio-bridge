@@ -28,6 +28,26 @@ namespace Snad
         private EqFader[] _faders;
         private Label[] _valueLabels;
 
+        /// <summary>曲线图。检查工具用它模拟拖动节点，验证与推子的联动。</summary>
+        internal SpectrumGraph Graph { get { return _graph; } }
+
+        /// <summary>推子数组。检查工具用它模拟拖动推子，验证与曲线的联动。</summary>
+        internal EqFader[] Faders { get { return _faders; } }
+
+        /// <summary>数值标签。检查工具用它确认读数已刷新。</summary>
+        internal Label[] ValueLabels { get { return _valueLabels; } }
+
+        /// <summary>
+        /// 按 Equalizer 当前值刷新推子与读数。
+        /// 曲线拖动后由事件回调走这条路径；检查工具也直接调它来验证联动。
+        /// </summary>
+        internal void SyncFromEqForTest()
+        {
+            SyncFadersFromEq();
+            UpdateReadouts();
+            _graph.Invalidate();
+        }
+
         /// <summary>防止联动拖动时事件递归。</summary>
         private bool _adjusting;
 
@@ -40,6 +60,9 @@ namespace Snad
             _log = log;
 
             Text = "SNAD  EQUALIZER";
+            // 复用主窗口的内嵌图标。不设的话标题栏是系统默认图标，
+            // 与主窗口看起来像两个不相干的程序。
+            Icon = LoadAppIcon();
             BackColor = Theme.BgBase;
             ForeColor = Theme.TextPrimary;
             Font = Theme.Mono(9f);
@@ -55,14 +78,47 @@ namespace Snad
             SyncFromEq();
         }
 
+        /// <summary>
+        /// 从 exe 自身内嵌资源取出应用图标（与主窗口同一套逻辑）。
+       /// 优先取嵌入的多尺寸资源，取不到再退回 ExtractAssociatedIcon。
+        /// </summary>
+        private static System.Drawing.Icon LoadAppIcon()
+        {
+            try
+            {
+                var asm = System.Reflection.Assembly.GetExecutingAssembly();
+                using (var s = asm.GetManifestResourceStream("AppIcon.ico"))
+                    if (s != null) return new System.Drawing.Icon(s);
+            }
+            catch (Exception ex)
+            {
+                System.Diagnostics.Debug.WriteLine("EQ：加载嵌入图标失败：" + ex.Message);
+            }
+            try
+            {
+                var ico = System.Drawing.Icon.ExtractAssociatedIcon(
+                    System.Reflection.Assembly.GetExecutingAssembly().Location);
+                if (ico != null) return ico;
+            }
+            catch (Exception ex)
+            {
+                System.Diagnostics.Debug.WriteLine("EQ：提取关联图标失败：" + ex.Message);
+            }
+            return SystemIcons.Application;
+        }
+
         private void BuildUi()
         {
             SuspendLayout();
 
             int bandCount = _eq.Bands.Count;
             const int colW = 62;
-            const int faderH = 104;
-            const int readoutH = 18;
+            const int faderH = 100;
+            // 标签高度按字体实测，不能写死。
+            // 写死 16/18 时，中文与带下伸部的字形（如 "1.8k" 的 k）
+            // 下沿会被 Label 边界切掉——实测多行读数下缘都被截断。
+            int readoutH = Theme.Metric(9f).Height + 4;
+            int freqH = Theme.Label(8f).Height + 4;
             const int graphH = 300;
 
             // ---- 曲线图（视觉主体）----
@@ -75,11 +131,20 @@ namespace Snad
             // dB 轴改为 ±18：EQ 增益只有 ±12dB，沿用频谱的 0~-96 会把曲线
             // 挤在顶部一条窄带里，形状完全看不出来
             _graph.UseEqAxis(18.0);
-            _graph.BandChanged += (b, g) => { UpdateReadouts(); UpdateHint(); };
+            _graph.BandChanged += (b, g) =>
+            {
+                // 曲线是数据源，推子必须跟着走——否则曲线在变、推子不动，
+                // 两者看起来是解耦的（实测正是如此：只刷新了读数，漏了推子）。
+                SyncFadersFromEq();
+                UpdateReadouts();
+                UpdateHint();
+            };
             _graph.BandReset += b =>
             {
                 _log("Band " + _eq.Bands[b].Label + " reset to 0");
-                SyncFromEq();
+                SyncFadersFromEq();
+                UpdateReadouts();
+                UpdateHint();
             };
 
             var graphHost = new Panel
@@ -170,7 +235,7 @@ namespace Snad
             var faderRow = new Panel
             {
                 Dock = DockStyle.Top,
-                Height = faderH + readoutH + 22,
+                Height = faderH + readoutH + freqH + 18,
                 BackColor = Theme.BgPanel,
                 Padding = new Padding(12, 6, 12, 6)
             };
@@ -214,9 +279,9 @@ namespace Snad
                     ForeColor = Theme.TextTertiary,
                     Font = Theme.Label(8f),
                     Width = colW,
-                    Height = 16,
+                    Height = freqH,
                     TextAlign = ContentAlignment.MiddleCenter,
-                    Location = new Point(x, 6 + faderH + readoutH + 2)
+                    Location = new Point(x, 6 + faderH + readoutH + 1)
                 };
                 faderRow.Controls.Add(fl);
             }
@@ -242,7 +307,7 @@ namespace Snad
             Controls.Add(bar2);
             Controls.Add(bar1);
 
-            ClientSize = new Size(contentW, graphH + 40 + 40 + (faderH + readoutH + 22) + 32);
+            ClientSize = new Size(contentW, graphH + 40 + 40 + (faderH + readoutH + freqH + 18) + 32);
             MinimumSize = new Size(ClientSize.Width + 16, ClientSize.Height + 40);
 
             ResumeLayout(true);
@@ -269,7 +334,7 @@ namespace Snad
         /// </summary>
         private void OnFaderChanged(object sender, EventArgs e)
         {
-            if (_adjusting) return;
+            if (_adjusting) return;      // 由同步方法设置推子时，忽略回调
             var fd = sender as EqFader;
             if (fd == null) return;
 
@@ -277,56 +342,51 @@ namespace Snad
             double delta = fd.GainDb - _eq.Bands[idx].GainDb;
             if (Math.Abs(delta) < 1e-9) return;
 
-            _adjusting = true;
-            try
+            int n = _eq.Bands.Count;
+            for (int j = 0; j < n; j++)
             {
-                int n = _eq.Bands.Count;
-                for (int j = 0; j < n; j++)
+                double w;
+                if (j == idx) w = 1.0;
+                else if (_couple.Checked)
                 {
-                    double w;
-                    if (j == idx) w = 1.0;
-                    else if (_couple.Checked)
-                    {
-                        double d = j - idx;
-                        w = Math.Exp(-(d * d) / (2.0 * CoupleSigma * CoupleSigma));
-                    }
-                    else w = 0.0;
-
-                    if (w <= 0.01) continue;
-                    _eq.SetGainNoRebuild(j, _eq.Bands[j].GainDb + delta * w);
-                    // 联动改到的频段，推子位置也要跟上，否则显示与实际不一致
-                    if (j != idx)
-                    {
-                        double g = _eq.Bands[j].GainDb;
-                        _adjusting = false;
-                        _faders[j].GainDb = g;
-                        _adjusting = true;
-                    }
+                    double d = j - idx;
+                    w = Math.Exp(-(d * d) / (2.0 * CoupleSigma * CoupleSigma));
                 }
-                _eq.RebuildAllFilters();
-            }
-            finally
-            {
-                _adjusting = false;
-            }
+                else w = 0.0;
 
+                if (w <= 0.01) continue;
+                _eq.SetGainNoRebuild(j, _eq.Bands[j].GainDb + delta * w);
+            }
+            _eq.RebuildAllFilters();
+
+            // 联动会改到相邻频段，那些推子的位置与曲线都要跟上。
+            // 早先在这里来回翻 _adjusting 来绕过守卫、逐个补设推子，
+            // 是补丁摞补丁；统一走一次同步即可。
+            SyncFadersFromEq();
             UpdateReadouts();
             _graph.Invalidate();
             UpdateHint();
         }
 
-        /// <summary>把 Equalizer 的当前状态同步到所有控件与图上。</summary>
-        private void SyncFromEq()
+        /// <summary>把所有推子按 Equalizer 的当前值摆好。不再触发回调。</summary>
+        private void SyncFadersFromEq()
         {
             _adjusting = true;
             try
             {
-                for (int i = 0; i < _faders.Length; i++) _faders[i].GainDb = _eq.Bands[i].GainDb;
+                for (int i = 0; i < _faders.Length && i < _eq.Bands.Count; i++)
+                    _faders[i].GainDb = _eq.Bands[i].GainDb;
             }
             finally
             {
                 _adjusting = false;
             }
+        }
+
+        /// <summary>把 Equalizer 的当前状态同步到所有控件与图上。</summary>
+        private void SyncFromEq()
+        {
+            SyncFadersFromEq();
             _enable.Checked = _eq.Enabled;
             UpdateReadouts();
             _graph.Invalidate();
