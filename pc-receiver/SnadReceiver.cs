@@ -856,7 +856,12 @@ namespace Snad
             {
                 if (frames > _frameCap) frames = _frameCap;
 
-                int avail = (int)(_framesWritten - _readFrame);
+                // 消费位置必须包含分数部分。此前只减 _readFrame 而漏掉 _readFrac，
+                // 使 avail 偏大、需要丢弃的帧数算少，音频因而越过容量边界写穿环形缓冲，
+                // 表现为水位远超容量（实测到 3843 ms，而容量只有 150 ms）
+                // 以及随之而来的欠载与丢帧。
+                double consumed = _readFrame + _readFrac;
+                int avail = (int)(_framesWritten - consumed);
 
                 // 需要腾出 frames 个空位；必要时把读取位置向前推（丢弃最旧数据）
                 int need = frames - (_frameCap - avail);
@@ -944,14 +949,19 @@ namespace Snad
         private readonly int _deviceIndex;
         private readonly int _port;
 
-        // 样本环形缓冲：容量 200 ms，起播前预填充 80 ms。
-        // 这是本次修复的核心——它把"包到达"与"音频播放"彻底解耦。
+        // 样本环形缓冲：目标水位 80 ms、容量 150 ms、起播预填充 60 ms。
         //
-        // 容量取 200 ms 而非 500 ms：实测消费率 99.5%、产出率约 100.3%，
-        // 稳态几乎匹配，200 ms 足够吸收抖动；过大的容量只会让启动突发把
-        // 延迟永久顶在高位（曾出现 500 ms 缓冲在 0.8 秒内被灌满的情况）。
-        private readonly SampleRing _ring = new SampleRing(48000 * 200 / 1000);
-        private const int PrebufferFrames = 48000 * 80 / 1000;    // 80 ms 的帧数
+        // 水位依据实测标定，不是拍脑袋：
+        //   网络抖动 5-8 ms（热点 RTT），零丢包（序号缺口恒为 0）；
+        //   手机产出约 48128 帧/s，本机消费 48000 帧/s，漂移约 0.27%；
+        //   50 ms 目标实测会出现欠载（Windows 线程调度抖动），
+        //   120 ms 则从未欠载但延迟偏高。80 ms 为折中。
+        //
+        // 注意：尺寸必须按"实际采样率"换算，不能把 48000 写死。
+        // 采样率要等第一个包才能确定，因此环形缓冲延迟到那时再建。
+        private SampleRing _ring;
+        private int _prebufferFrames;
+        private volatile bool _ringReady;      // 环形缓冲已按实际采样率建好
 
         private readonly CancellationTokenSource _cts = new CancellationTokenSource();
 
@@ -1140,11 +1150,25 @@ namespace Snad
                         {
                             _sampleRate = rate > 0 ? rate : 48000;
                             _channels = ch > 0 ? ch : 2;
+
+                            // 环形缓冲按实际采样率换算，避免把 48000 写死。
+                            // 只有首次（或采样率变化时）才重建，避免中途清空已缓冲的数据。
+                            int capFrames = _sampleRate * 150 / 1000;
+                            _ring = new SampleRing(capFrames);
+                            _prebufferFrames = _sampleRate * 60 / 1000;
                             _formatLogged = true;
-                            Logger.Info(string.Format("流格式确定：{0} Hz / {1} 声道 / 16 bit，第一个包来自 {2}",
+                            _ringReady = true;   // 此刻起 _ring 才可被安全访问
+
+                            Logger.Info(string.Format(
+                                "流格式确定：{0} Hz / {1} 声道 / 16 bit，第一个包来自 {2}",
                                 _sampleRate, _channels, remote));
+                            Logger.Info(string.Format(
+                                "缓冲按实际采样率换算：容量 {0} 帧（{1} ms）、预填充 {2} 帧（{3} ms）、每块 {4} 帧（16 ms）",
+                                _ring.CapacityFrames, _ring.CapacityFrames * 1000 / _sampleRate,
+                                _prebufferFrames, _prebufferFrames * 1000 / _sampleRate,
+                                Math.Max(64, _sampleRate * 16 / 1000)));
                             if (rate != 48000)
-                                Logger.Warn("手机实际采样率 " + rate + " Hz 与预期 48000 不同，已按实际值播放");
+                                Logger.Warn("手机采样率 " + rate + " Hz（非 48000），已按实际值处理");
                         }
 
                         // 逐包明细：仅 Verbose 档落盘。
@@ -1164,6 +1188,14 @@ namespace Snad
                         Interlocked.Increment(ref _packets);
                         Interlocked.Add(ref _bytes, payload);
                         Interlocked.Add(ref _framesIn, payload / Math.Max(1, _channels * 2));
+
+                        if (!_ringReady)
+                        {
+                            // 还没收到第一个包，无从得知采样率，本包无法处理（正常不会发生：
+                            // 格式判定就在本循环内、紧随其后完成）。留痕而非静默跳过。
+                            Logger.Trace("收到包但环形缓冲尚未建立（缺少格式信息），本包丢弃");
+                            continue;
+                        }
 
                         if (!_ring.Write(pcm, _channels, payload))
                         {
@@ -1230,22 +1262,38 @@ namespace Snad
         {
             try
             {
-                // 预填充：先攒够 100 ms 再起播。否则一起播就见底，
+                // 先等第一个包确定格式。环形缓冲要按实际采样率换算尺寸，
+                // 不能把 48000 写死，因此这里必须等到 _ringReady。
+                var waitFmt = DateTime.UtcNow;
+                while (!_cts.IsCancellationRequested && !_ringReady)
+                {
+                    Thread.Sleep(10);
+                    if ((DateTime.UtcNow - waitFmt).TotalSeconds > 15)
+                    {
+                        Logger.Warn("等待首个数据包超过 15 秒仍未收到，播放线程退出。" +
+                                    "请确认手机端已开始串流、且与本机在同一网络。");
+                        return;
+                    }
+                }
+                if (_cts.IsCancellationRequested) return;
+
+                // 预填充：先攒够设定水位再起播。否则一起播就见底，
                 // 播放侧拿不到数据只能补零，波形被切断，听感即"电音"。
-                Logger.Info("等待预填充 " + PrebufferFrames + " 帧（约 100 ms）...");
+                Logger.Info(string.Format("等待预填充 {0} 帧（约 {1} ms，采样率 {2} Hz）...",
+                            _prebufferFrames, _prebufferFrames * 1000 / _sampleRate, _sampleRate));
                 var waitStart = DateTime.UtcNow;
-                while (!_cts.IsCancellationRequested && _ring.AvailableFrames < PrebufferFrames)
+                while (!_cts.IsCancellationRequested && _ring.AvailableFrames < _prebufferFrames)
                 {
                     Thread.Sleep(10);
                     if ((DateTime.UtcNow - waitStart).TotalSeconds > 10)
                     {
                         Logger.Warn("预填充等待超过 10 秒，仅攒到 " + _ring.AvailableFrames +
-                                    " 帧，先起播（仍可能欠载）");
+                                    " 帧（目标 " + _prebufferFrames + "），先起播（仍可能欠载）");
                         break;
                     }
                 }
-                Logger.Info("预填充完成，可用 " + _ring.AvailableFrames + " 帧（约 " +
-                            (_ring.AvailableFrames / 48) + " ms），开始播放");
+                Logger.Info(string.Format("预填充完成，可用 {0} 帧（约 {1} ms），开始播放",
+                            _ring.AvailableFrames, _ring.AvailableFrames * 1000 / _sampleRate));
 
                 // 播放完全由 waveOut 时钟驱动，每次固定取 16 ms，
                 // 与"包到达"解耦——这是消除欠载补零的关键。
@@ -1263,7 +1311,11 @@ namespace Snad
                     // 因此把范围放宽到 ±8%：远大于 0.27% 的实际漂移，
                     // 保证控制器总能找到把水位拉回目标的工作点。
                     // 稳态下比率会非常接近 1.0，插值带来的音高变化不可察觉。
-                    int targetFrames = _sampleRate * 120 / 1000;   // 目标水位 120 ms
+                    // 目标水位 80 ms。
+                    // 标定过程：50 ms 时水位落在 41-67 ms，55 秒内出现 7 次欠载
+                    // （丢帧 3129 帧），说明余量不足以吸收 Windows 线程调度抖动；
+                    // 120 ms 则从未欠载但延迟偏高。80 ms 是两者之间的折中。
+                    int targetFrames = _sampleRate * 80 / 1000;
                     int avail = _ring.AvailableFrames;
                     double ratio = 1.0 + (avail - targetFrames) / (double)Math.Max(1, targetFrames) * 0.05;
                     if (ratio > 1.08) ratio = 1.08;
