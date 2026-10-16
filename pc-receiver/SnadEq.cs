@@ -190,6 +190,25 @@ namespace Snad
             Rebuild(bandIndex);
         }
 
+        /// <summary>
+        /// 只设置增益值，不重算系数。
+        ///
+        /// 用于联动拖动：一次拖动会改动多个频段，若每个都重算系数，
+        /// 10 个 biquad 的三角函数会被反复调用上百次。批量设完之后
+        /// 再调一次 RebuildAll 即可。
+        /// </summary>
+        public void SetGainNoRebuild(int bandIndex, double gainDb)
+        {
+            if (bandIndex < 0 || bandIndex >= _bands.Count) return;
+            _bands[bandIndex].GainDb = Math.Max(MinGainDb, Math.Min(MaxGainDb, gainDb));
+        }
+
+        /// <summary>重算所有频段系数。与 SetGainNoRebuild 配合使用。</summary>
+        public void RebuildAllFilters()
+        {
+            RebuildAll();
+        }
+
         /// <summary>把某个频段增益按给定增量调整，返回新值。</summary>
         public double NudgeGain(int bandIndex, double deltaDb)
         {
