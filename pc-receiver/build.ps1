@@ -143,6 +143,18 @@ if (Test-Path 'SnadConfigTest.cs') {
     if ($LASTEXITCODE -ne 0) { throw "配置验证工具编译失败，csc 退出码 $LASTEXITCODE" }
 }
 
+# ---- 1f) 界面自渲染检查工具（主界面 + 均衡器）----
+if (Test-Path 'SnadShot.cs') {
+    $shotArgs = @('/nologo', '/target:winexe', '/platform:x64', '/optimize+',
+                  '/main:Snad.Shot', '/out:SnadShot.exe')
+    foreach ($a in $guiRefs) { $shotArgs += ("/r:" + (Join-Path $fw $a)) }
+    $shotArgs += @('SnadReceiver.cs', 'SnadProfile.cs', 'SnadBeacon.cs', 'SnadBeaconService.cs',
+                   'SnadEq.cs', 'SnadEqForm.cs', 'SnadSpectrum.cs', 'SnadGui.cs',
+                   'SnadSecret.cs', 'SnadShot.cs')
+    & $csc @shotArgs
+    if ($LASTEXITCODE -ne 0) { throw "界面检查工具编译失败，csc 退出码 $LASTEXITCODE" }
+}
+
 # ---- 2) GUI 版 ----
 if ($buildGui) {
     $guiSources = @('SnadReceiver.cs', 'SnadProfile.cs', 'SnadBeacon.cs', 'SnadBeaconService.cs',

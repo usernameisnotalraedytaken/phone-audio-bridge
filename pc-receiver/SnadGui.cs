@@ -59,6 +59,25 @@ namespace Snad
         /// <summary>均衡器入口按钮。</summary>
         private Button _eqBtn;
 
+        /// <summary>顶部控制条，用于把右侧控件贴到右边缘。</summary>
+        private Panel _topBar;
+
+        /// <summary>
+        /// 把状态标签与均衡器按钮贴到顶部条的右边缘。
+        /// 状态标签宽度固定并启用 AutoEllipsis，因此状态文字再长也只会被截断，
+        /// 不会压到按钮上（原先正是这样把按钮盖住的）。
+        /// </summary>
+        private void LayoutTopRight()
+        {
+            if (_topBar == null || _eqBtn == null || _statusLabel == null) return;
+            int right = _topBar.ClientSize.Width - _topBar.Padding.Right;
+            int btnW = _eqBtn.Width;
+            int statusW = _statusLabel.Width;
+
+            _eqBtn.Left = right - btnW;
+            _statusLabel.Left = _eqBtn.Left - 6 - statusW;
+        }
+
         private readonly SpectrumAnalyzer _analyzer = new SpectrumAnalyzer();
         private readonly object _audioGate = new object();
         private byte[] _pendingAudio;
@@ -103,13 +122,14 @@ namespace Snad
             //
             // 本机实测：屏幕 1280x720，工作区同为 1280x720，进程为 PerMonitor DPI 感知。
             // 布局所需：顶部 76 + 波形 76 + 频谱(至少约 120) + 底部 116 ≈ 390，
-            // 加上边框与标题栏，取 600 高、880 宽可完整显示且不溢出屏幕。
-            // 此前用"工作区减去固定边距"的写法在缩放下算得过小，界面被压扁。
+            // 加上边框与标题栏，取 620 高可完整显示且不溢出屏幕。
+            // 宽度取 960：顶部要同时容纳"档位+设备+开始+状态文字+均衡器按钮"，
+            // 太窄时状态文字会被截断（按钮本身有锚定保护，不会重叠）。
             var wa = Screen.PrimaryScreen != null ? Screen.PrimaryScreen.WorkingArea : new Rectangle(0, 0, 1280, 800);
-            int wantW = 880, wantH = 600;
-            int w = Math.Min(wantW, Math.Max(620, wa.Width - 20));
+            int wantW = 960, wantH = 620;
+            int w = Math.Min(wantW, Math.Max(700, wa.Width - 20));
             int h = Math.Min(wantH, Math.Max(460, wa.Height - 20));
-            MinimumSize = new Size(Math.Min(620, wa.Width), Math.Min(460, wa.Height));
+            MinimumSize = new Size(Math.Min(700, wa.Width), Math.Min(460, wa.Height));
             Size = new Size(w, h);
 
             BuildUi();
@@ -187,22 +207,26 @@ namespace Snad
             _startBtn.FlatAppearance.MouseDownBackColor = Color.FromArgb(34, 40, 52);
             _startBtn.Click += OnStartStop;
 
-            _statusLabel = new Label
-            {
-                Text = "未启动",
-                ForeColor = FgDim,
-                AutoSize = true,
-                Location = new Point(496, 32)
-            };
+            // 状态文字与均衡器按钮改用锚定布局，不再用绝对坐标。
+            //
+            // 原因：状态标签原本 autoSize 从 x=496 起画，文本是
+            // "系统默认: 耳机 (Realtek(R) Audio)" 这种长串时会一路盖到 x≈760，
+            // 把 x=672 的按钮整个挡住（实测截图里按钮被文字覆盖）。
+            // 绝对坐标无法预知文本长度，必须让布局自己分配空间。
+            //
+            // 用 Anchor 而不是 Dock：Dock 会让按钮填满所在容器的高度，
+            // 实测得到一个 88x60 的按钮（与"开始"的 34 高不一致）。
+            // Anchor 保持显式尺寸，同时跟随窗口右边缘移动。
+            const int eqBtnW = 88, eqBtnH = 34, statusW = 280, statusGap = 6;
 
-            // 均衡器入口。做成独立窗口：主界面逻辑高度只有约 480 像素，
-            // 已被频谱、波形、统计占满，放不下 10 段竖向推子。
             _eqBtn = new Button
             {
                 Text = "均衡器",
-                Width = 88,
-                Height = 34,
-                Location = new Point(672, 24),
+                Width = eqBtnW,
+                Height = eqBtnH,
+                // 先给一个占位位置，随后由 OnTopBarResize 按实际宽度摆到右边缘
+                Location = new Point(800, 24),
+                Anchor = AnchorStyles.Top | AnchorStyles.Right,
                 FlatStyle = FlatStyle.Flat,
                 BackColor = BgBar,
                 ForeColor = FgMain,
@@ -213,7 +237,26 @@ namespace Snad
             _eqBtn.FlatAppearance.MouseDownBackColor = Color.FromArgb(34, 40, 52);
             _eqBtn.Click += OnOpenEq;
 
+            _statusLabel = new Label
+            {
+                Text = "未启动",
+                ForeColor = FgDim,
+                AutoSize = false,
+                Width = statusW,
+                Height = eqBtnH,
+                TextAlign = ContentAlignment.MiddleLeft,
+                AutoEllipsis = true,
+                Location = new Point(800 - statusGap - statusW, 24),
+                Anchor = AnchorStyles.Top | AnchorStyles.Right
+            };
+
             top.Controls.AddRange(new Control[] { lblProfile, _profileBox, lblDevice, _deviceBox, _startBtn, _statusLabel, _eqBtn });
+
+            // 顶部条的宽度在构造时还不确定（窗口尺寸随后才设），
+            // 因此用 Resize 事件把这两个控件贴到右边缘。
+            _topBar = top;
+            top.Resize += (s, e) => LayoutTopRight();
+            LayoutTopRight();
 
             // ---- 底部统计 ----
             var bottom = new Panel { Dock = DockStyle.Bottom, Height = 116, BackColor = BgPanel, Padding = new Padding(10, 6, 10, 6) };
