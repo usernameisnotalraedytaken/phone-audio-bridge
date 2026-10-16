@@ -573,6 +573,165 @@ namespace Snad
             }
         }
 
+        /// <summary>
+        /// 把一组键值写入指定档位的段落。
+        ///
+        /// 这是配置持久化的**唯一入口**：SaveEq 与 SaveProfile 都走它，
+        /// 避免各写一份"段落定位"逻辑而逐渐不一致。
+        ///
+        /// 三条必须守住的规则（都由实测教训得来）：
+        ///   1. 档位还没有段落时，新段落只能加在**文件末尾**——
+        ///      插到已有段落内部会改到别的档位（踩过：为自定义档保存时，
+        ///      键被插进了上一个 [profile:] 段，既没建出新段又污染了别人）。
+        ///   2. 已有段落内缺失的键追加到**该段末尾**，保持段内聚。
+        ///   3. 只在段落范围内改动，绝不触碰段外内容与注释。
+        /// </summary>
+        /// <param name="pairs">键（小写）到值的映射。值里不要带换行。</param>
+        /// <param name="sectionComment">新建段落时写入的注释，便于用户知道它从哪来。</param>
+        public static bool SaveFields(string path, string profileName,
+                                      IEnumerable<KeyValuePair<string, string>> pairs,
+                                      string sectionComment)
+        {
+            if (string.IsNullOrEmpty(path) || string.IsNullOrEmpty(profileName)) return false;
+
+            var wanted = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+            foreach (var kv in pairs) wanted[kv.Key.ToLowerInvariant()] = kv.Value;
+            if (wanted.Count == 0) return false;
+
+            string[] lines;
+            try
+            {
+                lines = File.Exists(path) ? File.ReadAllLines(path) : new string[0];
+            }
+            catch (Exception ex)
+            {
+                Logger.Err("读取配置失败，未保存：" + path, ex);
+                return false;
+            }
+
+            string targetSection = "[profile:" + profileName + "]";
+            var outLines = new List<string>(lines);
+            int sectionStart = -1, sectionEnd = outLines.Count;
+
+            for (int i = 0; i < outLines.Count; i++)
+            {
+                string t = outLines[i].Trim();
+                if (t.StartsWith("[") && t.EndsWith("]"))
+                {
+                    if (sectionStart >= 0) { sectionEnd = i; break; }
+                    if (string.Equals(t, targetSection, StringComparison.OrdinalIgnoreCase)) sectionStart = i;
+                }
+            }
+
+            var remaining = new Dictionary<string, string>(wanted, StringComparer.OrdinalIgnoreCase);
+
+            if (sectionStart < 0)
+            {
+                // 没有该档位的段落：整段新建在文件末尾
+                var block = new List<string>();
+                if (outLines.Count > 0 && outLines[outLines.Count - 1].Trim().Length != 0)
+                    block.Add("");
+                if (!string.IsNullOrEmpty(sectionComment)) block.Add("# " + sectionComment);
+                block.Add(targetSection);
+                foreach (var kv in wanted) block.Add(kv.Key + " = " + kv.Value);
+                outLines.AddRange(block);
+            }
+            else
+            {
+                // 已有段落：就地更新已存在的键，记录缺失的
+                for (int i = sectionStart + 1; i < sectionEnd && remaining.Count > 0; i++)
+                {
+                    string t = outLines[i].Trim();
+                    if (t.StartsWith("#") || t.Length == 0) continue;
+                    int eqIdx = t.IndexOf('=');
+                    if (eqIdx <= 0) continue;
+                    string key = t.Substring(0, eqIdx).Trim().ToLowerInvariant();
+                    string val;
+                    if (remaining.TryGetValue(key, out val))
+                    {
+                        outLines[i] = key + " = " + val;
+                        remaining.Remove(key);
+                    }
+                }
+                if (remaining.Count > 0)
+                {
+                    var add = new List<string>();
+                    foreach (var kv in remaining) add.Add(kv.Key + " = " + kv.Value);
+                    outLines.InsertRange(sectionEnd, add);
+                }
+            }
+
+            try
+            {
+                File.WriteAllLines(path, outLines.ToArray());
+                Logger.Info("配置已保存到 " + path + "（档位 " + profileName + "，" +
+                            wanted.Count + " 个键）");
+                return true;
+            }
+            catch (Exception ex)
+            {
+                Logger.Err("写入配置失败：" + path, ex);
+                return false;
+            }
+        }
+
+        /// <summary>把档位的全部可调参数写成键值对，供 SaveFields 落盘。</summary>
+        public static List<KeyValuePair<string, string>> ToPairs(Profile p)
+        {
+            var list = new List<KeyValuePair<string, string>>();
+            if (p == null) return list;
+            Func<string, string, KeyValuePair<string, string>> kv =
+                (k, v) => new KeyValuePair<string, string>(k, v);
+            var ci = CultureInfo.InvariantCulture;
+
+            if (!string.IsNullOrEmpty(p.Description)) list.Add(kv("description", p.Description));
+
+            // 输出后端
+            list.Add(kv("backend", p.Backend));
+            if (!string.IsNullOrEmpty(p.DeviceId)) list.Add(kv("device", p.DeviceId));
+            list.Add(kv("format", p.Format));
+            list.Add(kv("wasapiperiod", p.WasapiPeriodMs.ToString(ci)));
+
+            // 延迟相关
+            list.Add(kv("targetbuffer", p.TargetBufferMs.ToString(ci)));
+            list.Add(kv("prebuffer", p.PrebufferMs.ToString(ci)));
+            list.Add(kv("ringcapacity", p.RingCapacityMs.ToString(ci)));
+            list.Add(kv("block", p.BlockMs.ToString(ci)));
+            list.Add(kv("poll", p.PollMs.ToString(ci)));
+
+            // 稳定性相关
+            list.Add(kv("waveoutbuffers", p.WaveOutBuffers.ToString(ci)));
+            list.Add(kv("lead", p.LeadMs.ToString(ci)));
+            list.Add(kv("driftrange", p.DriftRange.ToString("0.####", ci)));
+            list.Add(kv("driftgain", p.DriftGain.ToString("0.####", ci)));
+            list.Add(kv("ratiomin", p.RatioMin.ToString("0.####", ci)));
+            list.Add(kv("ratiomax", p.RatioMax.ToString("0.####", ci)));
+            list.Add(kv("formatwait", p.FormatWaitSec.ToString(ci)));
+            list.Add(kv("prebufferwait", p.PrebufferWaitSec.ToString(ci)));
+
+            // 均衡器
+            list.Add(kv("eq", p.EqEnabled ? "on" : "off"));
+            list.Add(kv("eqpreamp", p.EqPreampDb.ToString("0.#", ci)));
+            if (p.EqGains != null && p.EqGains.Length > 0)
+            {
+                var sb = new StringBuilder();
+                for (int i = 0; i < p.EqGains.Length; i++)
+                {
+                    if (i > 0) sb.Append(',');
+                    sb.Append(p.EqGains[i].ToString("0.#", ci));
+                }
+                list.Add(kv("eqgains", sb.ToString()));
+            }
+            return list;
+        }
+
+        /// <summary>把档位的全部参数落盘。编辑器的保存入口。</summary>
+        public static bool SaveProfile(string path, Profile p)
+        {
+            if (p == null) return false;
+            return SaveFields(path, p.Name, ToPairs(p), "此段落由配置编辑器保存");
+        }
+
         /// <summary>把档位里保存的均衡器设置套用到均衡器实例上。</summary>
         public static void ApplyEq(Profile p, Equalizer eq)
         {

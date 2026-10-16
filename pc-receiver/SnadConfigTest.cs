@@ -136,6 +136,86 @@ namespace Snad
                 if (found) Check(p.TargetBufferMs > 0, "  " + name + " 的 targetbuffer 有效（" + p.TargetBufferMs + "ms）");
             }
 
+            // ---- 7. 后端与音质参数的完整往返 ----
+            //
+            // v3 新增 backend / device / format / wasapiperiod 四个维度。
+            // 它们此前只存在于内存（Profile 有字段但没有落盘路径），
+            // 于是"改了也存不下来"。这里验证整档保存与读回。
+            Console.WriteLine();
+            Console.WriteLine("--- 后端与音质参数往返 ---");
+
+            const string deviceId = "{0.0.0.00000000}.{7b5a235f-3f3d-4f5e-a070-7f439722d43b}";
+            var wasapi = new Profile
+            {
+                Name = "往返测试",
+                Backend = "wasapi_exclusive",
+                DeviceId = deviceId,
+                Format = "pcm24",
+                WasapiPeriodMs = 3,
+                TargetBufferMs = 45,
+                BlockMs = 8,
+                WaveOutBuffers = 4,
+                LeadMs = 20,
+                DriftGain = 0.07,
+                DriftRange = 0.05,
+                EqEnabled = true,
+                EqPreampDb = -3.5
+            };
+            wasapi.EqGains = new double[] { 1, 2, 3, 4, 5, 6, 7, 8, 9, 10 };
+
+            Check(ProfileLibrary.SaveProfile(cfg, wasapi), "SaveProfile 返回成功");
+
+            reloaded = ProfileLibrary.Load(cfg, out selected);
+            Profile rt;
+            Check(reloaded.TryGetValue("往返测试", out rt), "保存的档位可被载入");
+            if (rt != null)
+            {
+                Check(rt.Backend == "wasapi_exclusive", "backend 读回正确（" + rt.Backend + "）");
+                Check(rt.DeviceId == deviceId, "device 读回正确（" + rt.DeviceId + "）");
+                Check(rt.Format == "pcm24", "format 读回正确（" + rt.Format + "）");
+                Check(rt.WasapiPeriodMs == 3, "wasapiperiod 读回正确（" + rt.WasapiPeriodMs + "）");
+                Check(rt.TargetBufferMs == 45, "targetbuffer 读回正确（" + rt.TargetBufferMs + "）");
+                Check(rt.BlockMs == 8, "block 读回正确（" + rt.BlockMs + "）");
+                Check(rt.WaveOutBuffers == 4, "waveoutbuffers 读回正确（" + rt.WaveOutBuffers + "）");
+                Check(rt.LeadMs == 20, "lead 读回正确（" + rt.LeadMs + "）");
+                Check(Math.Abs(rt.DriftGain - 0.07) < 0.001, "driftgain 读回正确（" + rt.DriftGain + "）");
+                Check(Math.Abs(rt.DriftRange - 0.05) < 0.001, "driftrange 读回正确（" + rt.DriftRange + "）");
+                Check(rt.EqEnabled, "eq 状态读回正确");
+                Check(Math.Abs(rt.EqPreampDb - (-3.5)) < 0.01, "eqpreamp 读回正确（" + rt.EqPreampDb + "）");
+                Check(rt.EqGains != null && rt.EqGains.Length == 10 && Math.Abs(rt.EqGains[9] - 10) < 0.01,
+                      "eqgains 读回正确");
+            }
+
+            // 二次保存应就地更新，不产生重复键
+            wasapi.TargetBufferMs = 55;
+            ProfileLibrary.SaveProfile(cfg, wasapi);
+            string afterSecond = File.ReadAllText(cfg);
+            Check(CountKeyIn(afterSecond, "[profile:往返测试]", "targetbuffer") == 1,
+                  "二次保存后 targetbuffer 在该段内只出现一次");
+            Check(CountKeyIn(afterSecond, "[profile:往返测试]", "backend") == 1,
+                  "二次保存后 backend 在该段内只出现一次");
+
+            reloaded = ProfileLibrary.Load(cfg, out selected);
+            if (reloaded.TryGetValue("往返测试", out rt))
+                Check(rt.TargetBufferMs == 55, "二次保存后就地更新为 55（实为 " + rt.TargetBufferMs + "）");
+
+            // 非法取值必须被拒绝并保留原值，而不是静默接受
+            Console.WriteLine();
+            Console.WriteLine("--- 非法取值应被拒绝 ---");
+            ProfileLibrary.SaveFields(cfg, "非法测试", new[]
+            {
+                new KeyValuePair<string, string>("backend", "占位后端"),
+                new KeyValuePair<string, string>("format", "pcm8")
+            }, "测试用");
+            reloaded = ProfileLibrary.Load(cfg, out selected);
+            Profile bad;
+            if (reloaded.TryGetValue("非法测试", out bad))
+            {
+                Check(bad.Backend == "waveout", "非法 backend 被拒绝，保留默认 waveout（实为 " + bad.Backend + "）");
+                Check(bad.Format == "pcm16", "非法 format 被拒绝，保留默认 pcm16（实为 " + bad.Format + "）");
+            }
+            else Check(false, "非法测试档位应仍能被载入（只是取值回退到默认）");
+
             Console.WriteLine();
             Console.WriteLine(_failures == 0 ? "全部断言通过" : ("有 " + _failures + " 项断言失败"));
             return _failures == 0 ? 0 : 1;
@@ -149,6 +229,31 @@ namespace Snad
             {
                 string t = raw.Trim();
                 if (t.Length == 0 || t.StartsWith("#") || t.StartsWith("[")) continue;
+                int i = t.IndexOf('=');
+                if (i <= 0) continue;
+                if (string.Equals(t.Substring(0, i).Trim(), key, StringComparison.OrdinalIgnoreCase)) n++;
+            }
+            return n;
+        }
+
+        /// <summary>
+        /// 统计**指定段落内**某键出现的次数。
+        /// 用于验证二次保存是就地更新而不是又追加一个键——
+        /// 后者会让配置越存越长，且读回时以哪个为准变得不确定。
+        /// </summary>
+        private static int CountKeyIn(string text, string section, string key)
+        {
+            int n = 0;
+            bool inside = false;
+            foreach (var raw in text.Split('\n'))
+            {
+                string t = raw.Trim();
+                if (t.StartsWith("[") && t.EndsWith("]"))
+                {
+                    inside = string.Equals(t, section, StringComparison.OrdinalIgnoreCase);
+                    continue;
+                }
+                if (!inside || t.Length == 0 || t.StartsWith("#")) continue;
                 int i = t.IndexOf('=');
                 if (i <= 0) continue;
                 if (string.Equals(t.Substring(0, i).Trim(), key, StringComparison.OrdinalIgnoreCase)) n++;
