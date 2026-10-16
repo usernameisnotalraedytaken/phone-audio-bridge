@@ -172,13 +172,23 @@ namespace Snad
             };
 
             // ---- 控制条 1：开关 + 前置 ----
-            var bar1 = new Panel { Dock = DockStyle.Top, Height = 40, BackColor = Theme.BgPanel, Padding = new Padding(12, 9, 12, 9) };
+            //
+            // 用 FlowLayoutPanel 排，不手工累加 x 坐标。
+            // 手工累加时间距是我拍脑袋的常数（+16 / +22），
+            // 结果几个控件贴在一起很局促；交给布局引擎后
+            // 只需给一个统一的间距值，也不会因为某个控件改宽度而错位。
+            var bar1 = new FlowLayoutPanel
+            {
+                Dock = DockStyle.Top,
+                Height = 52,
+                BackColor = Theme.BgPanel,
+                Padding = new Padding(14, 12, 14, 12),
+                FlowDirection = FlowDirection.LeftToRight,
+                WrapContents = false,
+                AutoSize = false
+            };
 
-            // 位置按实测宽度依次排布，不写死坐标。
-            // 写死宽度会让 "EQ ON" 被切成 "EQ O"（末字符超出控件边界）。
-            int bx1 = 12;
-
-            _enable = new FlatToggle("EQ ON") { Location = new Point(bx1, 9), Height = 24 };
+            _enable = new FlatToggle("EQ ON") { Height = 26, Margin = new Padding(0, 0, 0, 0) };
             _enable.FitToContent();
             _enable.CheckedChanged += (s, e) =>
             {
@@ -187,28 +197,24 @@ namespace Snad
                 _log("Equalizer " + (_enable.Checked ? "enabled" : "disabled"));
             };
             bar1.Controls.Add(_enable);
-            bx1 += _enable.Width + 16;
 
-            _couple = new FlatToggle("LINK") { Location = new Point(bx1, 9), Height = 24 };
+            _couple = new FlatToggle("LINK") { Height = 26, Margin = new Padding(26, 0, 0, 0) };
             _couple.FitToContent();
             _couple.CheckedChanged += (s, e) =>
                 _log("Linked drag " + (_couple.Checked ? "on" : "off"));
             bar1.Controls.Add(_couple);
-            bx1 += _couple.Width + 22;
 
             var preLabel = new Label
             {
                 Text = "PREAMP",
                 ForeColor = Theme.TextTertiary,
-                Font = Theme.Label(7.5f),
+                Font = Theme.Label(8f),
                 AutoSize = true,
-                Location = new Point(bx1, 15)
+                Margin = new Padding(30, 6, 10, 0)   // 与左侧开关拉开，与右侧数值留白
             };
             bar1.Controls.Add(preLabel);
-            // AutoSize 标签在加入父容器后才算得出宽度，因此这里用字体测量
-            bx1 += (int)Math.Ceiling(preLabel.Font.GetHeight() * 3.4) + 10;
 
-            _preamp = new FlatStepper { Location = new Point(bx1, 8), Width = 96, Height = 26 };
+            _preamp = new FlatStepper { Width = 104, Height = 26, Margin = new Padding(0) };
             _preamp.Configure(-24, 12, 0.5, 1, "dB");
             _preamp.Value = _eq.PreampDb;
             _preamp.ValueChanged += (s, e) =>
@@ -230,20 +236,32 @@ namespace Snad
                 ("CUTLOW",  new double[] { -8, -6, -3,  0,  0,  0,  0,  0,  0,  0 }),
             };
 
-            int contentW = 12 + bandCount * colW + 12;
-            int presetAreaW = contentW - 24;
-            int btnGap = 6;
+            int contentW = 14 + bandCount * colW + 14;
+            int presetAreaW = contentW - 28;      // 两侧各 14
+            int btnGap = 8;
             int btnW = (presetAreaW - btnGap * (presets.Length - 1)) / presets.Length;
 
-            var bar2 = new Panel { Dock = DockStyle.Top, Height = 40, BackColor = Theme.BgBase, Padding = new Padding(12, 7, 12, 7) };
-            int bx = 12;
+            // 预设行同样交给布局引擎，间距统一由 Margin 决定
+            var bar2 = new FlowLayoutPanel
+            {
+                Dock = DockStyle.Top,
+                Height = 50,
+                BackColor = Theme.BgBase,
+                Padding = new Padding(14, 10, 14, 10),
+                FlowDirection = FlowDirection.LeftToRight,
+                WrapContents = false
+            };
             foreach (var p in presets)
             {
-                var btn = new FlatButton(p.Name) { Width = btnW, Height = 26, Location = new Point(bx, 7) };
+                var btn = new FlatButton(p.Name)
+                {
+                    Width = btnW,
+                    Height = 28,
+                    Margin = new Padding(0, 0, btnGap, 0)
+                };
                 btn.Tag = p.Gains;
                 btn.Click += OnPresetClicked;
                 bar2.Controls.Add(btn);
-                bx += btnW + btnGap;
             }
 
             // ---- 控制条 3：逐段推子 + 读数 ----
@@ -323,7 +341,7 @@ namespace Snad
             Controls.Add(bar2);
             Controls.Add(bar1);
 
-            ClientSize = new Size(contentW, graphH + 40 + 40 + (faderH + readoutH + freqH + 18) + 32);
+            ClientSize = new Size(contentW, graphH + 52 + 50 + (faderH + readoutH + freqH + 18) + 32);
             MinimumSize = new Size(ClientSize.Width + 16, ClientSize.Height + 40);
 
             ResumeLayout(true);

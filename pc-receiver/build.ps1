@@ -16,15 +16,36 @@ $here = Split-Path -Parent $MyInvocation.MyCommand.Path
 Set-Location $here
 
 # 正在运行的进程会锁住 exe，导致 csc 报 CS2012 无法写入。
-# 注意两个产物都要停：只停 SnadReceiver 会让 GUI 版编译失败（踩过一次）。
-# 编译后不自动重启，由调用方决定用什么参数启动。
-foreach ($name in @('SnadReceiver', 'SnadGui')) {
+#
+# 需要停的不止两个产物：检查工具（SnadShot / SnadPreview / SnadEqShot /
+# SnadWordShot）也各自是独立 exe，同名进程若在运行同样会锁住目标文件。
+# 这里统一停掉所有本项目的可执行文件，并等待句柄真正释放——
+# Stop-Process 返回后文件锁可能还残留一小段时间，实测 800ms 不够稳。
+$ourExes = @('SnadReceiver', 'SnadGui', 'SnadShot', 'SnadPreview', 'SnadEqShot', 'SnadWordShot')
+foreach ($name in $ourExes) {
     $running = Get-Process $name -ErrorAction SilentlyContinue
     if ($running) {
         Write-Host ("停止正在运行的 " + $name + " pid=" + (($running | ForEach-Object { $_.Id }) -join ','))
         $running | Stop-Process -Force
-        Start-Sleep -Milliseconds 800
     }
+}
+
+# 等待目标文件可写。逐个尝试打开独占句柄，成功即说明锁已释放。
+$targets = @('SnadReceiver.exe', 'SnadGui.exe')
+for ($i = 0; $i -lt 40; $i++) {
+    $busy = $false
+    foreach ($t in $targets) {
+        if (-not (Test-Path $t)) { continue }
+        try {
+            $fs = [System.IO.File]::Open((Join-Path (Get-Location) $t), 'Open', 'ReadWrite', 'None')
+            $fs.Close(); $fs.Dispose()
+        } catch { $busy = $true }
+    }
+    if (-not $busy) { break }
+    if ($i -eq 39) {
+        Write-Host "警告：仍有目标文件被占用，编译可能失败" -ForegroundColor Yellow
+    }
+    Start-Sleep -Milliseconds 200
 }
 
 $csc = 'C:\Program Files (x86)\Microsoft Visual Studio\18\BuildTools\MSBuild\Current\Bin\Roslyn\csc.exe'
