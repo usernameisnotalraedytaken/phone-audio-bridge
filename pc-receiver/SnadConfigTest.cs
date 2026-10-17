@@ -151,6 +151,7 @@ namespace Snad
                 Backend = "wasapi_exclusive",
                 DeviceId = deviceId,
                 Format = "pcm24",
+                SampleRate = "48000",
                 WasapiPeriodMs = 3,
                 TargetBufferMs = 45,
                 BlockMs = 8,
@@ -183,6 +184,10 @@ namespace Snad
                 Check(rt.Backend == "wasapi_exclusive", "backend 读回正确（" + rt.Backend + "）");
                 Check(rt.DeviceId == deviceId, "device 读回正确（" + rt.DeviceId + "）");
                 Check(rt.Format == "pcm24", "format 读回正确（" + rt.Format + "）");
+                Check(rt.SampleRate == "48000", "samplerate 读回正确（" + rt.SampleRate + "）");
+                Check(rt.DeclaredSampleRate() == 48000, "DeclaredSampleRate 解析为 48000");
+                Check(new Profile { SampleRate = "follow" }.DeclaredSampleRate() == 0,
+                      "follow 解析为 0（跟随源）");
                 Check(rt.WasapiPeriodMs == 3, "wasapiperiod 读回正确（" + rt.WasapiPeriodMs + "）");
                 Check(rt.TargetBufferMs == 45, "targetbuffer 读回正确（" + rt.TargetBufferMs + "）");
                 Check(rt.BlockMs == 8, "block 读回正确（" + rt.BlockMs + "）");
