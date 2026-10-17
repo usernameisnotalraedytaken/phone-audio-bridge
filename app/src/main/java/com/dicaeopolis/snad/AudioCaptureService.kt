@@ -11,7 +11,6 @@ import android.media.AudioAttributes
 import android.media.AudioFormat
 import android.media.AudioPlaybackCaptureConfiguration
 import android.media.AudioRecord
-import android.media.AudioRecord.AudioTimestamp
 import android.media.projection.MediaProjection
 import android.media.projection.MediaProjectionManager
 import android.os.Build
@@ -128,7 +127,34 @@ class AudioCaptureService : Service() {
             var sock: DatagramSocket? = null
             try {
                 sock = DatagramSocket()
-                val ts = AudioTimestamp()
+
+                // 用反射拿 AudioRecord.getTimestamp：
+                // 编译期直接用嵌套类 AudioRecord.AudioTimestamp 时，CI 上解析不到
+                // （compileSdk 35、无同名冲突，原因未查明），而手机上是否支持该 API
+                // 本来就因厂商而异。反射可以做到"拿到就用，拿不到如实上报"，
+                // 不会因为一个可选 API 让整个构建失败。
+                var tsCls: Class<*>? = null
+                var tsObj: Any? = null
+                var getTs: java.lang.reflect.Method? = null
+                var fNano: java.lang.reflect.Field? = null
+                var fPos: java.lang.reflect.Field? = null
+                try {
+                    // 先取成局部 val 再赋值：tsCls 若是 Class<*>?，
+                    // getMethod 的变参会因可空而编译不过。
+                    val cls = Class.forName("android.media.AudioRecord\$AudioTimestamp")
+                    val obj = cls.getDeclaredConstructor().newInstance()
+                    tsCls = cls
+                    tsObj = obj
+                    getTs = AudioRecord::class.java.getMethod("getTimestamp", cls)
+                    fNano = cls.getField("nanoTime")
+                    fPos = cls.getField("framePosition")
+                    SnadLog.info(TAG, "采样钟：getTimestamp 可用，将按系统采集时刻测量")
+                } catch (e: Throwable) {
+                    SnadLog.wrn(TAG, "采样钟：本机不支持 getTimestamp" +
+                            "（${e.javaClass.simpleName}: ${e.message}），" +
+                            "flags 将恒为 0，PC 侧只能退化为 read 时刻")
+                }
+
                 var failStreak = 0L
                 while (running.get()) {
                     val buf = ByteArray(44)
@@ -137,21 +163,32 @@ class AudioCaptureService : Service() {
                     buf[4] = 1
                     buf[5] = 'K'.code.toByte()
 
-                    // getTimestamp 返回 int 状态码，不是布尔：
-                    //   AudioRecord.SUCCESS(0) 或 ERROR_INVALID_OPERATION(-3) 等。
-                    // 我最初按 Boolean 用，编译期就炸了——这类错只有编译器能拦，
-                    // 所以本地做不了 Kotlin 编译时，至少要把 API 签名逐个核对过。
-                    val ok = try { ar.getTimestamp(ts) == AudioRecord.SUCCESS } catch (e: Throwable) {
-                        SnadLog.wrn(TAG, "getTimestamp 抛异常：${e.javaClass.simpleName}")
-                        false
+                    var ok = false
+                    var capNs = 0L
+                    var capPos = 0
+                    // 取局部非空变量再调用：字段是 var 且可空，直接传参会因可空编译不过。
+                    val mGet = getTs
+                    val tObj = tsObj
+                    if (mGet != null && tObj != null) {
+                        try {
+                            // 返回 int 状态码：0 = SUCCESS，非 0 表示该设备不支持。
+                            val rc = mGet.invoke(ar, tObj) as? Int ?: -1
+                            ok = rc == 0
+                            if (ok) {
+                                capNs = fNano?.getLong(tObj) ?: 0L
+                                capPos = fPos?.getInt(tObj) ?: 0
+                            }
+                        } catch (e: Throwable) {
+                            SnadLog.wrn(TAG, "getTimestamp 反射调用失败：${e.javaClass.simpleName}")
+                        }
                     }
                     val el = SystemClock.elapsedRealtimeNanos()
 
                     putI32(buf, 6, lastSentSeq)
                     putI32(buf, 10, lastSentFrames.toInt())
-                    putI64(buf, 14, if (ok) ts.nanoTime else 0L)
+                    putI64(buf, 14, if (ok) capNs else 0L)
                     putI64(buf, 22, el)
-                    putI32(buf, 30, if (ok) ts.framePosition else 0)
+                    putI32(buf, 30, if (ok) capPos else 0)
                     putI32(buf, 34, ar.bufferSizeInFrames)
                     putI32(buf, 38, if (chunkFrames > 0) chunkFrames else CHUNK_DEFAULT_FRAMES)
                     buf[42] = if (ok) 1 else 0
