@@ -1175,6 +1175,9 @@ namespace Snad
         private SnadClockSync _clockSync;
         private long _clockSyncStartFailures;
 
+        /// <summary>采样钟接收（端口 6984）：手机真实采集时刻，端到端测量的起点。</summary>
+        private SnadClockListener _clockListener;
+
         /// <summary>
         /// 声卡设备缓冲的估计值（ms）。
         ///
@@ -1473,8 +1476,8 @@ namespace Snad
                             _latencyMeter.OnPacket(phoneTsMs, startFrame);
                         }
 
-                        // 第一个音频包带来了手机地址——从这一刻起才能做时钟校准。
-                        // 失败必须留痕：没有校准，端到端延迟就不能报数。
+                        // 第一个音频包带来了手机地址——从这一刻起才能做时钟校准，
+                        // 也才知道该去哪里收采样钟报文。
                         if (_clockSync == null)
                         {
                             try
@@ -1493,6 +1496,22 @@ namespace Snad
                                 _clockSyncStartFailures++;
                                 _clockSync = null;
                                 Logger.Err("时钟校准启动失败（端到端延迟将不可用）", ex);
+                            }
+                        }
+
+                        // 采样钟：它给出手机真正的采集时刻（getTimestamp），
+                        // 是端到端测量的起点。绑定失败要明确说，不能一声不响。
+                        if (_clockListener == null)
+                        {
+                            try
+                            {
+                                _clockListener = new SnadClockListener(msg => Logger.Info(msg));
+                                _clockListener.Start();
+                            }
+                            catch (Exception ex)
+                            {
+                                Logger.Err("采样钟监听启动失败（起点只能退化为包时间戳）", ex);
+                                _clockListener = null;
                             }
                         }
 

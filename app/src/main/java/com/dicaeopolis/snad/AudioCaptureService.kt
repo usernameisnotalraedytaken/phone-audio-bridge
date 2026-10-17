@@ -141,7 +141,13 @@ class AudioCaptureService : Service() {
                 try {
                     // 先取成局部 val 再赋值：tsCls 若是 Class<*>?，
                     // getMethod 的变参会因可空而编译不过。
-                    val cls = Class.forName("android.media.AudioRecord\$AudioTimestamp")
+                    //
+                    // 类名必须是**顶层类** android.media.AudioTimestamp。
+                    // 我最初写成 AudioRecord$AudioTimestamp（不存在的嵌套类），
+                    // 于是 CI 报"解析不到"、真机抛 ClassNotFoundException，
+                    // 而我当时还把原因归到"厂商 ROM 不支持"上——那是不对的：
+                    // 是我写错了名字，不是设备的问题。
+                    val cls = Class.forName("android.media.AudioTimestamp")
                     val obj = cls.getDeclaredConstructor().newInstance()
                     tsCls = cls
                     tsObj = obj
