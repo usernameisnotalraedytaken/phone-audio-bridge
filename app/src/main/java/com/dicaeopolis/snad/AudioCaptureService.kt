@@ -161,7 +161,7 @@ class AudioCaptureService : Service() {
 
                     var ok = false
                     var capNs = 0L
-                    var capPos = 0
+                    var capPos = 0L
                     if (tsUsable) {
                         try {
                             val rc = ar.getTimestamp(ts, AudioTimestamp.TIMEBASE_BOOTTIME)
@@ -180,7 +180,7 @@ class AudioCaptureService : Service() {
                     putI32(buf, 10, lastSentFrames.toInt())
                     putI64(buf, 14, if (ok) capNs else 0L)
                     putI64(buf, 22, el)
-                    putI32(buf, 30, if (ok) capPos else 0)
+                    putI32(buf, 30, if (ok) capPos.toInt() else 0)
                     putI32(buf, 34, ar.bufferSizeInFrames)
                     putI32(buf, 38, if (chunkFrames > 0) chunkFrames else CHUNK_DEFAULT_FRAMES)
                     buf[42] = if (ok) 1 else 0

@@ -121,6 +121,16 @@ namespace Snad
             return b[off] | (b[off + 1] << 8) | (b[off + 2] << 16) | (b[off + 3] << 24);
         }
 
+        /// <summary>
+        /// 自测钩子：不经过 socket，直接把一段字节喂进解析流程。
+        /// 存在的理由很实际——没有它，'K' 报文的解析只能靠"装到手机上看看"，
+        /// 而这条路今晚已经证明代价很高。
+        /// </summary>
+        public void TestParse(byte[] p, int len)
+        {
+            Parse(p, len, new IPEndPoint(IPAddress.Loopback, 0));
+        }
+
         private void Parse(byte[] p, int len, IPEndPoint from)
         {
             if (len < PacketSize) { Interlocked.Increment(ref _badLength); return; }
