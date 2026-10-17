@@ -1465,6 +1465,11 @@ namespace Snad
             public double RateIn, RateWritten, RateRead;
             public double ReadCallsPerSec;
             public long FramesDropped, Underruns, Interpolated, SeqGaps, SeqMissing;
+
+            // 到达统计（计划 §3.3）：这两个数决定"缓冲该留多深"，
+            // 此前只在周期日志里出现过，界面上看不到。
+            public double DriftMsPerMin, JitterMs;
+            public bool HasArrivalStats;
             public long ShortPkt, BadMagic, BadVersion, BadPayload;
             public int TargetMs, CapacityMs, BlockMs, WaveOutBuffers;
             public string ProfileName;
@@ -1695,6 +1700,14 @@ namespace Snad
             m.RateRead = _lastRateRead;
             m.ReadCallsPerSec = _lastRateCalls;
             m.Kbps = _lastKbps;
+
+            double jit, drift, span;
+            if (TryGetArrivalStats(out jit, out drift, out span))
+            {
+                m.JitterMs = jit;
+                m.DriftMsPerMin = drift;
+                m.HasArrivalStats = true;
+            }
             return m;
         }
 

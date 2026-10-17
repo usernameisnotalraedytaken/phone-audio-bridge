@@ -191,7 +191,7 @@ namespace Snad
             graphHost.Controls.Add(_graph);
 
             // ---- 通道条 ----
-            _metrics = new MetricStrip(6) { Dock = DockStyle.Top, Height = 88 };
+            _metrics = new MetricStrip(8) { Dock = DockStyle.Top, Height = 88 };
             BuildMetricLabels();
 
             // ---- 控件行 ----
@@ -319,8 +319,8 @@ namespace Snad
             //   UNDER    缓冲空导致的欠载。非零说明水位过低或调度抖动大
             //   LATENCY  按档位参数估算的端到端延迟（EST.，非实测）。同档位恒定，
             //            用于横向比较不同档位的取舍；真正常变的是 BUFFER
-            string[] labels = { "LATENCY EST.", "BUFFER", "RX", "TX", "DROP", "UNDER" };
-            string[] units = { "ms", "ms", "fps", "fps", "frames", "underruns" };
+            string[] labels = { "LATENCY EST.", "BUFFER", "RX", "TX", "DROP", "UNDER", "DRIFT", "INTERP" };
+            string[] units  = { "ms", "ms", "fps", "fps", "frames", "underruns", "ms/min", "frames" };
             for (int i = 0; i < _metrics.Count; i++)
             {
                 _metrics[i].Label = labels[i];
@@ -1102,6 +1102,39 @@ namespace Snad
             _metrics[5].BarValue = _underRate;
             _metrics[5].Alert = _underRate >= 0.5;
             _metrics[5].HigherIsWorse = true;
+
+            // DRIFT：两端时钟速率差，单位 ms/分。
+            //
+            // 它决定"缓冲要留多少余量"：漂移 10 ms/分意味着每 6 分钟差 60 ms，
+            // 缓冲太浅就会周期性欠载或溢出。绝对值超过 5 ms/分即提示——
+            // 那是"每 12 分钟差一分钟的千分之五"，已经需要比默认更深的缓冲。
+            if (m.HasArrivalStats)
+            {
+                _metrics[6].Value = m.DriftMsPerMin.ToString("+0.0;-0.0;0.0", CultureInfo.InvariantCulture);
+                _metrics[6].Unit = "ms/min";
+                _metrics[6].BarMax = 20;                 // 满量程 20 ms/分
+                _metrics[6].BarValue = Math.Abs(m.DriftMsPerMin);
+                _metrics[6].Alert = Math.Abs(m.DriftMsPerMin) > 5;
+                _metrics[6].HigherIsWorse = true;
+
+                // INTERP：靠插值补出来的帧数。它是漂移补偿正在工作的证据，
+                // 长期为 0 说明比率为 1（两端速率恰好一致）或补偿没生效。
+                _metrics[7].Value = m.Interpolated.ToString(CultureInfo.InvariantCulture);
+                _metrics[7].Unit = "frames";
+                _metrics[7].BarMax = Math.Max(1, m.SampleRate);   // 每秒插值 1 秒即满格
+                _metrics[7].BarValue = m.Interpolated;
+                _metrics[7].HigherIsWorse = false;
+            }
+            else
+            {
+                // 样本不足时显示 —，而不是显示 0：
+                // 0 会被读成"没有漂移"，而真相是"还没测出来"。
+                _metrics[6].Value = "—";
+                _metrics[6].BarValue = -1;
+                _metrics[6].Alert = false;
+                _metrics[7].Value = "—";
+                _metrics[7].BarValue = -1;
+            }
 
             _metrics.Invalidate();
         }

@@ -214,6 +214,14 @@ namespace Snad
             s[4].Value = "3488"; s[4].BarMax = 10; s[4].BarValue = 3.5; s[4].Alert = true;
             s[5].Value = "10"; s[5].BarMax = 10; s[5].BarValue = 1.2; s[5].Alert = true;
 
+            // DRIFT / INTERP（计划 §3.3）：填入非零值，让截图能证明这两项确实有位置、
+            // 也证明标签没被挤掉。没有这两项时截图上看不出缺失。
+            if (s.Count >= 8)
+            {
+                s[6].Value = "+3.2"; s[6].BarMax = 20; s[6].BarValue = 3.2; s[6].Alert = false;
+                s[7].Value = "1728"; s[7].BarMax = 48000; s[7].BarValue = 1728;
+            }
+
             // 标题条的状态点与采样率也一并填上，否则渲染出来是 IDLE
             var labels = new List<Control>();
             CollectByType(root, typeof(Label), labels);
@@ -298,6 +306,26 @@ namespace Snad
                 }
                 else Console.WriteLine("  [通过] 标签 / 数值 / 电平条互不重叠");
             }
+
+            // 指标项数：计划 §3.3 要求显示漂移率与插值帧数。
+            // 少了这两项时截图上看不出缺失（只是少两个格子），因此必须断言项数与标签。
+            Console.WriteLine();
+            if (ms.Count < 8)
+            {
+                Console.WriteLine("  [失败] 指标项只有 " + ms.Count + " 项，§3.3 要求至少 8 项" +
+                                  "（含 DRIFT 与 INTERP）");
+                bad++;
+            }
+            else
+            {
+                string d = ms[6].Label, iv = ms[7].Label;
+                bool okLabels = d.IndexOf("DRIFT", StringComparison.OrdinalIgnoreCase) >= 0 &&
+                                iv.IndexOf("INTERP", StringComparison.OrdinalIgnoreCase) >= 0;
+                Console.WriteLine(okLabels ? "  [通过] 含 DRIFT 与 INTERP 两项" :
+                                              "  [失败] 第 7/8 项标签不是 DRIFT/INTERP（" + d + " / " + iv + "）");
+                if (!okLabels) bad++;
+            }
+
             return bad;
         }
 
