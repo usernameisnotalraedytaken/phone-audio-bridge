@@ -1474,6 +1474,15 @@ namespace Snad
 
             _capRate = capRate;
             _capBufferMs = capBufMs;
+
+            // 把上报值真正接进延迟估算，否则这个包只是被记下来、对界面毫无影响。
+            // 采集缓冲此前是按 8 ms 的典型值猜的，这里换成实测。
+            if (capBufMs > 0 && _profile != null)
+            {
+                _profile.ReportedCaptureMs = capBufMs;
+                Logger.Info("采集缓冲已按上报值 " + capBufMs + " ms 计入延迟估算" +
+                            "（此前按典型值 " + Profile.AndroidCaptureMs + " ms）");
+            }
             _capMask = mask;
 
             Logger.Info(string.Format(

@@ -74,4 +74,30 @@ object SnadProtocol {
         b[off + 2] = ((v ushr 16) and 0xFF).toByte()
         b[off + 3] = ((v ushr 24) and 0xFF).toByte()
     }
+
+    // ---- 能力上报（type = 'C'，14 字节，发往日志端口）----
+    //
+    // 用途：让电脑端把"手机采集延迟"从猜测变成已知。
+    // 电脑端估算里的 capture 固定按 8 ms（典型值）；上报之后可以用实测值。
+    //
+    //   0..3  magic
+    //   4     version
+    //   5     type = 'C'
+    //   6..9  captureRate（u32，采集采样率）
+    //   10..11 captureBufferMs（u16，采集缓冲）
+    //   12    formatMask（u8）：bit0 pcm16 / bit1 pcm24 / bit2 pcm32 / bit3 float32
+    //   13    保留
+    const val TYPE_CAPABILITY: Byte = 'C'.code.toByte()
+
+    fun buildCapability(captureRate: Int, captureBufferMs: Int, formatMask: Int): ByteArray {
+        val h = ByteArray(TEXT_HEADER_SIZE)
+        System.arraycopy(MAGIC, 0, h, 0, 4)
+        h[4] = VERSION
+        h[5] = TYPE_CAPABILITY
+        putIntLE(h, 6, captureRate)
+        putIntLE(h, 10, captureBufferMs and 0xFFFF)
+        h[12] = (formatMask and 0xFF).toByte()
+        h[13] = 0
+        return h
+    }
 }
