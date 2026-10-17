@@ -1441,6 +1441,64 @@ namespace Snad
         }
 
         /// <summary>
+        /// 处理手机端能力上报（type = 'C'，14 字节）：
+        ///   0..3  magic "SNAD"
+        ///   4     version
+        ///   5     type = 'C'
+        ///   6..9  captureRate（u32，采集采样率）
+        ///   10..11 captureBufferMs（u16，采集缓冲）
+        ///   12    formatMask（u8）：bit0 pcm16 / bit1 pcm24 / bit2 pcm32 / bit3 float32
+        ///   13    保留
+        ///
+        /// 这些值把"手机采集延迟"从猜测变成已知：
+        /// 此前估算里 capture 固定按 8 ms、网络按 21 ms，两者都不是测出来的。
+        /// </summary>
+        private void HandleCapability(byte[] pkt, IPEndPoint remote)
+        {
+            if (pkt.Length < 14)
+            {
+                Logger.Warn("能力上报包过短：" + pkt.Length + " 字节（需 ≥ 14），来自 " + remote);
+                return;
+            }
+
+            int capRate = BitConverter.ToInt32(pkt, 6);
+            int capBufMs = BitConverter.ToUInt16(pkt, 10);
+            int mask = pkt[12];
+
+            var names = new List<string>();
+            if ((mask & 1) != 0) names.Add("pcm16");
+            if ((mask & 2) != 0) names.Add("pcm24");
+            if ((mask & 4) != 0) names.Add("pcm32");
+            if ((mask & 8) != 0) names.Add("float32");
+            if (names.Count == 0) names.Add("未声明");
+
+            _capRate = capRate;
+            _capBufferMs = capBufMs;
+            _capMask = mask;
+
+            Logger.Info(string.Format(
+                "手机能力上报：采集 {0} Hz，采集缓冲 {1} ms，可用位深 {2}",
+                capRate, capBufMs, string.Join(" / ", names.ToArray())));
+
+            // 采样率不一致要显式警告：那意味着两端对"同一段音频"的理解不同，
+            // 表现为音高偏高或偏低，而不是报错
+            if (capRate > 0 && _sampleRate > 0 && capRate != _sampleRate)
+                Logger.Warn("采集采样率 " + capRate + " Hz 与播放 " + _sampleRate +
+                            " Hz 不一致，音高会偏移（需重采样，当前未做）");
+
+            // 位深协商的结果要等音频流真的开始以后再判断：
+            // 能力包通常先于第一个音频包到达，此刻 _pktFormat 还是缺省 pcm16，
+            // 立刻下"仍用 pcm16"的结论会误导（实测就会先报一句假结论）。
+            // 因此这里只记录能力，判断放到周期统计里做。
+        }
+
+        private int _capRate, _capBufferMs, _capMask = -1;
+        private bool _notedBitDepth;
+
+        /// <summary>最近一次能力上报的采集缓冲（毫秒）。-1 表示未收到。</summary>
+        public int ReportedCaptureBufferMs { get { return _capBufferMs; } }
+
+        /// <summary>
         /// 到达抖动与漂移。返回 false 表示样本不足——此时不给数字，
         /// 因为样本太少算出的"抖动"没有意义，报一个数反而误导。
         /// 计算本身在 ArrivalStats 里，是纯函数，可脱离网络单独验证。
@@ -1555,9 +1613,16 @@ namespace Snad
                             Logger.Warn("日志端口收到非 SNAD 包，长度 " + pkt.Length + "，来自 " + remote);
                             continue;
                         }
+                        if (pkt[5] == (byte)'C')
+                        {
+                            // 能力上报包。它不是日志，因此不进 phone.log，
+                            // 而是解析出来写进接收器日志并用于后续估计。
+                            HandleCapability(pkt, remote);
+                            continue;
+                        }
                         if (pkt[5] != (byte)'T')
                         {
-                            Logger.Warn("日志端口收到非文本包 type=" + pkt[5] + "，来自 " + remote);
+                            Logger.Warn("日志端口收到未知类型包 type=" + pkt[5] + "，来自 " + remote);
                             continue;
                         }
 
@@ -1831,6 +1896,15 @@ namespace Snad
                             // 只写一行启动值是看不出它有没有收敛的
                             if (!string.IsNullOrEmpty(_lastPolicyStatus))
                                 Logger.Info("[缓冲策略] " + _lastPolicyStatus);
+
+                            // 位深协商的稳态判断（只报一次）
+                            if (!_notedBitDepth && _capMask >= 0 && _pktFormat == SampleFormat.Pcm16 &&
+                                (_capMask & 2) != 0)
+                            {
+                                Logger.Info("手机声明支持 pcm24，但音频仍以 pcm16 到达；" +
+                                            "升位深需手机端按 v2 协议发送");
+                                _notedBitDepth = true;
+                            }
 
                             _lastFramesIn = fIn;
                             _lastFramesWritten = fWr;

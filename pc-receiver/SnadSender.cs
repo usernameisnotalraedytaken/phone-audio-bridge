@@ -72,6 +72,7 @@ namespace Snad
             double baseDelayMs = 80;      // 抖动摆动的基准，需 ≥ 最大抖动
             int version = 1;              // 协议版本：1 = 22 字节头，2 = 26 字节头（带位深）
             SampleFormat format = SampleFormat.Pcm16;
+            int capBufferMs = 20;         // 能力上报里的"手机采集缓冲"，模拟值
             double toneHz = 440;
             int timestampOffsetMs = 0;
             bool silent = false;
@@ -89,6 +90,7 @@ namespace Snad
                     case "抖动": case "jitter": jitterMs = double.Parse(v, CultureInfo.InvariantCulture); break;
                     case "基准延迟": case "base": baseDelayMs = double.Parse(v, CultureInfo.InvariantCulture); break;
                     case "版本": case "version": version = int.Parse(v); break;
+                    case "采集缓冲": case "capbuffer": capBufferMs = int.Parse(v); break;
                     case "格式": case "format":
                         {
                             string f = v.Trim().ToLowerInvariant();
@@ -153,6 +155,24 @@ namespace Snad
             using (var sock = new UdpClient())
             {
                 sock.Client.SendBufferSize = 1 << 20;
+
+                // v2 先发一次能力上报（发往日志端口），让接收端把"手机采集延迟"
+                // 从猜测变成已知。v1 没有这个包，接收端会继续按缺省值估算。
+                if (version == 2)
+                {
+                    try
+                    {
+                        var capEnd = new IPEndPoint(target.Address, port + 1);
+                        var cap = BuildCapabilityPacket(rate, capBufferMs, format);
+                        sock.Send(cap, cap.Length, capEnd);
+                        Console.WriteLine("  已发送能力上报：采集 " + rate + " Hz，采集缓冲 " +
+                                          capBufferMs + " ms，位深 " + AudioCodec.Name(format));
+                    }
+                    catch (Exception ex)
+                    {
+                        Console.WriteLine("  能力上报发送失败：" + ex.Message);
+                    }
+                }
 
                 var pcm = new byte[payloadBytes];
                 double phase = 0;
@@ -251,8 +271,7 @@ namespace Snad
 
         private static void TrySend(UdpClient sock, IPEndPoint target, byte[] pkt)
         {
-            try { sock.Send(pkt, pkt.Length, target); }
-            catch (Exception ex) { Console.WriteLine("发送失败：" + ex.Message); }
+            try { sock.Send(pkt, pkt.Length, target); }            catch (Exception ex) { Console.WriteLine("发送失败：" + ex.Message); }
         }
 
         /// <summary>按手机端 SnadProtocol.buildHeader 的布局构造包头。</summary>
@@ -262,6 +281,32 @@ namespace Snad
         ///   v2 = 26 字节，22..23 为格式码（新协议）
         /// 前 22 字节两者完全一致，因此 v1 接收端能读出 v2 包的核心字段。
         /// </summary>
+        /// <summary>
+        /// 能力上报包（发往日志端口，14 字节）：
+        ///   0..3 magic / 4 version / 5 type='C'
+        ///   6..9 captureRate（u32）
+        ///   10..11 captureBufferMs（u16）
+        ///   12 formatMask（u8）  13 保留
+        /// 与接收端 HandleCapability 的布局必须一致。
+        /// </summary>
+        private static byte[] BuildCapabilityPacket(int rate, int captureBufferMs, SampleFormat format)
+        {
+            var p = new byte[14];
+            p[0] = (byte)'S'; p[1] = (byte)'N'; p[2] = (byte)'A'; p[3] = (byte)'D';
+            p[4] = WireProtocol.Version2;
+            p[5] = (byte)'C';
+            WireProtocol.PutInt32LE(p, 6, rate);
+            WireProtocol.PutInt16LE(p, 10, captureBufferMs);
+
+            int mask = 1;                                   // pcm16 总是有
+            if (format == SampleFormat.Pcm24) mask |= 2;
+            if (format == SampleFormat.Pcm32) mask |= 4;
+            if (format == SampleFormat.Float32) mask |= 8;
+            p[12] = (byte)mask;
+            p[13] = 0;
+            return p;
+        }
+
         private static byte[] BuildPacket(int channels, int rate, int seq, int timestampMs,
                                           int payloadBytes, byte[] pcm,
                                           int version, SampleFormat format)
