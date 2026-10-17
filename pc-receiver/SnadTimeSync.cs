@@ -24,13 +24,34 @@ namespace Snad
 
         private static readonly byte[] Info = Encoding.ASCII.GetBytes("snad-timesync-v1");
 
-        /// <summary>从预共享密钥派生时间同步专用密钥（与信标密钥相互独立）。</summary>
+        /// <summary>
+        /// 从预共享密钥派生时间同步专用密钥。
+        ///
+        /// **必须与手机上已安装的 APK 完全一致**，当前公式是：
+        ///     SHA256( SHA256(pskx) ‖ "snad-timesync-v1" )
+        ///
+        /// 这里记一段踩过的坑：最初 C# 侧写的是 HMAC-SHA256(key=psk, data=info)，
+        /// 而 Kotlin 侧写的是上面这个双重 SHA256。两者"看起来都是派生"，
+        /// 实际完全不同，症状是——信标一切正常（说明 PSK 一致），
+        /// 但手机对每个时间同步探测都回 "HMAC 校验失败"，极易误判成密钥不一致。
+        ///
+        /// 现在以**已部署到手机的实现**为准：手机侧重编译成本高，
+        /// 因此由 PC 侧对齐它，而不是反过来。
+        /// 将来若两端都改，必须同时改并各自加一个"派生结果相同"的断言。
+        /// </summary>
         public static byte[] DeriveKey(string psk)
         {
             if (string.IsNullOrEmpty(psk))
                 throw new ArgumentException("PSK 为空：构建时未注入密钥");
-            using (var h = new HMACSHA256(Encoding.ASCII.GetBytes(psk)))
-                return h.ComputeHash(Info);
+
+            using (var sha = SHA256.Create())
+            {
+                var baseKey = sha.ComputeHash(Encoding.ASCII.GetBytes(psk));
+                sha.Initialize();
+                sha.TransformBlock(baseKey, 0, baseKey.Length, null, 0);
+                sha.TransformFinalBlock(Info, 0, Info.Length);
+                return sha.Hash;
+            }
         }
 
         private static void PutU32(byte[] b, int off, uint v)

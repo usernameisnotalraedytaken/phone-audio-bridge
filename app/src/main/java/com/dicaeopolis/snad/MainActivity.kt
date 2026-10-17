@@ -277,6 +277,52 @@ class MainActivity : AppCompatActivity() {
         }
         root.addView(detailView)
 
+        // ---- 读块大小滑块 ----
+        //
+        // 这是手机侧唯一直接决定延迟的旋钮：read() 阻塞到凑满一块才返回，
+        // 所以块越大，块内最老的样本等得越久（平均约半块，最坏一整块）。
+        //
+        // 上下限与默认值取自服务里的常量，避免两处各写一个数、日后对不上。
+        // 改动在**下一条流**生效：中途改会让包序号与采样钟对不齐。
+        root.addView(TextView(this).apply {
+            textSize = 13f
+            setTextColor(ContextCompat.getColor(context, R.color.muted))
+            setPadding(0, pad / 2, 0, 0)
+            val prefs = getSharedPreferences("snad", MODE_PRIVATE)
+            val cur = prefs.getInt("chunk_frames", AudioCaptureService.CHUNK_DEFAULT_FRAMES)
+            text = "读块 ${cur} 帧（%.1f ms/包）".format(cur * 1000.0 / 48000)
+        })
+
+        val chunkSlider = SeekBar(this).apply {
+            val lo = AudioCaptureService.CHUNK_MIN_FRAMES
+            val hi = AudioCaptureService.CHUNK_MAX_FRAMES
+            max = 100
+            val prefs = getSharedPreferences("snad", MODE_PRIVATE)
+            val cur = prefs.getInt("chunk_frames", AudioCaptureService.CHUNK_DEFAULT_FRAMES)
+            progress = ((cur - lo) * 100 / (hi - lo)).coerceIn(0, 100)
+        }
+        val chunkLabel = TextView(this).apply {
+            textSize = 12f
+            setTextColor(ContextCompat.getColor(context, R.color.muted))
+        }
+        chunkSlider.setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
+            override fun onProgressChanged(sb: SeekBar?, progress: Int, fromUser: Boolean) {
+                val lo = AudioCaptureService.CHUNK_MIN_FRAMES
+                val hi = AudioCaptureService.CHUNK_MAX_FRAMES
+                val frames = lo + (hi - lo) * progress / 100
+                val ms = frames * 1000.0 / 48000
+                chunkLabel.text = "$frames 帧 / %.1f ms 每包，约 %.0f 包每秒".format(ms, 48000.0 / frames)
+                if (fromUser) {
+                    getSharedPreferences("snad", MODE_PRIVATE).edit()
+                        .putInt("chunk_frames", frames).apply()
+                }
+            }
+            override fun onStartTrackingTouch(sb: SeekBar?) {}
+            override fun onStopTrackingTouch(sb: SeekBar?) {}
+        })
+        root.addView(chunkSlider)
+        root.addView(chunkLabel)
+
         root.addView(label(R.string.label_log))
         root.addView(Button(this).apply {
             text = getString(R.string.btn_copy_log)

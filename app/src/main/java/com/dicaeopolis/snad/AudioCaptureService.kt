@@ -40,6 +40,14 @@ class AudioCaptureService : Service() {
         private const val CHANNEL_ID = "snad_stream"
         private const val NOTIF_ID = 4201
 
+        /** 采样钟报文端口。与音频(6981)、文本日志(6982)、信标(6983)分开。 */
+        const val CLOCK_PORT = 6984
+
+        /** 读块帧数的可调区间。低于 240 帧（5 ms）在多数 HAL 上只会制造空读。 */
+        const val CHUNK_MIN_FRAMES = 256
+        const val CHUNK_MAX_FRAMES = 2048
+        const val CHUNK_DEFAULT_FRAMES = 480
+
         const val ACTION_START = "com.dicaeopolis.snad.START"
         const val ACTION_STOP = "com.dicaeopolis.snad.STOP"
         const val EXTRA_RESULT_CODE = "resultCode"
@@ -77,6 +85,111 @@ class AudioCaptureService : Service() {
     private var bytesSent = 0L
     private var packetsSent = 0L
     private var readErrors = 0L
+
+    /** 读块帧数（可调）。0 表示用默认值 480 帧（10 ms，HAL 周期的整数倍）。 */
+    private var chunkFrames = 0
+
+    /** 最近发出的音频包序号与累计帧数，供采样钟报文对齐。 */
+    @Volatile private var lastSentSeq = -1
+    @Volatile private var lastSentFrames = 0L
+
+    /** 采样钟报文端口。与音频(6981)、文本日志(6982)、信标(6983)分开。 */
+    // CLOCK_PORT 定义在上面 companion object 里
+
+    /** 每包字节数：读块帧数 × 声道 × 2 字节。 */
+    private fun payloadBytes(): Int {
+        val frames = if (chunkFrames > 0) chunkFrames else CHUNK_DEFAULT_FRAMES
+        return frames * channels * 2
+    }
+
+    /**
+     * 采样钟报文：每 50 ms 一包，向 PC 提供"这一帧是什么时候被产出的"。
+     *
+     * 字段（小端，44 字节）：
+     *   0..3   "SNAD"        4  version=1     5  type='K'
+     *   6..9   lastSeq                最近发出的音频包序号
+     *   10..13 lastSentFrames         累计已发帧数
+     *   14..21 captureNanoTime        getTimestamp() 给出的采集时刻（CLOCK_MONOTONIC）
+     *   22..29 elapsedRealtimeNanos   同一时刻的 BOOTTIME 读数（用于两时钟域换算）
+     *   30..33 tsFramePosition        该时刻对应的帧位置
+     *   34..37 bufferFrames           AudioRecord 缓冲帧数
+     *   38..41 chunkFrames            当前读块帧数
+     *   42     flags                  bit0=1 表示 getTimestamp 可用
+     *
+     * 为什么要双时钟：getTimestamp 用 CLOCK_MONOTONIC，而音频包时间戳用
+     * CLOCK_BOOTTIME（elapsedRealtime）。设备休眠时两者分叉，
+     * 只给一个的话 PC 侧换算会随息屏莫名漂移。两个都给，PC 自己求差。
+     *
+     * getTimestamp 失败时必须如实上报 flags=0，不能拿 read 时刻冒充采集时刻。
+     */
+    private fun startClockReporter(ar: AudioRecord, dest: InetAddress) {
+        val t = Thread({
+            var sock: DatagramSocket? = null
+            try {
+                sock = DatagramSocket()
+                val ts = AudioRecord.AudioTimestamp()
+                var failStreak = 0L
+                while (running.get()) {
+                    val buf = ByteArray(44)
+                    buf[0] = 'S'.code.toByte(); buf[1] = 'N'.code.toByte()
+                    buf[2] = 'A'.code.toByte(); buf[3] = 'D'.code.toByte()
+                    buf[4] = 1
+                    buf[5] = 'K'.code.toByte()
+
+                    val ok = try { ar.getTimestamp(ts) } catch (e: Throwable) {
+                        SnadLog.wrn(TAG, "getTimestamp 抛异常：${e.javaClass.simpleName}")
+                        false
+                    }
+                    val el = SystemClock.elapsedRealtimeNanos()
+                    val nm = System.nanoTime()
+
+                    putI32(buf, 6, lastSentSeq)
+                    putI32(buf, 10, lastSentFrames.toInt())
+                    putI64(buf, 14, if (ok) ts.nanoTime else 0L)
+                    putI64(buf, 22, el)
+                    putI32(buf, 30, if (ok) ts.framePosition else 0)
+                    putI32(buf, 34, ar.bufferSizeInFrames)
+                    putI32(buf, 38, if (chunkFrames > 0) chunkFrames else CHUNK_DEFAULT_FRAMES)
+                    buf[42] = if (ok) 1 else 0
+
+                    try {
+                        sock.send(DatagramPacket(buf, buf.size, dest, CLOCK_PORT))
+                    } catch (e: Throwable) {
+                        SnadLog.wrn(TAG, "采样钟报文发送失败：${e.javaClass.simpleName}: ${e.message}")
+                    }
+
+                    if (!ok) {
+                        failStreak++
+                        if (failStreak == 1L || failStreak % 40L == 0L) {
+                            SnadLog.wrn(TAG, "getTimestamp 不可用（连续 $failStreak 次）：" +
+                                    "本机可能不支持播放捕获时间戳，端到端起点只能退化为 read 时刻")
+                        }
+                    } else failStreak = 0
+
+                    Thread.sleep(50)
+                }
+            } catch (e: Throwable) {
+                SnadLog.err(TAG, "采样钟线程异常退出", e)
+            } finally {
+                try { sock?.close() } catch (e: Throwable) {
+                    SnadLog.soft(TAG, "关闭采样钟 socket", e)
+                }
+            }
+        }, "snad-clock")
+        t.isDaemon = true
+        t.start()
+    }
+
+    private fun putI32(b: ByteArray, off: Int, v: Int) {
+        b[off] = (v and 0xFF).toByte()
+        b[off + 1] = ((v ushr 8) and 0xFF).toByte()
+        b[off + 2] = ((v ushr 16) and 0xFF).toByte()
+        b[off + 3] = ((v ushr 24) and 0xFF).toByte()
+    }
+
+    private fun putI64(b: ByteArray, off: Int, v: Long) {
+        for (i in 0 until 8) b[off + i] = ((v ushr (8 * i)) and 0xFF).toByte()
+    }
     private var consecutiveSilence = 0
 
     override fun onBind(intent: Intent?): IBinder? = null
@@ -98,6 +211,24 @@ class AudioCaptureService : Service() {
                 return START_NOT_STICKY
             }
             ACTION_START -> {
+                // 读块帧数来自界面滑块，改动在下一条流生效。
+                // 范围与默认值在 companion object 里定义，越界时钳住并说明——
+                // 静默接受一个非法值会让"为什么延迟没变"变成悬案。
+                val pref = getSharedPreferences("snad", MODE_PRIVATE)
+                val want = pref.getInt("chunk_frames", CHUNK_DEFAULT_FRAMES)
+                chunkFrames = when {
+                    want < CHUNK_MIN_FRAMES -> {
+                        SnadLog.wrn(TAG, "读块 $want 帧低于下限 ${CHUNK_MIN_FRAMES}，已钳到下限")
+                        CHUNK_MIN_FRAMES
+                    }
+                    want > CHUNK_MAX_FRAMES -> {
+                        SnadLog.wrn(TAG, "读块 $want 帧高于上限 ${CHUNK_MAX_FRAMES}，已钳到上限")
+                        CHUNK_MAX_FRAMES
+                    }
+                    else -> want
+                }
+                SnadLog.info(TAG, "读块 $chunkFrames 帧" +
+                        "（${"%.1f".format(chunkFrames * 1000.0 / 48000)} ms/包）")
                 if (running.get()) {
                     SnadLog.wrn(TAG, "服务已在运行，忽略本次重复启动")
                     return START_NOT_STICKY
@@ -286,7 +417,7 @@ class AudioCaptureService : Service() {
     }
 
     private fun sendLoop(ar: AudioRecord, sock: DatagramSocket, dest: InetAddress, port: Int) {
-        val pcm = ByteArray(SnadProtocol.PAYLOAD_BYTES)
+        val pcm = ByteArray(payloadBytes())
         try {
             ar.startRecording()
             if (ar.recordingState != AudioRecord.RECORDSTATE_RECORDING) {
@@ -295,6 +426,11 @@ class AudioCaptureService : Service() {
             }
             SnadLog.info(TAG, "开始串流 -> $dest:$port  ${sampleRate}Hz/${channels}ch  " +
                     "每包 ${pcm.size}B ≈ ${"%.1f".format(pcm.size * 1000.0 / (sampleRate * channels * 2))}ms")
+
+            // 采样钟：让"手机何时真正产出这一帧"变成可观测量。
+            // 单独线程、单独端口，带双时钟读数（MONOTONIC 与 BOOTTIME 分域，休眠后会分叉）。
+            startClockReporter(ar, dest)
+
             report("streaming", "$dest:$port  ${sampleRate}Hz/${channels}ch")
 
             var lastLog = SystemClock.elapsedRealtime()
@@ -335,10 +471,13 @@ class AudioCaptureService : Service() {
                 if (filled <= 0) continue
 
                 val out = try {
+                    val seqNow = seq++
+                    lastSentSeq = seqNow
+                    lastSentFrames += filled / Math.max(1, channels * 2)
                     val header = SnadProtocol.buildHeader(
                         channels = channels,
                         sampleRate = sampleRate,
-                        sequence = seq++,
+                        sequence = seqNow,
                         timestampMs = (SystemClock.elapsedRealtime() and 0xFFFFFFFFL).toInt(),
                         payloadBytes = filled
                     )

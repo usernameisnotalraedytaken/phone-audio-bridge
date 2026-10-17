@@ -191,6 +191,17 @@ namespace Snad
                 return SnadTimeSync.SelfTest();
             }
 
+            // 打印派生密钥的十六进制，用于和手机端逐字节对照。
+            // 派生公式两端各写一份时，唯一可靠的核对方式就是比结果，不比"看起来对不对"。
+            if (args.Length > 0 && args[0] == "--timesync-keyid")
+            {
+                var k = SnadTimeSync.DeriveKey(SnadSecret.Psk);
+                var sb = new StringBuilder();
+                foreach (var b in k) sb.Append(b.ToString("x2"));
+                Console.WriteLine("timesync-key=" + sb);
+                return 0;
+            }
+
             // 提高系统计时器精度到 1 ms。不做这一步，播放线程会被 15.6 ms 的
             // 调度粒度拖慢，而音频块只有 16 ms，消费必然跟不上产出。
             uint tRes = TimeBeginPeriod(TimerResolutionMs);
@@ -694,7 +705,8 @@ namespace Snad
         /// </summary>
         public static void Play(int deviceIndex, Func<int> getSampleRate, Func<int> getChannels,
                                 Func<byte[]> pull, CancellationToken token, Profile profile,
-                                Action<byte[], int, int> onBlock = null, Equalizer eq = null)
+                                Action<byte[], int, int> onBlock = null, Equalizer eq = null,
+                                SnadLatencyMeter meter = null)
         {
             int sampleRate = getSampleRate();
             int channels = getChannels();
@@ -726,6 +738,10 @@ namespace Snad
             int pollMs = Math.Max(1, profile.PollMs);
 
             var bufs = new Buf[slots];
+            // 每个缓冲覆盖的帧区间首号。播出时刻要靠它反推——
+            // 没有这个映射，只知道"某个缓冲播完了"，不知道是哪段音频。
+            var bufStart = new long[slots];
+            int framesPerBuf = Math.Max(1, (bufBytes / Math.Max(1, channels * 2)));
             try
             {
                 for (int i = 0; i < slots; i++)
@@ -733,6 +749,7 @@ namespace Snad
                     bufs[i] = new Buf(hwo, bufBytes);
                     // 预填充：首轮就有队列，避免起播卡顿
                     var first = pull();
+                    bufStart[i] = meter != null ? meter.OnBufferSubmitted(framesPerBuf) : 0;
                     bufs[i].Submit(first == null ? new byte[bufBytes] : Fit(first, bufBytes));
                 }
 
@@ -745,6 +762,17 @@ namespace Snad
                     for (int i = 0; i < slots; i++)
                     {
                         if (!bufs[i].IsDone) continue;
+
+                        // 该缓冲刚刚播完：此刻就是它最后一帧离开队列的时刻。
+                        // 轮询间隔 1 ms，因此这里的时间戳误差不超过一个轮询周期。
+                        if (meter != null)
+                        {
+                            bool cal = meter.Sync != null && meter.Sync.HasCalibration;
+                            meter.OnBufferDone(bufStart[i], framesPerBuf,
+                                               SnadLatencyMeter.NowMs(), cal,
+                                               meter.Sync != null ? meter.Sync.OffsetMs : 0);
+                        }
+
                         var data = pull();
                         if (data == null) continue;
                         var fitted = Fit(data, bufBytes);
@@ -763,6 +791,7 @@ namespace Snad
                             }
                         }
 
+                        bufStart[i] = meter != null ? meter.OnBufferSubmitted(framesPerBuf) : 0;
                         bufs[i].Submit(fitted);
                         // 通知 GUI：这块音频即将播放，可用于绘制波形/频谱。
                         // 回调抛异常不能影响播放，因此单独捕获并只提示有限次数。
@@ -1146,6 +1175,18 @@ namespace Snad
         private SnadClockSync _clockSync;
         private long _clockSyncStartFailures;
 
+        /// <summary>
+        /// 声卡设备缓冲的估计值（ms）。
+        ///
+        /// 必须说清它是估计：waveOut 不提供"设备内部还压着多少"的读数，
+        /// 真值只能用回环采集测（那台工具不在当前基线里）。
+        /// 写成常量而不是塞进别的段，是为了让"哪一段是估计"在剖分里一眼可见。
+        /// </summary>
+        private const double DeviceBufferEstimateMs = 12.0;
+
+        /// <summary>端到端延迟计。环形缓冲建立时按实际采样率创建。</summary>
+        private SnadLatencyMeter _latencyMeter;
+
         private static readonly double MsPerTick = 1000.0 / Stopwatch.Frequency;
         private static double NowMs() { return Stopwatch.GetTimestamp() * MsPerTick; }
         private long _logLines, _logPkts;
@@ -1382,6 +1423,7 @@ namespace Snad
                             // 尺寸全部由 profile 提供，并按实际采样率换算，不写死 48000。
                             int capFrames = _profile.RingCapacityFrames(_sampleRate);
                             _ring = new SampleRing(capFrames);
+                            _latencyMeter = new SnadLatencyMeter(_sampleRate);
                             _prebufferFrames = _profile.PrebufferFrames(_sampleRate);
                             _formatLogged = true;
                             _ringReady = true;   // 此刻起 _ring 才可被安全访问
@@ -1423,6 +1465,14 @@ namespace Snad
                             _lastPhoneTsMs = phoneTsMs;
                         }
 
+                        // 登记到延迟计：首帧号 + 手机采集时刻。
+                        // 帧号用写入前的累计值，与播放侧"已读帧数"同一套编号。
+                        if (_latencyMeter != null)
+                        {
+                            long startFrame = Interlocked.Read(ref _framesIn);
+                            _latencyMeter.OnPacket(phoneTsMs, startFrame);
+                        }
+
                         // 第一个音频包带来了手机地址——从这一刻起才能做时钟校准。
                         // 失败必须留痕：没有校准，端到端延迟就不能报数。
                         if (_clockSync == null)
@@ -1435,6 +1485,8 @@ namespace Snad
                                 _clockSync.Start();
                                 Logger.Info("时钟校准已启动：目标 " + remote.Address +
                                             ":" + SnadBeacon.DefaultPort);
+                                // 让延迟计也能看到校准状态（播放线程是静态方法，只能经由 meter 拿）
+                                if (_latencyMeter != null) _latencyMeter.Sync = _clockSync;
                             }
                             catch (Exception ex)
                             {
@@ -1542,6 +1594,32 @@ namespace Snad
                                     _clockSync.BestRttMs, _clockSync.Failures));
                             }
 
+                            // 端到端延迟：手机采集 → 音频真正播出。
+                            // 未校准时数值里含两端时钟差，必须标出来，不能当作延迟报。
+                            if (_latencyMeter != null)
+                            {
+                                bool calibrated = _clockSync != null && _clockSync.HasCalibration;
+                                string win = _latencyMeter.TakeWindow(out _);
+                                Logger.Info("[端到端" + (calibrated ? "" : "·含时钟差") + "] " + win +
+                                            (calibrated ? "" : "（未校准：含手机与 PC 的时钟差）") +
+                                            "；待结算包 " + _latencyMeter.Orphans + " 个孤儿");
+
+                                // 逐段剖分：每段独立来源，合计 = 各段之和。
+                                // 它的用途是看"延迟长在哪"，而不是只给一个总数。
+                                if (calibrated)
+                                {
+                                    double ringMs = _ring.AvailableFrames * 1000.0 / Math.Max(1, _sampleRate);
+                                    double poolMs = _profile.WaveOutBuffers * (double)_profile.BlockMs;
+                                    double total;
+                                    string bd = SnadLatencyMeter.Breakdown(
+                                        _lastArrivalMs - _lastPhoneTsMs,
+                                        _clockSync.OffsetMs, _clockSync.BestRttMs,
+                                        ringMs, poolMs, DeviceBufferEstimateMs,
+                                        out total);
+                                    Logger.Info("[延迟分解] 各段实测/可算值：\n" + bd);
+                                }
+                            }
+
                             _lastFramesIn = fIn;
                             _lastFramesWritten = fWr;
                             _lastFramesRead = fRd;
@@ -1640,7 +1718,7 @@ namespace Snad
                     var buf = new byte[framesPerBuffer * 4];
                     _ring.Read(buf, framesPerBuffer, ratio);
                     return buf;
-                }, _cts.Token, _profile, AudioBlockReady, Equalizer);
+                }, _cts.Token, _profile, AudioBlockReady, Equalizer, _latencyMeter);
             }
             catch (OperationCanceledException)
             {
