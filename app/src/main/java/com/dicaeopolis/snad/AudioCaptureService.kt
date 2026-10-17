@@ -138,6 +138,7 @@ class AudioCaptureService : Service() {
                 var getTs: java.lang.reflect.Method? = null
                 var fNano: java.lang.reflect.Field? = null
                 var fPos: java.lang.reflect.Field? = null
+                var tsTimebase: Int = 2
                 try {
                     // 先取成局部 val 再赋值：tsCls 若是 Class<*>?，
                     // getMethod 的变参会因可空而编译不过。
@@ -151,10 +152,26 @@ class AudioCaptureService : Service() {
                     val obj = cls.getDeclaredConstructor().newInstance()
                     tsCls = cls
                     tsObj = obj
-                    getTs = AudioRecord::class.java.getMethod("getTimestamp", cls)
+                    // 必须是两参数版本：getTimestamp(AudioTimestamp, int timebase)。
+                    // 一参数版本在真机上抛 NoSuchMethodException（已实测），
+                    // 我之前按一参数写，白烧了两轮构建。
+                    getTs = AudioRecord::class.java.getMethod("getTimestamp", cls, Integer.TYPE)
                     fNano = cls.getField("nanoTime")
                     fPos = cls.getField("framePosition")
-                    SnadLog.info(TAG, "采样钟：getTimestamp 可用，将按系统采集时刻测量")
+
+                    // timebase 常量从类里读，不写死 1/2：
+                    //   TIMEBASE_BOOTTIME  —— 与 elapsedRealtime 同一时钟域（首选）
+                    //   TIMEBASE_MONOTONIC —— 退而求其次，需要额外换算
+                    var tb = 2
+                    try { tb = cls.getField("TIMEBASE_BOOTTIME").getInt(null) }
+                    catch (e: Throwable) {
+                        try { tb = cls.getField("TIMEBASE_MONOTONIC").getInt(null) }
+                        catch (e2: Throwable) {
+                            SnadLog.wrn(TAG, "读不到 timebase 常量，按 2(BOOTTIME) 试")
+                        }
+                    }
+                    tsTimebase = tb
+                    SnadLog.info(TAG, "采样钟：getTimestamp 可用（timebase=" + tb + "）")
                 } catch (e: Throwable) {
                     SnadLog.wrn(TAG, "采样钟：本机不支持 getTimestamp" +
                             "（${e.javaClass.simpleName}: ${e.message}），" +
@@ -178,7 +195,7 @@ class AudioCaptureService : Service() {
                     if (mGet != null && tObj != null) {
                         try {
                             // 返回 int 状态码：0 = SUCCESS，非 0 表示该设备不支持。
-                            val rc = mGet.invoke(ar, tObj) as? Int ?: -1
+                            val rc = mGet.invoke(ar, tObj, tsTimebase) as? Int ?: -1
                             ok = rc == 0
                             if (ok) {
                                 capNs = fNano?.getLong(tObj) ?: 0L

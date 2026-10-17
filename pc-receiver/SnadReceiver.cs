@@ -741,6 +741,7 @@ namespace Snad
             // 每个缓冲覆盖的帧区间首号。播出时刻要靠它反推——
             // 没有这个映射，只知道"某个缓冲播完了"，不知道是哪段音频。
             var bufStart = new long[slots];
+            var bufSubmit = new double[slots];   // 各缓冲的提交时刻，用于算"提交→播完"
             int framesPerBuf = Math.Max(1, (bufBytes / Math.Max(1, channels * 2)));
             try
             {
@@ -750,6 +751,7 @@ namespace Snad
                     // 预填充：首轮就有队列，避免起播卡顿
                     var first = pull();
                     bufStart[i] = meter != null ? meter.OnBufferSubmitted(framesPerBuf) : 0;
+                    bufSubmit[i] = SnadLatencyMeter.NowMs();
                     bufs[i].Submit(first == null ? new byte[bufBytes] : Fit(first, bufBytes));
                 }
 
@@ -767,14 +769,36 @@ namespace Snad
                         // 轮询间隔 1 ms，因此这里的时间戳误差不超过一个轮询周期。
                         if (meter != null)
                         {
+                            double doneMs = SnadLatencyMeter.NowMs();
+                            // 先结算"提交→播完"这一段：它含设备缓冲，
+                            // 是一个独立可报的实测 span，不依赖包映射。
+                            meter.OnBufferFinished(bufSubmit[i], doneMs);
+
                             bool cal = meter.Sync != null && meter.Sync.HasCalibration;
                             meter.OnBufferDone(bufStart[i], framesPerBuf,
-                                               SnadLatencyMeter.NowMs(), cal,
+                                               doneMs, cal,
                                                meter.Sync != null ? meter.Sync.OffsetMs : 0);
+
+                            // 五段结算：这一块播完，把它对应的 S3/S4/S5 与端到端一起记账。
+                            if (meter.Spans != null)
+                                meter.Spans.OnBlockDone(doneMs, cal,
+                                                        meter.Sync != null ? meter.Sync.OffsetMs : 0,
+                                                        meter.Sync != null ? meter.Sync.BestRttMs : 0);
                         }
 
                         var data = pull();
                         if (data == null) continue;
+
+                        // 读出一块：登记读出时刻，并查出它对应的包（写入时刻+手机采集时刻）。
+                        double readMs = SnadLatencyMeter.NowMs();
+                        if (meter != null && meter.Spans != null)
+                        {
+                            double wMs; uint pTs;
+                            bool mapped = meter.Spans.TryLookup(bufStart[i], out wMs, out pTs);
+                            meter.Spans.OnBlockRead(bufStart[i], mapped, wMs, pTs);
+                            meter.Spans.MarkReadNow(readMs);
+                        }
+
                         var fitted = Fit(data, bufBytes);
 
                         // 均衡器就地处理。放在提交与可视化回调之前，
@@ -792,6 +816,8 @@ namespace Snad
                         }
 
                         bufStart[i] = meter != null ? meter.OnBufferSubmitted(framesPerBuf) : 0;
+                        bufSubmit[i] = SnadLatencyMeter.NowMs();
+                        if (meter != null && meter.Spans != null) meter.Spans.MarkSubmitNow(bufSubmit[i]);
                         bufs[i].Submit(fitted);
                         // 通知 GUI：这块音频即将播放，可用于绘制波形/频谱。
                         // 回调抛异常不能影响播放，因此单独捕获并只提示有限次数。
@@ -1171,6 +1197,9 @@ namespace Snad
         private long _lastArrivalMs;                       // 最近一包到达时刻（本机单调 ms）
         private uint _lastPhoneTsMs;                       // 该包的采集时刻
 
+        /// <summary>五段测量器：到达→写、写→读、读→提交、提交→播完 + 对账。</summary>
+        private SnadSpanMeter _spanMeter;
+
         /// <summary>时钟校准器。收到第一个音频包时创建（此时才知道手机地址）。</summary>
         private SnadClockSync _clockSync;
         private long _clockSyncStartFailures;
@@ -1427,6 +1456,7 @@ namespace Snad
                             int capFrames = _profile.RingCapacityFrames(_sampleRate);
                             _ring = new SampleRing(capFrames);
                             _latencyMeter = new SnadLatencyMeter(_sampleRate);
+                            _latencyMeter.Spans = _spanMeter = new SnadSpanMeter(_sampleRate);
                             _prebufferFrames = _profile.PrebufferFrames(_sampleRate);
                             _formatLogged = true;
                             _ringReady = true;   // 此刻起 _ring 才可被安全访问
@@ -1470,10 +1500,11 @@ namespace Snad
 
                         // 登记到延迟计：首帧号 + 手机采集时刻。
                         // 帧号用写入前的累计值，与播放侧"已读帧数"同一套编号。
+                        long pktStartFrame = -1;
                         if (_latencyMeter != null)
                         {
-                            long startFrame = Interlocked.Read(ref _framesIn);
-                            _latencyMeter.OnPacket(phoneTsMs, startFrame);
+                            pktStartFrame = Interlocked.Read(ref _framesIn);
+                            _latencyMeter.OnPacket(phoneTsMs, pktStartFrame);
                         }
 
                         // 第一个音频包带来了手机地址——从这一刻起才能做时钟校准，
@@ -1536,7 +1567,15 @@ namespace Snad
                             if (ov <= 3 || ov % 100 == 0)
                                 Logger.Warn("环形缓冲已满，丢弃第 " + ov + " 个包（可用 " +
                                             _ring.AvailableFrames + " 帧 / 容量 " + _ring.CapacityFrames +
-                                            " 帧）。持续出现说明播放侧未跟上");
+                                            " 帧）。持续出现说明播放侧未跟上");                        }
+
+                        // S2：到达 → 写入完成；同时把(帧号, 写入时刻, 采集时刻)交给
+                        // 五段测量器，供播放侧按帧号查出 S3 的起点。
+                        if (_spanMeter != null && pktStartFrame >= 0)
+                        {
+                            double wroteMs = NowMs();
+                            _spanMeter.AddArrivalToWrite(wroteMs - _lastArrivalMs);
+                            _spanMeter.OnPacketWritten(pktStartFrame, wroteMs, phoneTsMs);
                         }
 
                         var now = DateTime.UtcNow;
@@ -1623,19 +1662,27 @@ namespace Snad
                                             (calibrated ? "" : "（未校准：含手机与 PC 的时钟差）") +
                                             "；待结算包 " + _latencyMeter.Orphans + " 个孤儿");
 
-                                // 逐段剖分：每段独立来源，合计 = 各段之和。
-                                // 它的用途是看"延迟长在哪"，而不是只给一个总数。
-                                if (calibrated)
+                                // 逐段分解：只报**确实测到的**段，并明确说明还缺哪几段。
+                                //
+                                // 这里之前打过一个"合计 402.6 ms"——其中声卡设备是常数、
+                                // 池是假设、手机段算成负数被截零。三项假的相加还宣称是
+                                // 端到端，那是在编数。现在只列实测项，不给总数：
+                                // 五段剖分（到达→写入、写入→读出、读出→提交、提交→播完）
+                                // 还没实现，端到端合计暂时不可用。
+                                if (calibrated && _spanMeter != null)
                                 {
-                                    double ringMs = _ring.AvailableFrames * 1000.0 / Math.Max(1, _sampleRate);
-                                    double poolMs = _profile.WaveOutBuffers * (double)_profile.BlockMs;
-                                    double total;
-                                    string bd = SnadLatencyMeter.Breakdown(
-                                        _lastArrivalMs - _lastPhoneTsMs,
-                                        _clockSync.OffsetMs, _clockSync.BestRttMs,
-                                        ringMs, poolMs, DeviceBufferEstimateMs,
-                                        out total);
-                                    Logger.Info("[延迟分解] 各段实测/可算值：\n" + bd);
+                                    double unaccounted;
+                                    string rep = _spanMeter.TakeReport(true, _clockSync.BestRttMs, out unaccounted);
+                                    Logger.Info("[延迟分段] " + rep);
+
+                                    // 对账门禁：五段之和与端到端差得太多，说明有段没插桩
+                                    // 或映射断了，这时**不报端到端数字**，只报差值。
+                                    if (Math.Abs(unaccounted) > 20)
+                                    {
+                                        Logger.Warn(string.Format(CultureInfo.InvariantCulture,
+                                            "[延迟分段] 对账不通过：未归因 {0:F1} ms（>20 ms），" +
+                                            "端到端数字本轮不可信，已拒绝输出", unaccounted));
+                                    }
                                 }
                             }
 

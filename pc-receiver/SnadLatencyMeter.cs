@@ -23,6 +23,12 @@ namespace Snad
         /// </summary>
         public SnadClockSync Sync;
 
+        /// <summary>
+        /// 逐段测量器。挂在 meter 上带进静态播放线程——
+        /// 播放线程拿不到接收器实例，只能经由这个共享点访问。
+        /// </summary>
+        public SnadSpanMeter Spans;
+
         /// <summary>本机单调毫秒。播放线程用它算缓冲完成时刻。</summary>
         public static double NowMs()
         {
@@ -46,6 +52,14 @@ namespace Snad
         /// <summary>已读出的总帧数，用于给每个缓冲分配帧区间。</summary>
         private long _framesRead;
 
+        // ---- 段：提交 → 播完（含声卡设备）----
+        //
+        // WOM_DONE 触发时，这块缓冲里的音频已经真正播出，所以这一段
+        // **已经包含设备缓冲**，不需要另外假设一个"设备 12 ms"。
+        // 这是目前唯一插好桩的 PC 内部段，先把它报出来。
+        private double _bufDurSum, _bufDurMin = double.MaxValue, _bufDurMax;
+        private long _bufDurCount;
+
         public SnadLatencyMeter(int sampleRate) { _rate = Math.Max(1, sampleRate); }
 
         /// <summary>缓冲已提交时登记它的帧区间，返回该区间的首帧号。</summary>
@@ -54,6 +68,38 @@ namespace Snad
             long start;
             lock (_gate) { start = _framesRead; _framesRead += frames; }
             return start;
+        }
+
+        /// <summary>
+        /// 结算"提交 → 播完"这一段，并返回该缓冲的时长（ms）。
+        /// 调用方传入提交时刻；这里只做统计，不参与包结算。
+        /// </summary>
+        public double OnBufferFinished(double submitMs, double doneMs)
+        {
+            double dur = doneMs - submitMs;
+            if (dur < 0) dur = 0;
+            lock (_gate)
+            {
+                _bufDurSum += dur;
+                if (dur < _bufDurMin) _bufDurMin = dur;
+                if (dur > _bufDurMax) _bufDurMax = dur;
+                _bufDurCount++;
+            }
+            return dur;
+        }
+
+        /// <summary>取出并清空"提交→播完"窗口统计。</summary>
+        public string TakeBufferWindow()
+        {
+            lock (_gate)
+            {
+                if (_bufDurCount == 0) return null;
+                string s = string.Format(CultureInfo.InvariantCulture,
+                    "提交→播完（含设备）样本 {0}，均 {1:F1} ms，最小 {2:F1}，最大 {3:F1}",
+                    _bufDurCount, _bufDurSum / _bufDurCount, _bufDurMin, _bufDurMax);
+                _bufDurCount = 0; _bufDurSum = 0; _bufDurMin = double.MaxValue; _bufDurMax = 0;
+                return s;
+            }
         }
 
         /// <summary>收到音频包时登记它的首帧号与手机采集时刻。</summary>
