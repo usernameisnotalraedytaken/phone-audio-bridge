@@ -338,18 +338,35 @@ namespace Snad
             var fNorm = Theme.Metric(8.5f);
 
             // ---- 布局度量：全部由字体实测推导，不写死像素 ----
-            _pad = 12;
+            //
+            // 这里刻意不出现"180""80""6"这类数字。
+            // 写死的值在换字体、换 DPI、换语言时必然错位，而且错位方式是**裁字**，
+            // 用户看到的是半个按钮标签，不是报错——最难发现的那种。
+            _pad = Math.Max(8, (int)Math.Round(fNorm.Height * 0.85));
             _rowH = Math.Max(26, (int)Math.Ceiling(Math.Max(fLabel.Height, fNorm.Height) * 1.9f));
-            _listW = 180;
 
             int labelW = 0;
+            int listW = 0;
             using (var g = CreateGraphics())
+            {
                 foreach (var f in _fields)
                 {
                     int w = (int)Math.Ceiling(g.MeasureString(f.Label, fLabel).Width);
                     if (w > labelW) labelW = w;
                 }
-            _labelW = labelW + 10;
+                _labelW = labelW + _pad;
+
+                // 列表宽度按**最长的档位名**实测，而不是猜一个数字。
+                // 用户自己起的名字可能比内置档位长得多。
+                int wname = (int)Math.Ceiling(g.MeasureString("PROFILES", fNorm).Width);
+                foreach (var pr in _profiles.Values)
+                {
+                    int w = (int)Math.Ceiling(g.MeasureString(pr.Name, fNorm).Width);
+                    if (w > wname) wname = w;
+                }
+                listW = wname + _pad * 2;
+            }
+            _listW = listW;
 
             // ---- 顶部说明 ----
             var head = new Label
@@ -556,7 +573,7 @@ namespace Snad
 
             int w = ClientSize.Width, h = ClientSize.Height;
             int headH = Math.Max(30, (int)Math.Ceiling(Theme.Label(8f).Height * 2.2f));
-            int btnH = _rowH + 4;
+            int btnH = _rowH + Math.Max(2, _rowH / 6);
             int footH = _rowH * 3 + btnH + _pad * 2;   // 原因 + 摘要 + 分解 + 按钮行
 
             head.Bounds = new Rectangle(0, 0, w, headH);
@@ -564,17 +581,18 @@ namespace Snad
             int bodyTop = headH;
             int bodyH = Math.Max(120, h - headH - footH);
 
-            _list.Bounds = new Rectangle(_pad, bodyTop + _pad, _listW, Math.Max(60, bodyH - _pad * 2));
+            int thin = Math.Max(1, _pad / 6);
+            _list.Bounds = new Rectangle(_pad, bodyTop + _pad, _listW, Math.Max(_rowH * 2, bodyH - _pad * 2));
 
             int contentX = _pad + _listW + _pad;
-            int contentW = Math.Max(220, w - contentX - _pad);
-            _content.Bounds = new Rectangle(contentX, bodyTop + _pad, contentW, Math.Max(60, bodyH - _pad * 2));
+            int contentW = Math.Max(_labelW * 2, w - contentX - _pad);
+            _content.Bounds = new Rectangle(contentX, bodyTop + _pad, contentW, Math.Max(_rowH * 2, bodyH - _pad * 2));
 
             int sumTop = bodyTop + bodyH;
             // 顺序：原因 → 延迟摘要 → 分解 → 按钮
-            _notes.Bounds = new Rectangle(_pad, sumTop, Math.Max(80, w - _pad * 2), _rowH);
-            _summary.Bounds = new Rectangle(0, sumTop + _rowH, Math.Max(80, w), _rowH + 2);
-            _breakdown.Bounds = new Rectangle(0, sumTop + _rowH * 2 + 2, Math.Max(80, w), _rowH);
+            _notes.Bounds = new Rectangle(_pad, sumTop, Math.Max(_rowH * 3, w - _pad * 2), _rowH);
+            _summary.Bounds = new Rectangle(0, sumTop + _rowH, Math.Max(_rowH * 3, w), _rowH + thin);
+            _breakdown.Bounds = new Rectangle(0, sumTop + _rowH * 2 + thin, Math.Max(_rowH * 3, w), _rowH);
 
             int btnY = h - btnH - _pad;
 
@@ -582,11 +600,23 @@ namespace Snad
             //   左侧：档位生命周期（新建/复制/重命名/重置/删除/导入/导出）
             //   右侧：本次编辑（撤销/保存）
             // 混在一排会让"删掉整个档位"和"撤销一个字段"看起来同等危险。
-            const int bw = 80, gap = 6;
+            //
+            // 按钮宽度按**最宽的标签**实测。写死宽度会在换字体或加按钮时裁字，
+            // 而裁掉的往往正好是最后一个字母，看起来像拼写错误。
             var leftGroup = new FlatButton[]
             {
                 _newBtn, _copyBtn, _renameBtn, _deleteBtn, _resetBtn, _exportBtn, _importBtn
             };
+            int bw = 0, gap;
+            using (var g2 = CreateGraphics())
+            {
+                foreach (var b in leftGroup)
+                    bw = Math.Max(bw, (int)Math.Ceiling(g2.MeasureString(b.Text, b.Font).Width));
+                bw = Math.Max(bw, (int)Math.Ceiling(g2.MeasureString(_saveBtn.Text, _saveBtn.Font).Width));
+                bw = Math.Max(bw, (int)Math.Ceiling(g2.MeasureString(_revertBtn.Text, _revertBtn.Font).Width));
+            }
+            bw += _pad * 2;
+            gap = Math.Max(2, _pad / 2);
             int bx = _pad;
             foreach (var b in leftGroup)
             {
@@ -623,8 +653,14 @@ namespace Snad
             var live = _fields.FindAll(f => !f.Restart);
             var cold = _fields.FindAll(f => f.Restart);
 
-            int gap = 30;
-            int colW = Math.Max(230, (cw - gap) / 2);
+            int gap = _pad * 2;
+
+            // 列宽下限由内容实测：标签列 + 最长的枚举取值（如 wasapi_exclusive）。
+            // 这个值与"最小窗口宽度"必须用**同一个**来源，
+            // 否则会出现"列按内容变宽了、窗口最小宽度还是旧的"，
+            // 结果右列被裁掉——实测就是这么裁的（右列输入框全部看不见）。
+            int needW = MeasureColumnNeed();
+            int colW = Math.Max(needW, (cw - gap) / 2);
             int editorH = Math.Max(20, _rowH - 4);
 
             LayoutSection("APPLIES IMMEDIATELY", "Tweak while audio is playing",
@@ -1247,6 +1283,33 @@ namespace Snad
         /// 两列的行数是不对称的（热改项比需重启项多），所以不能对两列取平均，
         /// 也不能写死——字段表一变，写死的值就会开始裁内容。
         /// </summary>
+        /// <summary>
+        /// 一列需要的宽度下限：标签列 + 最长的枚举取值 + 留白。
+        ///
+        /// 布局与"最小窗口宽度"都调它。两边各算一次必然走偏——
+        /// 实测过一次：列按内容变宽了，最小宽度还是旧的，右列整列被裁掉。
+        /// </summary>
+        private int MeasureColumnNeed()
+        {
+            if (_labelW <= 0) return 0;
+            var fNorm = Theme.Metric(8.5f);
+            using (var g = CreateGraphics())
+            {
+                int widest = 0;
+                foreach (var f in _fields)
+                {
+                    // 设备名长度无上界（用户可能装一堆虚拟声卡），它在下拉里按省略号显示，
+                    // 因此不该由它决定列宽——否则窗口最小宽度会被一台设备名撑到离谱。
+                    if (string.Equals(f.Key, "device", StringComparison.OrdinalIgnoreCase))
+                        continue;
+                    foreach (var o in f.Options)
+                        widest = Math.Max(widest, (int)Math.Ceiling(g.MeasureString(o, fNorm).Width));
+                }
+                if (widest == 0) widest = (int)Math.Ceiling(g.MeasureString("000000", fNorm).Width);
+                return _labelW + widest + _pad * 4;
+            }
+        }
+
         private void ApplyContentMinimumSize()
         {
             int hot = 0, cold = 0;
@@ -1266,11 +1329,17 @@ namespace Snad
             // 压到面板边缘并被裁掉（实测就是这样，RATIO MAX 只剩半行可见）
             contentH += _rowH;
             int headH = Math.Max(30, (int)Math.Ceiling(Theme.Label(8f).Height * 2.2f));
-            int btnH = _rowH + 4;
+            int btnH = _rowH + Math.Max(2, _rowH / 6);
             int footH = _rowH * 3 + btnH + _pad * 2;
 
             int minH = headH + contentH + _pad * 2 + footH;
-            int minW = _pad + _listW + _pad + 2 * 240 + 30 + _pad;   // 列表 + 两列各 240 + 间距
+            // 列表 + 两列 + 间距，全部由实测宽度推导（原来写死 2*240+30）
+            // 列表 + 两列 + 间距，全部由实测宽度推导。
+            // 列宽这里必须与布局用同一个 MeasureColumnNeed()——
+            // 之前用 2*(_pad*18) 是个估算值，比实际需要窄，右列因此被裁。
+            int colNeed = MeasureColumnNeed();
+            if (colNeed <= 0) colNeed = _pad * 18;
+            int minW = _pad + _listW + _pad + 2 * colNeed + _pad * 2 + _pad;
 
             var size = new Size(Math.Max(MinimumSize.Width, minW), Math.Max(MinimumSize.Height, minH));
             MinimumSize = size;
