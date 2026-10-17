@@ -26,6 +26,34 @@ namespace Snad
         /// <summary>抖动缓冲目标水位（毫秒）。这是延迟的最大单项。</summary>
         public int TargetBufferMs = 80;
 
+        // ---- 缓冲策略 ----
+        //
+        // 目标水位由谁来定，本身就是个可配置的选择：
+        //   static      固定用 TargetBufferMs（行为与 v2.0 一致，可预测）
+        //   adaptive    按实测抖动自动调整，受 min/max 约束
+        //   calibrated  启动时观察一段时间，锁定一个够用的深度
+        //
+        // 回环实测（LATENCY-MEASURED.md）表明缓冲池不是稳态延迟，
+        // 真正决定延迟的是这个水位——所以它才是该被策略化的那个量。
+
+        /// <summary>缓冲策略：static / adaptive / calibrated。</summary>
+        public string BufferMode = "static";
+
+        /// <summary>自适应/标定时的下限（毫秒）。</summary>
+        public int MinBufferMs = 40;
+
+        /// <summary>自适应/标定时的上限（毫秒）。</summary>
+        public int MaxBufferMs = 200;
+
+        /// <summary>
+        /// 自适应调整速度（0..1）。每次调整把目标往期望值移动这个比例，
+        /// 太小收敛慢、太大容易振荡。
+        /// </summary>
+        public double AdaptRate = 0.2;
+
+        /// <summary>标定观察时长（秒）。到时锁定并停止调整。</summary>
+        public int CalibrateSec = 10;
+
         /// <summary>起播前预填充量（毫秒）。越大起播越稳、等待越久。</summary>
         public int PrebufferMs = 60;
 
@@ -392,6 +420,33 @@ namespace Snad
                     if (int.TryParse(val, out iv)) p.TargetBufferMs = iv;
                     else Logger.Warn("第 " + lineNo + " 行 targetbuffer 不是整数：" + val);
                     break;
+                case "buffermode":
+                    {
+                        string m = val.Trim().ToLowerInvariant();
+                        if (m == "static" || m == "adaptive" || m == "calibrated")
+                            p.BufferMode = m;
+                        else
+                            Logger.Warn("第 " + lineNo + " 行 buffermode 取值无效：" + val +
+                                        "（应为 static / adaptive / calibrated），已忽略");
+                        break;
+                    }
+                case "minbuffer":
+                    if (int.TryParse(val, out iv)) p.MinBufferMs = Math.Max(5, iv);
+                    else Logger.Warn("第 " + lineNo + " 行 minbuffer 不是整数：" + val);
+                    break;
+                case "maxbuffer":
+                    if (int.TryParse(val, out iv)) p.MaxBufferMs = Math.Max(10, iv);
+                    else Logger.Warn("第 " + lineNo + " 行 maxbuffer 不是整数：" + val);
+                    break;
+                case "adaptrate":
+                    if (double.TryParse(val, NumberStyles.Float, CultureInfo.InvariantCulture, out dv))
+                        p.AdaptRate = Math.Max(0.01, Math.Min(1.0, dv));
+                    else Logger.Warn("第 " + lineNo + " 行 adaptrate 不是数字：" + val);
+                    break;
+                case "calibratesec":
+                    if (int.TryParse(val, out iv)) p.CalibrateSec = Math.Max(1, iv);
+                    else Logger.Warn("第 " + lineNo + " 行 calibratesec 不是整数：" + val);
+                    break;
                 case "prebuffer":
                     if (int.TryParse(val, out iv)) p.PrebufferMs = iv;
                     else Logger.Warn("第 " + lineNo + " 行 prebuffer 不是整数：" + val);
@@ -727,6 +782,13 @@ namespace Snad
 
             // 延迟相关
             list.Add(kv("targetbuffer", p.TargetBufferMs.ToString(ci)));
+
+            // 缓冲策略
+            list.Add(kv("buffermode", p.BufferMode));
+            list.Add(kv("minbuffer", p.MinBufferMs.ToString(ci)));
+            list.Add(kv("maxbuffer", p.MaxBufferMs.ToString(ci)));
+            list.Add(kv("adaptrate", p.AdaptRate.ToString("0.###", ci)));
+            list.Add(kv("calibratesec", p.CalibrateSec.ToString(ci)));
             list.Add(kv("prebuffer", p.PrebufferMs.ToString(ci)));
             list.Add(kv("ringcapacity", p.RingCapacityMs.ToString(ci)));
             list.Add(kv("block", p.BlockMs.ToString(ci)));

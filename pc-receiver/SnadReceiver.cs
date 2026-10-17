@@ -1342,6 +1342,12 @@ namespace Snad
         private int _seqExpected = -1;
         private long _seqGaps, _seqMissing;
 
+        /// <summary>
+        /// 最近一次缓冲策略的状态，供周期日志打印。
+        /// adaptive/calibrated 会随时间变化，只写一次启动值是看不出它是否收敛的。
+        /// </summary>
+        private volatile string _lastPolicyStatus = "";
+
         // ------------------------------------------------------------------ 到达时间统计
         //
         // 目的：把"网络与发送侧的抖动"变成可读数字，从而回答"缓冲该留多深"。
@@ -1763,6 +1769,11 @@ namespace Snad
                                     jit, span, drift));
                             }
 
+                            // 缓冲策略状态：adaptive/calibrated 的目标会随时间变化，
+                            // 只写一行启动值是看不出它有没有收敛的
+                            if (!string.IsNullOrEmpty(_lastPolicyStatus))
+                                Logger.Info("[缓冲策略] " + _lastPolicyStatus);
+
                             _lastFramesIn = fIn;
                             _lastFramesWritten = fWr;
                             _lastFramesRead = fRd;
@@ -1826,15 +1837,19 @@ namespace Snad
                 // 每块时长、缓冲个数、轮询间隔、水位与漂移摆幅全部取自 profile，
                 // 因此换场景只需换档位，不必改代码。
                 int framesPerBuffer = _profile.BlockFrames(_sampleRate);
-                int targetFrames = _profile.TargetFrames(_sampleRate);
                 double gain = _profile.DriftGain;
                 double range = _profile.DriftRange;
 
+                // 目标水位不再是一个固定的数，而由策略给出：
+                // static 固定、adaptive 持续跟、calibrated 标定后锁定。
+                // 之所以值得策略化，是因为回环实测表明声卡池不是稳态延迟，
+                // 真正决定延迟的就是这个水位。
+                var policy = BufferPolicyFactory.Create(_profile);
+
                 Logger.Info(string.Format(
-                    "播放参数：每块 {0} 帧（{1} ms）、目标水位 {2} 帧（{3} ms）、" +
-                    "漂移摆幅 ±{4}%、增益 {5}",
+                    "播放参数：每块 {0} 帧（{1} ms）、缓冲策略 {2}、漂移摆幅 ±{3}%、增益 {4}",
                     framesPerBuffer, framesPerBuffer * 1000 / _sampleRate,
-                    targetFrames, _profile.TargetBufferMs, range * 100, gain));
+                    policy.Status(), range * 100, gain));
 
                 WaveOut.Play(_deviceIndex, () => _sampleRate, () => _channels, () =>
                 {
@@ -1853,13 +1868,29 @@ namespace Snad
                     // （丢帧 3129 帧），说明余量不足以吸收 Windows 线程调度抖动；
                     // 120 ms 则从未欠载但延迟偏高。80 ms 是两者之间的折中。
                     int avail = _ring.AvailableFrames;
+
+                    // 目标水位每块向策略要一次：adaptive/calibrated 会据此更新
+                    int targetFrames = _sampleRate * policy.TargetMs / 1000;
+                    if (targetFrames < 1) targetFrames = 1;
+
                     double ratio = 1.0 + (avail - targetFrames) / (double)Math.Max(1, targetFrames) * gain;
                     double hi = 1.0 + range, lo = 1.0 - range;
                     if (ratio > hi) ratio = hi;
                     if (ratio < lo) ratio = lo;
 
                     var buf = new byte[framesPerBuffer * 4];
+                    long urBefore = _ring.UnderrunEvents;
                     _ring.Read(buf, framesPerBuffer, ratio);
+
+                    // 用读取前的可用帧回报观测：掉坑深度就是从这一刻的欠载余量
+                    policy.Observe(avail, _sampleRate);
+
+                    // 把"刚刚真的读空了"告诉策略。
+                    // 只靠水位观测不够：水位是读取瞬间的采样，块内被读空它看不见，
+                    // 于是策略会在已经欠载的情况下继续往低处压（实测欠载 8 次仍在压）。
+                    long urAfter = _ring.UnderrunEvents;
+                    for (long u = urBefore; u < urAfter; u++) policy.NotifyUnderrun();
+                    _lastPolicyStatus = policy.Status();
                     return buf;
                 }, _cts.Token, _profile, AudioBlockReady, Equalizer);
             }

@@ -49,6 +49,13 @@ namespace Snad
 
         private static int _sent, _dropped, _reordered;
 
+        /// <summary>一个待发出去的包，连同它的释放时刻。</summary>
+        private sealed class PendingPkt
+        {
+            public double ReleaseAt;      // 相对发送器启动的毫秒数
+            public byte[] Payload;
+        }
+
         private static int Main(string[] args)
         {
             if (args.Length < 1)
@@ -62,6 +69,7 @@ namespace Snad
             double seconds = 10;
             int blockMs = 21;
             double lossPct = 0, jitterMs = 0, reorderPct = 0;
+            double baseDelayMs = 80;      // 抖动摆动的基准，需 ≥ 最大抖动
             double toneHz = 440;
             int timestampOffsetMs = 0;
             bool silent = false;
@@ -77,6 +85,7 @@ namespace Snad
                     case "块": case "block": blockMs = int.Parse(v); break;
                     case "丢包": case "loss": lossPct = double.Parse(v, CultureInfo.InvariantCulture); break;
                     case "抖动": case "jitter": jitterMs = double.Parse(v, CultureInfo.InvariantCulture); break;
+                    case "基准延迟": case "base": baseDelayMs = double.Parse(v, CultureInfo.InvariantCulture); break;
                     case "乱序": case "reorder": reorderPct = double.Parse(v, CultureInfo.InvariantCulture); break;
                     case "音调": case "tone": toneHz = double.Parse(v, CultureInfo.InvariantCulture); break;
                     case "时间戳偏移": case "tsoffset": timestampOffsetMs = int.Parse(v); break;
@@ -97,7 +106,8 @@ namespace Snad
                               payloadBytes + " 字节）");
             Console.WriteLine("  音调      " + toneHz.ToString("F0") + " Hz" + (silent ? "（静默）" : ""));
             Console.WriteLine("  丢包      " + lossPct.ToString("F1") + " %");
-            Console.WriteLine("  抖动      0.." + jitterMs.ToString("F1") + " ms 随机（独立，不追补）");
+            Console.WriteLine("  抖动      0.." + jitterMs.ToString("F1") + " ms 随机（叠加在基准延迟上）");
+            Console.WriteLine("  基准延迟  " + baseDelayMs.ToString("F1") + " ms（抖动摆动空间，需 ≥ 最大抖动）");
             Console.WriteLine("  乱序      " + reorderPct.ToString("F1") + " %");
             if (timestampOffsetMs != 0)
                 Console.WriteLine("  时间戳偏移 " + timestampOffsetMs + " ms（故意错开，用于验证测量）");
@@ -127,71 +137,80 @@ namespace Snad
                 var sw = System.Diagnostics.Stopwatch.StartNew();
                 var startWall = DateTime.UtcNow;
 
-                // 乱序用的小延迟队列
-                var held = new List<byte[]>();
+                // 发送队列：采集与发送必须分开两个线程。
+                //
+                // 抖动是"包已按固定节拍产生、路上各自被耽搁"，因此
+                // 采集时刻必须严格每 blockMs 一次，而释放时刻 = 采集 + 基础延迟 + 抖动。
+                // 单线程做不到：等完基础延迟就赶不上下一次采集，
+                // 于是采集节拍被拖慢、平均吞吐塌掉（实测吞吐掉到 73%，
+                // 接收端被饿死——测到的已不是网络，而是源跟不上实时）。
+                var queue = new System.Collections.Concurrent.BlockingCollection<PendingPkt>();
+                var sender = new Thread(() =>
+                {
+                    try
+                    {
+                        foreach (var item in queue.GetConsumingEnumerable())
+                        {
+                            while (sw.Elapsed.TotalMilliseconds < item.ReleaseAt) Thread.Sleep(1);
+                            TrySend(sock, target, item.Payload);
+                            _sent++;
+                        }
+                    }
+                    catch { }
+                }) { IsBackground = true, Name = "snad-send" };
+                sender.Start();
 
                 int packets = (int)(seconds * 1000 / blockMs);
 
                 long nextSendMs = 0;
                 for (int p = 0; p < packets; p++)
                 {
-                    // 节奏：采集时刻严格每 blockMs 一次。
-                    //
-                    // 采集必须按固定时钟走——真实手机的采集缓冲是固定节拍，
+                    // 采集时刻严格每 blockMs 一次：真实手机的采集缓冲是固定节拍，
                     // 抖动发生在**采集之后**的网络传输上。
-                    // 因此这里先等到采集时刻、打时间戳，再施加传输延迟。
                     while (sw.ElapsedMilliseconds < nextSendMs) Thread.Sleep(1);
                     nextSendMs += blockMs;
 
-                    bool drop = rnd.NextDouble() * 100 < lossPct;
+                    // 采集时刻要在施加传输延迟**之前**取。
+                    // 若先延迟再打时间戳，这个包看起来只是"采集得更晚"，
+                    // 接收端算出的 arrival − timestamp 完全不变，注入等于没做。
+                    double captureAt = sw.Elapsed.TotalMilliseconds;
 
+                    bool drop = rnd.NextDouble() * 100 < lossPct;
                     if (!drop)
                     {
                         FillTone(pcm, framesPerPacket, channels, toneHz, ref phase, silent);
 
-                        // 时间戳 = 采集时刻（手机侧单调时钟低 32 位），在施加传输抖动**之前**取。
-                        //
-                        // 这一点是注入能否生效的关键：若先延迟再打时间戳，
-                        // 这个包看起来只是"采集得更晚"，接收端算出的
-                        // arrival − timestamp 完全不变，注入等于没做
-                        // ——实测注入 0/8/20ms 测到的抖动都是 0.3ms 正是此因。
-                        // 真实网络是"包已按固定节拍产生，路上被耽搁"，
-                        // 所以先打戳、后延迟。
-                        int ts = (int)((sw.ElapsedMilliseconds + timestampOffsetMs) & 0xFFFFFFFFL);
-
-                        // 传输抖动：独立随机延迟，不追补
-                        if (jitterMs > 0)
-                        {
-                            double j = rnd.NextDouble() * jitterMs;
-                            if (j >= 0.5) Thread.Sleep((int)Math.Round(j));
-                        }
-
+                        long tsRaw = (long)captureAt + timestampOffsetMs;
+                        int ts = (int)(tsRaw & 0xFFFFFFFFL);
                         byte[] pkt = BuildPacket(channels, rate, seq, ts, payloadBytes, pcm);
+
+                        // 释放时刻 = 采集 + 基础延迟 + 独立抖动。
+                        // 基础延迟给抖动留出摆动空间，使平均到达间隔仍等于采集间隔；
+                        // 没有它时抖动会单向地把发送往后推，吞吐随之塌掉。
+                        double releaseAt = captureAt + baseDelayMs +
+                                           (jitterMs > 0 ? rnd.NextDouble() * jitterMs : 0);
 
                         if (reorderPct > 0 && rnd.NextDouble() * 100 < reorderPct)
                         {
-                            // 延后一个包再发，制造乱序
-                            held.Add(pkt);
+                            // 额外压后一点再发，制造乱序
+                            releaseAt += blockMs * 1.5;
                             _reordered++;
                         }
-                        else
-                        {
-                            TrySend(sock, target, pkt);
-                            _sent++;
-                            if (held.Count > 0)
-                            {
-                                foreach (var h in held) { TrySend(sock, target, h); _sent++; }
-                                held.Clear();
-                            }
-                        }
+
+                        queue.Add(new PendingPkt { ReleaseAt = releaseAt, Payload = pkt });
+
+                        // 正常情况下队列只有基础延迟/块长 那么几个包；
+                        // 超过这个量说明消费端落后，提示而不是无限堆积
+                        while (queue.Count > 64) Thread.Sleep(1);
                     }
                     else _dropped++;
 
                     seq++;
                 }
 
-                // 收尾：把还压着的包发出去
-                foreach (var h in held) { TrySend(sock, target, h); _sent++; }
+                // 收尾：队列里还没到点的包也要发出去，否则末尾会凭空丢一段
+                queue.CompleteAdding();
+                sender.Join(2000);
 
                 sw.Stop();
                 Console.WriteLine();

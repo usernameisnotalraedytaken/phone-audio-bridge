@@ -128,7 +128,8 @@ $audioCoreSources = @('SnadAudioSink.cs', 'SnadAudioCodec.cs', 'SnadAudioDevices
 
 # 接收器核心（Logger、接收循环、播放路径）。绝大多数工具都需要它。
 $receiverCoreSources = @('SnadReceiver.cs', 'SnadProfile.cs', 'SnadBeacon.cs', 'SnadBeaconService.cs',
-                         'SnadEq.cs', 'SnadSecret.cs', 'SnadArrivalStats.cs') + $audioCoreSources
+                         'SnadEq.cs', 'SnadSecret.cs', 'SnadArrivalStats.cs',
+                         'SnadBufferPolicy.cs') + $audioCoreSources
 
 # ---- 1) 控制台版（无 GUI，便于在无桌面环境或脚本中运行）----
 $consoleSources = $receiverCoreSources
@@ -217,6 +218,22 @@ if (Test-Path 'SnadLoopback.cs') {
     & $csc @lbArgs
     if ($LASTEXITCODE -ne 0) { throw "回环测量工具编译失败，csc 退出码 $LASTEXITCODE" }
     Install-Binary 'SnadLoopback.new.exe' 'SnadLoopback.exe'
+}
+
+# ---- 缓冲策略验证 ----
+#
+# 计划 §8 要求"抖动注入下跑三种策略，比较实测延迟与欠载次数"。
+# 端到端负责后者（接上去不炸、欠载不增加），但 adaptive/calibrated 的
+# 收敛行为依赖掉坑序列，端到端里那序列不可复现。因此收敛性用
+# 合成序列断言，结果确定、可解析核对。
+if ((Test-Path 'SnadBufferPolicyTest.cs') -and (Test-Path 'SnadBufferPolicy.cs')) {
+    $bpArgs = @('/nologo', '/target:exe', '/platform:x64', '/optimize+',
+                '/main:Snad.BufferPolicyTest', '/out:SnadBufferPolicyTest.new.exe', '/define:CONSOLE_BUILD')
+    foreach ($a in $coreRefs) { $bpArgs += ("/r:" + (Join-Path $fw $a)) }
+    $bpArgs += $receiverCoreSources + @('SnadBufferPolicyTest.cs')
+    & $csc @bpArgs
+    if ($LASTEXITCODE -ne 0) { throw "缓冲策略验证工具编译失败，csc 退出码 $LASTEXITCODE" }
+    Install-Binary 'SnadBufferPolicyTest.new.exe' 'SnadBufferPolicyTest.exe'
 }
 
 # ---- 到达统计验证 ----
