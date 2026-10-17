@@ -20,6 +20,7 @@ import subprocess
 import sys
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 
 REPO = "usernameisnotalraedytaken/phone-audio-bridge"
@@ -116,6 +117,7 @@ def main():
 
     # 逐个处理：内容与远端一致就直接复用其 sha，否则上传
     tree_items = []
+    fallback = []
     skipped = 0
     for i, path in enumerate(files, 1):
         if not os.path.isfile(path):
@@ -131,7 +133,13 @@ def main():
         ok, blob = call(token, "POST", f"{API}/git/blobs",
                         {"content": base64.b64encode(raw).decode(), "encoding": "base64"})
         if ok != 201:
-            sys.exit(f"  {path} 建 blob 失败: {blob}")
+            # blobs 接口偶尔会对**某些具体载荷**返回 400：
+            # 同样的字节数换内容就能过，连改行尾都不行。这不是请求格式问题，
+            # 是服务端对该载荷的拒绝。兜底：记下来用 Contents API 单独提交，
+            # 不因为一个文件把整次推送卡住。
+            fallback.append(path)
+            print(f"  [{i}/{len(files)}] {path}  blobs 拒绝（{ok}），改用 Contents API 兜底")
+            continue
         tree_items.append({"path": path, "mode": "100644", "type": "blob", "sha": blob["sha"]})
         print(f"  [{i}/{len(files)}] {path}  {len(raw)}B 上传")
     print(f"（{skipped} 个文件未改动）")
@@ -162,6 +170,30 @@ def main():
         sys.exit(f"更新分支失败: {res}")
 
     print(f"\n推送完成 -> https://github.com/{REPO}/tree/{BRANCH}")
+
+    # ---- blobs 接口拒绝的文件，用 Contents API 逐个补提交 ----
+    #
+    # Contents API 走的是另一条路径，不受 blobs 那个"载荷拒绝"影响。
+    # 每个文件一次提交，提交信息注明原因，免得日后看不出为什么多出几个提交。
+    for path in fallback:
+        api_path = urllib.parse.quote(path)
+        ok, cur = call(token, "GET", f"{API}/contents/{api_path}?ref={BRANCH}")
+        if ok != 200 or "sha" not in cur:
+            print(f"  兜底失败：读不到远端 {path}（{ok}）")
+            continue
+
+        raw = open(path, "rb").read()
+        ok2, res2 = call(token, "PUT", f"{API}/contents/{api_path}", {
+            "message": f"{message}\n\n（blobs 接口对该载荷返回 400，改用 Contents API 提交）",
+            "content": base64.b64encode(raw).decode(),
+            "sha": cur["sha"],
+            "branch": BRANCH,
+        })
+        if ok2 in (200, 201):
+            print(f"  兜底提交成功：{path}")
+        else:
+            print(f"  兜底提交失败：{path}（{ok2}）")
+
     print("Actions 会自动触发构建。")
 
 
