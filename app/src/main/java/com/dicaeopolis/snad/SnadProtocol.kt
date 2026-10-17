@@ -49,6 +49,35 @@ object SnadProtocol {
         return h
     }
 
+    // ---- v2 包头（26 字节）：前 22 字节与 v1 完全相同，追加位深 ----
+    //
+    //  22..23  format（u16）：0=pcm16 1=pcm24 2=pcm32 3=float32
+    //  24..25  flags（u16）：保留
+    //
+    // 只在位深不是 pcm16 时才用 v2：pcm16 继续发 v1，旧电脑端不受影响。
+    const val VERSION_V2: Byte = 2
+    const val HEADER_SIZE_V2 = 26
+
+    fun buildHeaderVersioned(channels: Int, sampleRate: Int, sequence: Int,
+                             timestampMs: Int, payloadBytes: Int, formatCode: Int): ByteArray {
+        if (formatCode == 0) {
+            return buildHeader(channels, sampleRate, sequence, timestampMs, payloadBytes)
+        }
+        val h = ByteArray(HEADER_SIZE_V2)
+        System.arraycopy(MAGIC, 0, h, 0, 4)
+        h[4] = VERSION_V2
+        h[5] = channels.toByte()
+        putIntLE(h, 6, sampleRate)
+        putIntLE(h, 10, sequence)
+        putIntLE(h, 14, timestampMs)
+        putIntLE(h, 18, payloadBytes)
+        h[22] = (formatCode and 0xFF).toByte()
+        h[23] = ((formatCode ushr 8) and 0xFF).toByte()
+        h[24] = 0
+        h[25] = 0
+        return h
+    }
+
     /**
      * 文本包固定 14 字节头（与音频包头不同，用 type 字段区分）：
      *   0..3   magic "SNAD"

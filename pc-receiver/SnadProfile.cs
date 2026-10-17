@@ -147,6 +147,15 @@ namespace Snad
         /// <summary>前置增益（dB），用于补偿整体提升导致的削波。</summary>
         public double EqPreampDb = 0;
 
+        /// <summary>
+        /// 位深下转时的抖动（计划 §1.5）。默认关闭。
+        ///
+        /// 只在输入精度高于 16bit 时生效——pcm24/float32 落到 16bit 输出上必须量化，
+        /// 加 TPDF 抖动可把与信号相关的量化失真打散为白噪声；
+        /// pcm16 输入本身就在 16bit 网格上，加抖动只是白添噪声。
+        /// </summary>
+        public bool Dither = false;
+
         public int TargetFrames(int sampleRate) { return Math.Max(1, sampleRate * TargetBufferMs / 1000); }
         public int PrebufferFrames(int sampleRate) { return Math.Max(1, sampleRate * PrebufferMs / 1000); }
         public int RingCapacityFrames(int sampleRate) { return Math.Max(1024, sampleRate * RingCapacityMs / 1000); }
@@ -540,6 +549,14 @@ namespace Snad
                     if (int.TryParse(val, out iv)) p.CalibrateSec = Math.Max(1, iv);
                     else Logger.Warn("第 " + lineNo + " 行 calibratesec 不是整数：" + val);
                     break;
+                case "dither":
+                    {
+                        string d = val.Trim().ToLowerInvariant();
+                        if (d == "on" || d == "true" || d == "1") p.Dither = true;
+                        else if (d == "off" || d == "false" || d == "0") p.Dither = false;
+                        else Logger.Warn("第 " + lineNo + " 行 dither 取值无效：" + val + "（应为 on/off）");
+                        break;
+                    }
                 case "outputleg":
                     if (int.TryParse(val, out iv) && iv > 0) p.OutputLegMs = iv;
                     else Logger.Warn("第 " + lineNo + " 行 outputleg 应为正整数：" + val);
@@ -916,6 +933,7 @@ namespace Snad
 
             // 均衡器
             list.Add(kv("eq", p.EqEnabled ? "on" : "off"));
+            list.Add(kv("dither", p.Dither ? "on" : "off"));
             list.Add(kv("eqpreamp", p.EqPreampDb.ToString("0.#", ci)));
             if (p.EqGains != null && p.EqGains.Length > 0)
             {

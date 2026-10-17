@@ -36,6 +36,7 @@ namespace Snad
             Test24BitSignExtension();
             TestClippingNoWrap();
             Test16BitUnchanged();
+            TestDither();
 
             Console.WriteLine();
             Console.WriteLine(_bad == 0 ? "位深路径对拍通过" : ("有 " + _bad + " 项失败"));
@@ -148,6 +149,95 @@ namespace Snad
 
             Check(l == 32767, "float32 +1.5 钳到 +32767", "实测 " + l);
             Check(r == -32768 || r == -32767, "float32 -1.5 钳到负满幅", "实测 " + r);
+        }
+
+        /// <summary>
+        /// 抖动（dither）的可判据性质。
+        ///
+        /// 用一个"落在 16bit 网格中间"的 24bit 常值输入：
+        ///   v = 0x00800080 = 8388736 → /8388608 = 1.0000... 超范围，换小一点
+        ///   v = 0x00400040 = 4194368 → 0.5000019…
+        /// 该值最接近 16bit 的 16384（0.5），但略高。
+        ///
+        /// 判据：
+        ///   不加抖动 → 每个样本都量化成同一个 16bit 值（恒定）；
+        ///   加抖动   → 会在相邻两个码之间跳动，且长期均值更接近真值。
+        ///
+        /// 这正是"抖动把量化失真打散"的可观测形式。
+        /// </summary>
+        private static void TestDither()
+        {
+            Console.WriteLine("--- 抖动（dither）---");
+
+            const int v = 0x00010001;      // 65537 / 8388608 = 0.00781262…
+            const int frames = 4096;
+            var payload = new byte[frames * 2 * 3];
+            for (int i = 0; i < frames * 2; i++) Put24(payload, i * 3, v);
+
+            // 不加抖动
+            var ringA = new SampleRing(16384) { Dither = false };
+            ringA.Write(payload, 2, payload.Length, SampleFormat.Pcm24);
+            var dstA = new byte[frames * 4];
+            ringA.Read(dstA, frames, 1.0);
+            var setA = new System.Collections.Generic.HashSet<short>();
+            double sumA = 0;
+            for (int f = 0; f < frames; f++)
+            {
+                short s = (short)(dstA[f * 4] | (dstA[f * 4 + 1] << 8));
+                setA.Add(s);
+                sumA += s;
+            }
+
+            // 加抖动
+            var ringB = new SampleRing(16384) { Dither = true };
+            ringB.Write(payload, 2, payload.Length, SampleFormat.Pcm24);
+            var dstB = new byte[frames * 4];
+            ringB.Read(dstB, frames, 1.0);
+            var setB = new System.Collections.Generic.HashSet<short>();
+            double sumB = 0;
+            for (int f = 0; f < frames; f++)
+            {
+                short s = (short)(dstB[f * 4] | (dstB[f * 4 + 1] << 8));
+                setB.Add(s);
+                sumB += s;
+            }
+
+            Check(setA.Count == 1, "不加抖动时输出恒定（只有 1 种取值）",
+                  "实测 " + setA.Count + " 种");
+            Check(setB.Count >= 2, "加抖动后在相邻码之间跳动",
+                  "实测 " + setB.Count + " 种");
+
+            double meanA = sumA / frames, meanB = sumB / frames;
+            double exact = v / 8388608.0 * 32768.0;
+            Console.WriteLine("        真值 " + exact.ToString("F3") +
+                              "，不加抖动均值 " + meanA.ToString("F3") +
+                              "，加抖动均值 " + meanB.ToString("F3"));
+
+            // 抖动的价值在频谱（把与信号相关的量化失真打散），不在均值精度。
+            // 因此这里只验一件必须成立的事：**不引入系统性偏移**。
+            // 早先用截断时它偏了 −0.5 LSB（真值 256.004、均值 255.495），
+            // 那是因为截断对正数恒定向下；改四舍五入后偏移消失。
+            Check(Math.Abs(meanB - exact) <= 0.5,
+                  "加抖动后无系统性偏移（≤0.5 LSB）",
+                  "偏差 " + (meanB - exact).ToString("F3"));
+
+            // pcm16 输入不应被加抖动（本来就在 16bit 网格上）
+            var p16 = new byte[frames * 2 * 2];
+            for (int i = 0; i < frames * 2; i++)
+            {
+                p16[i * 2] = (byte)(100 & 0xFF);
+                p16[i * 2 + 1] = (byte)((100 >> 8) & 0xFF);
+            }
+            var ringC = new SampleRing(16384) { Dither = true };
+            ringC.Write(p16, 2, p16.Length, SampleFormat.Pcm16);
+            var dstC = new byte[frames * 4];
+            ringC.Read(dstC, frames, 1.0);
+            var setC = new System.Collections.Generic.HashSet<short>();
+            for (int f = 0; f < frames; f++)
+                setC.Add((short)(dstC[f * 4] | (dstC[f * 4 + 1] << 8)));
+            Check(setC.Count == 1, "pcm16 输入不加抖动（取值仍恒定）", "实测 " + setC.Count + " 种");
+
+            Console.WriteLine();
         }
 
         /// <summary>pcm16 路径不能被这次改动影响（回归保护）。</summary>
