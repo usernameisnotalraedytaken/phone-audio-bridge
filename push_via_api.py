@@ -130,15 +130,28 @@ def main():
             print(f"  [{i}/{len(files)}] {path} 未改动，复用")
             continue
         raw = open(path, "rb").read()
-        ok, blob = call(token, "POST", f"{API}/git/blobs",
-                        {"content": base64.b64encode(raw).decode(), "encoding": "base64"})
+        # blobs 接口在链路不稳时会返回 400 "malformed request"，
+        # 但同一载荷过一会儿又能过——因此**必须重试**，不能当成永久失败。
+        ok, blob = 0, {}
+        for attempt in range(1, 6):
+            ok, blob = call(token, "POST", f"{API}/git/blobs",
+                            {"content": base64.b64encode(raw).decode(), "encoding": "base64"})
+            if ok == 201:
+                break
+            print(f"  [{i}/{len(files)}] {path} 上传失败（{ok}），{attempt}/5 重试")
+            time.sleep(3 * attempt)
+
         if ok != 201:
-            # blobs 接口偶尔会对**某些具体载荷**返回 400：
-            # 同样的字节数换内容就能过，连改行尾都不行。这不是请求格式问题，
-            # 是服务端对该载荷的拒绝。兜底：记下来用 Contents API 单独提交，
-            # 不因为一个文件把整次推送卡住。
+            # 关键：**绝不能把路径从 tree 里丢掉**。
+            # GitHub 的建 tree 是"整棵树"语义，路径缺席等于删除该文件。
+            # 这里曾真的删掉过 SnadProfileForm.cs（因为失败的 blob 被 continue 跳过）。
+            # 正确做法：沿用远端已有的 blob（保留旧内容），把这次更新记为"未落地"。
+            old_sha = remote_blobs.get(path)
+            if not old_sha:
+                sys.exit(f"  {path} 是新增文件且上传失败（{ok}），无法保留旧版本，中止推送")
+            tree_items.append({"path": path, "mode": "100644", "type": "blob", "sha": old_sha})
             fallback.append(path)
-            print(f"  [{i}/{len(files)}] {path}  blobs 拒绝（{ok}），改用 Contents API 兜底")
+            print(f"  [{i}/{len(files)}] {path} 上传失败，沿用远端旧版本（内容未更新，不会删除）")
             continue
         tree_items.append({"path": path, "mode": "100644", "type": "blob", "sha": blob["sha"]})
         print(f"  [{i}/{len(files)}] {path}  {len(raw)}B 上传")
@@ -171,28 +184,36 @@ def main():
 
     print(f"\n推送完成 -> https://github.com/{REPO}/tree/{BRANCH}")
 
-    # ---- blobs 接口拒绝的文件，用 Contents API 逐个补提交 ----
+    # ---- 上传失败的文件：远端保留的是旧版本，这里再用 Contents API 补一次 ----
     #
-    # Contents API 走的是另一条路径，不受 blobs 那个"载荷拒绝"影响。
-    # 每个文件一次提交，提交信息注明原因，免得日后看不出为什么多出几个提交。
-    for path in fallback:
-        api_path = urllib.parse.quote(path)
-        ok, cur = call(token, "GET", f"{API}/contents/{api_path}?ref={BRANCH}")
-        if ok != 200 or "sha" not in cur:
-            print(f"  兜底失败：读不到远端 {path}（{ok}）")
-            continue
+    # 两种通道都受链路影响，所以这里只承诺"不会把文件删掉"，
+    # 补提交成不成功都要**明确列出**，不能让人以为全部落地了。
+    if fallback:
+        print(f"\n注意：{len(fallback)} 个文件本次未更新（远端仍是旧版本）：")
+        for path in fallback:
+            api_path = urllib.parse.quote(path)
+            ok, cur = call(token, "GET", f"{API}/contents/{api_path}?ref={BRANCH}")
+            if ok != 200 or "sha" not in cur:
+                print(f"  {path}：读不到远端（{ok}），跳过")
+                continue
 
-        raw = open(path, "rb").read()
-        ok2, res2 = call(token, "PUT", f"{API}/contents/{api_path}", {
-            "message": f"{message}\n\n（blobs 接口对该载荷返回 400，改用 Contents API 提交）",
-            "content": base64.b64encode(raw).decode(),
-            "sha": cur["sha"],
-            "branch": BRANCH,
-        })
-        if ok2 in (200, 201):
-            print(f"  兜底提交成功：{path}")
-        else:
-            print(f"  兜底提交失败：{path}（{ok2}）")
+            raw = open(path, "rb").read()
+            ok2, res2 = 0, {}
+            for attempt in range(1, 4):
+                ok2, res2 = call(token, "PUT", f"{API}/contents/{api_path}", {
+                    "message": f"{message}\n\n（blobs 接口上传失败，改用 Contents API 补交）",
+                    "content": base64.b64encode(raw).decode(),
+                    "sha": cur["sha"],
+                    "branch": BRANCH,
+                })
+                if ok2 in (200, 201):
+                    break
+                time.sleep(3 * attempt)
+
+            if ok2 in (200, 201):
+                print(f"  {path}：已通过 Contents API 补上")
+            else:
+                print(f"  {path}：**仍然是旧版本**（Contents API 也失败 {ok2}），下次推送需重试")
 
     print("Actions 会自动触发构建。")
 
