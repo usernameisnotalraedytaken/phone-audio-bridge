@@ -1138,6 +1138,7 @@ namespace Snad
         private long _readFrame;              // 已消费的整数帧位置
         private double _readFrac;             // 已消费的小数偏移，用于插值
         private long _underrunEvents;
+        private long _primeFills;          // 起播补池时的静音块，不算稳定性欠载
         private long _interpolatedFrames;
         private long _framesDropped;
         private long _framesProduced;      // 写入环形的累计帧数
@@ -1155,6 +1156,9 @@ namespace Snad
         public int CapacityFrames { get { return _frameCap; } }
         public long FramesWritten { get { lock (_gate) return _framesWritten; } }
         public long UnderrunEvents { get { return Interlocked.Read(ref _underrunEvents); } }
+
+        /// <summary>起播补池时读到静音的块数。不计入稳定性欠载。</summary>
+        public long PrimeFills { get { return Interlocked.Read(ref _primeFills); } }
         public long InterpolatedFrames { get { return Interlocked.Read(ref _interpolatedFrames); } }
         public long FramesDropped { get { return Interlocked.Read(ref _framesDropped); } }
         public long FramesProduced { get { return Interlocked.Read(ref _framesProduced); } }
@@ -1251,6 +1255,23 @@ namespace Snad
         /// </summary>
         public int Read(byte[] dest, int outFrames, double ratio)
         {
+            return Read(dest, outFrames, ratio, true);
+        }
+
+        /// <summary>
+        /// 读取并写成立体声 PCM16LE。
+        ///
+        /// <paramref name="countAsUnderrun"/> = false 时，读到空的次数记进"起播补池"，
+        /// 不计入稳定性的欠载计数。
+        ///
+        /// 为什么需要这个区分：waveOut 起播要预填整个缓冲池（默认 16 块 = 256 ms），
+        /// 而环里此刻只有预填充那点数据（约 80 ms ≈ 5 块），
+        /// 剩下 11 块只能读到静音——**每次都会记 11 次"欠载"**。
+        /// 实测确认：池=16 时 11 次、池=4 时 0 次，且 45 秒内不再增长。
+        /// 把这种一次性的补池读数混进稳定性指标，会让人误以为运行中一直在掉音频。
+        /// </summary>
+        public int Read(byte[] dest, int outFrames, double ratio, bool countAsUnderrun)
+        {
             if (ratio < 0.8) ratio = 0.8;
             if (ratio > 1.2) ratio = 1.2;
 
@@ -1261,7 +1282,8 @@ namespace Snad
                 {
                     if (_readFrame + 1 >= _framesWritten)
                     {
-                        Interlocked.Increment(ref _underrunEvents);
+                        if (countAsUnderrun) Interlocked.Increment(ref _underrunEvents);
+                        else Interlocked.Increment(ref _primeFills);
                         for (int k = f; k < outFrames; k++)
                         {
                             dest[k * 4] = 0; dest[k * 4 + 1] = 0;
@@ -1379,6 +1401,9 @@ namespace Snad
         /// adaptive/calibrated 会随时间变化，只写一次启动值是看不出它是否收敛的。
         /// </summary>
         private volatile string _lastPolicyStatus = "";
+
+        /// <summary>已交给输出后端的帧数。用于判断是否仍在起播补池阶段。</summary>
+        private long _pulledFrames;
 
         // ------------------------------------------------------------------ 到达时间统计
         //
@@ -1880,7 +1905,7 @@ namespace Snad
                             Logger.Info(string.Format(
                                 "包={0} {1:F0}kbps 缓冲={2}帧({3}ms) " +
                                 "速率[到{4:F0} 写{5:F0} 读{6:F0}] 差[读-到={7:+0;-0;0}] " +
-                                "Read调用={8:F0}/s(每块{9:F1}ms) 丢最旧帧={10} 欠载={11} 插值={12} " +
+                                "Read调用={8:F0}/s(每块{9:F1}ms) 丢最旧帧={10} 欠载={11} 起播补池={19} 插值={12} " +
                                 "序号缺口={13}(缺{14}包) 丢弃[短{15} magic{16} 版本{17} 负载{18}]",
                                 p, kbps, _ring.AvailableFrames, _ring.AvailableFrames / 48,
                                 rateIn, rateWr, rateRd, rateRd - rateIn,
@@ -1888,7 +1913,8 @@ namespace Snad
                                 _ring.FramesDropped, _ring.UnderrunEvents, _ring.InterpolatedFrames,
                                 _seqGaps, _seqMissing,
                                 Interlocked.Read(ref _shortPkt), Interlocked.Read(ref _badMagic),
-                                Interlocked.Read(ref _badVersion), Interlocked.Read(ref _badPayload)));
+                                Interlocked.Read(ref _badVersion), Interlocked.Read(ref _badPayload),
+                                _ring.PrimeFills));
 
                             // 到达抖动与漂移：这两个数决定"缓冲该留多深"，
                             // 此前完全不可见（协议里一直带着时间戳但没人读）。
@@ -2021,7 +2047,16 @@ namespace Snad
 
                     var buf = new byte[framesPerBuffer * 4];
                     long urBefore = _ring.UnderrunEvents;
-                    _ring.Read(buf, framesPerBuffer, ratio);
+
+                    // 起播阶段先把 waveOut 的缓冲池填满（要做 WaveOutBuffers 次读取），
+                    // 这段时间里环里的数据本来就不够，读到空属正常。
+                    // 把这段排除在稳定性计数之外，否则每次起播都会报十几次"欠载"，
+                    // 而那并不代表运行中在掉音频（实测：池=16 报 11 次、池=4 报 0 次）。
+                    long primedFrames = (long)_profile.WaveOutBuffers * framesPerBuffer;
+                    bool priming = _pulledFrames < primedFrames;
+                    _pulledFrames += framesPerBuffer;
+
+                    _ring.Read(buf, framesPerBuffer, ratio, !priming);
 
                     // 用读取前的可用帧回报观测：掉坑深度就是从这一刻的欠载余量
                     policy.Observe(avail, _sampleRate);
