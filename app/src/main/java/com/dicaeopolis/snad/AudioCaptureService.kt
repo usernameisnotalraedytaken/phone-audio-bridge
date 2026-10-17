@@ -73,6 +73,9 @@ class AudioCaptureService : Service() {
 
     private var sampleRate = 48000
     private var channels = 2
+
+    /** 实际选中的采集编码（pcm16 或 float32），决定包头版本与能力上报。 */
+    private var captureEncoding = AudioFormat.ENCODING_PCM_16BIT
     private var seq = 0
     private var bytesSent = 0L
     private var packetsSent = 0L
@@ -206,34 +209,67 @@ class AudioCaptureService : Service() {
             return
         }
 
-        val minBuf = AudioRecord.getMinBufferSize(
-            sampleRate, AudioFormat.CHANNEL_IN_STEREO, AudioFormat.ENCODING_PCM_16BIT
-        )
-        if (minBuf <= 0) {
-            SnadLog.wrn(TAG, "getMinBufferSize 返回异常值 $minBuf，改用 4096 兜底")
-        }
-        val bufSize = max(if (minBuf > 0) minBuf * 2 else 8192, SnadProtocol.PAYLOAD_BYTES * 4)
-        SnadLog.info(TAG, "AudioRecord 参数：minBuf=$minBuf 实际缓冲=$bufSize " +
-                "请求 ${sampleRate}Hz/2ch/16bit")
+        // 位深选择（计划 §6）：优先 float32，失败退回 pcm16。
+        //
+        // 为什么要试：计划要求"不再受 16bit 限制"。抓取侧若能拿到 float32，
+        // 整条链路就不必在采集处就把精度砍到 16bit；拿不到则如实退回并上报 pcm16，
+        // 不假装支持。
+        val candidates = mutableListOf<Int>()
+        candidates.add(AudioFormat.ENCODING_PCM_FLOAT)
+        candidates.add(AudioFormat.ENCODING_PCM_16BIT)
 
-        val ar = try {
-            AudioRecord.Builder()
-                .setAudioFormat(
-                    AudioFormat.Builder()
-                        .setEncoding(AudioFormat.ENCODING_PCM_16BIT)
-                        .setSampleRate(sampleRate)
-                        .setChannelMask(AudioFormat.CHANNEL_IN_STEREO)
-                        .build()
-                )
-                .setBufferSizeInBytes(bufSize)
-                .setAudioPlaybackCaptureConfig(cfg)
-                .build()
-        } catch (t: Throwable) {
-            SnadLog.err(TAG, "AudioRecord 构建失败（厂商 ROM 可能限制内部音频抓取）", t)
-            fail("创建录音器失败：${t.javaClass.simpleName}: ${t.message}")
+        var chosenEncoding = AudioFormat.ENCODING_PCM_16BIT
+        var arOrNull: AudioRecord? = null
+        for (enc in candidates) {
+            val minB = AudioRecord.getMinBufferSize(
+                sampleRate, AudioFormat.CHANNEL_IN_STEREO, enc
+            )
+            val bytesPerSample = if (enc == AudioFormat.ENCODING_PCM_FLOAT) 4 else 2
+            val buf = max(
+                if (minB > 0) minB * 2 else 8192,
+                SnadProtocol.PAYLOAD_BYTES * bytesPerSample
+            )
+            try {
+                val cand = AudioRecord.Builder()
+                    .setAudioFormat(
+                        AudioFormat.Builder()
+                            .setEncoding(enc)
+                            .setSampleRate(sampleRate)
+                            .setChannelMask(AudioFormat.CHANNEL_IN_STEREO)
+                            .build()
+                    )
+                    .setBufferSizeInBytes(buf)
+                    .setAudioPlaybackCaptureConfig(cfg)
+                    .build()
+
+                if (cand.state == AudioRecord.STATE_INITIALIZED) {
+                    arOrNull = cand
+                    chosenEncoding = enc
+                    break
+                }
+                SnadLog.wrn(TAG, "编码 ${encodingName(enc)} 不可用（state=${cand.state}），尝试下一种")
+                try { cand.release() } catch (t: Throwable) { SnadLog.soft(TAG, "释放候选录音器", t) }
+            } catch (t: Throwable) {
+                SnadLog.wrn(TAG, "编码 ${encodingName(enc)} 构建失败：${t.javaClass.simpleName}，尝试下一种")
+            }
+        }
+
+        if (arOrNull == null) {
+            fail("创建录音器失败：float32 与 pcm16 都不可用（厂商 ROM 可能限制内部音频抓取）")
             stopEverything("录音器失败")
             return
         }
+
+        val minBuf = AudioRecord.getMinBufferSize(
+            sampleRate, AudioFormat.CHANNEL_IN_STEREO, chosenEncoding
+        )
+        val chosenBytesPerSample = if (chosenEncoding == AudioFormat.ENCODING_PCM_FLOAT) 4 else 2
+        val bufSize = max(if (minBuf > 0) minBuf * 2 else 8192,
+                          SnadProtocol.PAYLOAD_BYTES * chosenBytesPerSample)
+        SnadLog.info(TAG, "AudioRecord 参数：minBuf=$minBuf 实际缓冲=$bufSize " +
+                "请求 ${sampleRate}Hz/2ch/${encodingName(chosenEncoding)}")
+
+        val ar = arOrNull
 
         if (ar.state != AudioRecord.STATE_INITIALIZED) {
             SnadLog.err(TAG, "AudioRecord 状态非 INITIALIZED，state=${ar.state}（0=INITIALIZED,1=UNINITIALIZED）")
@@ -244,6 +280,7 @@ class AudioCaptureService : Service() {
         }
 
         record = ar
+        captureEncoding = chosenEncoding
         channels = ar.channelCount.coerceAtLeast(1)
         sampleRate = ar.sampleRate
         SnadLog.info(TAG, "AudioRecord 就绪：实际 ${sampleRate}Hz / ${channels}ch " +
@@ -286,7 +323,11 @@ class AudioCaptureService : Service() {
     }
 
     private fun sendLoop(ar: AudioRecord, sock: DatagramSocket, dest: InetAddress, port: Int) {
-        val pcm = ByteArray(SnadProtocol.PAYLOAD_BYTES)
+        // 包长按位深缩放，保持"每包约 21ms"不变：
+        // float32 每样本 4 字节，若仍用 4096 字节，包长会减半、包率翻倍。
+        val bytesPerSample = if (captureEncoding == AudioFormat.ENCODING_PCM_FLOAT) 4 else 2
+        val payloadBytes = SnadProtocol.PAYLOAD_BYTES * bytesPerSample / 2
+        val pcm = ByteArray(payloadBytes)
         try {
             ar.startRecording()
             if (ar.recordingState != AudioRecord.RECORDSTATE_RECORDING) {
@@ -294,7 +335,8 @@ class AudioCaptureService : Service() {
                 report("error", "录音未真正启动（state=${ar.recordingState}）")
             }
             SnadLog.info(TAG, "开始串流 -> $dest:$port  ${sampleRate}Hz/${channels}ch  " +
-                    "每包 ${pcm.size}B ≈ ${"%.1f".format(pcm.size * 1000.0 / (sampleRate * channels * 2))}ms")
+                    "每包 ${pcm.size}B ≈ ${"%.1f".format(pcm.size * 1000.0 / (sampleRate * channels * bytesPerSample))}ms " +
+                    "位深 ${encodingName(captureEncoding)}")
             report("streaming", "$dest:$port  ${sampleRate}Hz/${channels}ch")
 
             // 上报采集侧能力：让电脑端把"采集延迟"从按典型值猜变成已知。
@@ -340,12 +382,15 @@ class AudioCaptureService : Service() {
                 if (filled <= 0) continue
 
                 val out = try {
-                    val header = SnadProtocol.buildHeader(
+                    // 位深由采集格式决定：float32 用 v2 包头声明，pcm16 继续用 v1，
+                    // 这样旧电脑端仍能收 pcm16 流（向后兼容），新端才能收到高精度。
+                    val header = SnadProtocol.buildHeaderVersioned(
                         channels = channels,
                         sampleRate = sampleRate,
                         sequence = seq++,
                         timestampMs = (SystemClock.elapsedRealtime() and 0xFFFFFFFFL).toInt(),
-                        payloadBytes = filled
+                        payloadBytes = filled,
+                        formatCode = formatCodeFor(chosenEncoding)
                     )
                     val buf = ByteArray(header.size + filled)
                     System.arraycopy(header, 0, buf, 0, header.size)
@@ -409,16 +454,30 @@ class AudioCaptureService : Service() {
                 Math.round(frames * 1000.0 / sampleRate).toInt()
             } else 0
 
-            // 当前采集固定 16bit；其余位深位置留着，等真正支持时再置位。
-            // 上报不声称没实现的能力。
-            val formatMask = 0x01
+            // 按**实际选中的**编码上报，不声称没实现的能力。
+            // float32 成功则置 bit3，否则只报 pcm16（bit0）。
+            val formatMask = if (captureEncoding == AudioFormat.ENCODING_PCM_FLOAT) (0x01 or 0x08) else 0x01
             val pkt = SnadProtocol.buildCapability(sampleRate, bufferMs, formatMask)
             sock.send(DatagramPacket(pkt, pkt.size, dest, port + 1))
-            SnadLog.info(TAG, "能力上报：${sampleRate}Hz，采集缓冲 ${bufferMs}ms（$frames 帧），位深 pcm16")
+            SnadLog.info(TAG, "能力上报：${sampleRate}Hz，采集缓冲 ${bufferMs}ms（$frames 帧），" +
+                    "位深 ${encodingName(captureEncoding)}")
         } catch (t: Throwable) {
             // 上报失败不影响串流，但必须留痕，否则电脑端会一直用估计值而无人知道原因
             SnadLog.soft(TAG, "能力上报发送失败", t)
         }
+    }
+
+    /** 编码名，仅用于日志。 */
+    private fun encodingName(enc: Int): String = when (enc) {
+        AudioFormat.ENCODING_PCM_FLOAT -> "float32"
+        AudioFormat.ENCODING_PCM_16BIT -> "pcm16"
+        else -> "enc$enc"
+    }
+
+    /** 把 AudioRecord 的编码映射成协议里的位深码：0=pcm16 3=float32。 */
+    private fun formatCodeFor(enc: Int): Int = when (enc) {
+        AudioFormat.ENCODING_PCM_FLOAT -> 3
+        else -> 0
     }
 
     private fun fail(msg: String) {

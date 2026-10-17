@@ -1170,6 +1170,22 @@ namespace Snad
         private long _readFrame;              // 已消费的整数帧位置
         private double _readFrac;             // 已消费的小数偏移，用于插值
         private long _underrunEvents;
+
+        /// <summary>
+        /// 输出抖动（dither）。默认关闭。
+        ///
+        /// 只有**输入精度高于 16bit** 时才有意义：pcm24/float32 的样本落到
+        /// 16bit 输出上必须量化，不加抖动会把量化误差变成与信号相关的失真；
+        /// 而 pcm16 输入本身就是 16bit 网格上的值，再加抖动只是白添噪声。
+        /// 因此是否生效由输入格式决定，见 Read 里的 needDither。
+        /// </summary>
+        public bool Dither;
+
+        /// <summary>最近一次写入所用的输入位深，决定 dither 是否该生效。</summary>
+        private SampleFormat _inputFormat = SampleFormat.Pcm16;
+
+        /// <summary>TPDF 抖动用的随机源。固定种子便于复现测试。</summary>
+        private readonly Random _ditherRnd = new Random(20261017);
         private long _primeFills;          // 起播补池时的静音块，不算稳定性欠载
         private long _interpolatedFrames;
         private long _framesDropped;
@@ -1236,6 +1252,7 @@ namespace Snad
         public bool Write(byte[] pcm, int channels, int payloadBytes, SampleFormat format)
         {
             if (channels < 1) return false;
+            _inputFormat = format;      // 供 Read 判断是否需要抖动
             int bytesPerSample = AudioCodec.BytesPerSample(format);
             int bytesPerFrame = channels * bytesPerSample;
             int frames = payloadBytes / bytesPerFrame;
@@ -1307,6 +1324,11 @@ namespace Snad
             if (ratio < 0.8) ratio = 0.8;
             if (ratio > 1.2) ratio = 1.2;
 
+            // 抖动只在"输入精度高于输出精度"时才有意义：
+            // pcm16 输入本身就在 16bit 网格上，加抖动只是白添噪声。
+            bool needDither = Dither &&
+                              AudioCodec.BytesPerSample(_inputFormat) > 2;
+
             lock (_gate)
             {
                 int produced = 0;
@@ -1339,13 +1361,38 @@ namespace Snad
                     float r = (float)(_slots[s0 + 1] * (1 - frac) + _slots[s1 + 1] * frac);
                     if (frac > 0.0001) Interlocked.Increment(ref _interpolatedFrames);
 
+                    // 抖动：只在输入精度高于 16bit 时才加。
+                    //
+                    // 用 TPDF（两个独立均匀分布之差），这是量化到 16bit 的常用选择：
+                    // 它把与信号相关的量化失真打散成与信号无关的白噪声，
+                    // 听感上比"干截断"干净。幅度取 1 LSB。
+                    if (needDither)
+                    {
+                        float d = (float)((_ditherRnd.NextDouble() - _ditherRnd.NextDouble()) / 32768.0);
+                        l += d;
+                        r += d;
+                    }
+
                     // 输出用 32768 还原，而不是 32767。
                     //
                     // 写侧是 s/32768，读侧若乘 32767 就会留下恒定 −1 LSB 偏差
                     // （实测 1234 → 1233、32767 → 32766）。乘 32768 才是它的逆运算，
                     // pcm16 输入可以逐位无损往返；+1.0 会得到 32768，靠钳位收住。
-                    short ls = (short)Math.Max(-32768, Math.Min(32767, l * 32768f));
-                    short rs = (short)Math.Max(-32768, Math.Min(32767, r * 32768f));
+                    double sl = l * 32768.0;
+                    double sr = r * 32768.0;
+
+                    // 加抖动时必须四舍五入，不能截断。
+                    // 截断对正数恒定向下，即便叠加了零均值噪声，均值仍会偏 −0.5 LSB
+                    // （实测：真值 256.004，加抖动后均值 255.495，反而比不加更差）。
+                    // 不加抖动时保持截断，以维持 pcm16 的逐位无损往返。
+                    if (needDither)
+                    {
+                        sl = Math.Round(sl, MidpointRounding.AwayFromZero);
+                        sr = Math.Round(sr, MidpointRounding.AwayFromZero);
+                    }
+
+                    short ls = (short)Math.Max(-32768, Math.Min(32767, sl));
+                    short rs = (short)Math.Max(-32768, Math.Min(32767, sr));
                     dest[f * 4] = (byte)(ls & 0xFF);
                     dest[f * 4 + 1] = (byte)((ls >> 8) & 0xFF);
                     dest[f * 4 + 2] = (byte)(rs & 0xFF);
@@ -1882,6 +1929,7 @@ namespace Snad
                             // 尺寸全部由 profile 提供，并按实际采样率换算，不写死 48000。
                             int capFrames = _profile.RingCapacityFrames(_sampleRate);
                             _ring = new SampleRing(capFrames);
+                            _ring.Dither = _profile.Dither;   // 档位里的抖动开关
                             _prebufferFrames = _profile.PrebufferFrames(_sampleRate);
                             _formatLogged = true;
                             _ringReady = true;   // 此刻起 _ring 才可被安全访问
@@ -2074,6 +2122,12 @@ namespace Snad
                 // 之所以值得策略化，是因为回环实测表明声卡池不是稳态延迟，
                 // 真正决定延迟的就是这个水位。
                 var policy = BufferPolicyFactory.Create(_profile);
+
+                // 抖动开关随档位。是否真正生效由环形缓冲按输入位深决定
+                // （pcm16 输入加抖动只是白添噪声）。
+                if (_ring != null) _ring.Dither = _profile.Dither;
+                if (_profile.Dither)
+                    Logger.Info("位深抖动已启用（仅当输入精度高于 16bit 时生效）");
 
                 Logger.Info(string.Format(
                     "播放参数：每块 {0} 帧（{1} ms）、缓冲策略 {2}、漂移摆幅 ±{3}%、增益 {4}",
