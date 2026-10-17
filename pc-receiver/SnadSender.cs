@@ -70,6 +70,8 @@ namespace Snad
             int blockMs = 21;
             double lossPct = 0, jitterMs = 0, reorderPct = 0;
             double baseDelayMs = 80;      // 抖动摆动的基准，需 ≥ 最大抖动
+            int version = 1;              // 协议版本：1 = 22 字节头，2 = 26 字节头（带位深）
+            SampleFormat format = SampleFormat.Pcm16;
             double toneHz = 440;
             int timestampOffsetMs = 0;
             bool silent = false;
@@ -86,6 +88,17 @@ namespace Snad
                     case "丢包": case "loss": lossPct = double.Parse(v, CultureInfo.InvariantCulture); break;
                     case "抖动": case "jitter": jitterMs = double.Parse(v, CultureInfo.InvariantCulture); break;
                     case "基准延迟": case "base": baseDelayMs = double.Parse(v, CultureInfo.InvariantCulture); break;
+                    case "版本": case "version": version = int.Parse(v); break;
+                    case "格式": case "format":
+                        {
+                            string f = v.Trim().ToLowerInvariant();
+                            if (f == "pcm16") format = SampleFormat.Pcm16;
+                            else if (f == "pcm24") format = SampleFormat.Pcm24;
+                            else if (f == "pcm32") format = SampleFormat.Pcm32;
+                            else if (f == "float32") format = SampleFormat.Float32;
+                            else Console.WriteLine("未知格式 " + v + "，按 pcm16 处理");
+                            break;
+                        }
                     case "乱序": case "reorder": reorderPct = double.Parse(v, CultureInfo.InvariantCulture); break;
                     case "音调": case "tone": toneHz = double.Parse(v, CultureInfo.InvariantCulture); break;
                     case "时间戳偏移": case "tsoffset": timestampOffsetMs = int.Parse(v); break;
@@ -97,7 +110,15 @@ namespace Snad
 
             const int rate = 48000, channels = 2;
             int framesPerPacket = rate * blockMs / 1000;
-            int payloadBytes = framesPerPacket * channels * 2;
+            int payloadBytes = framesPerPacket * channels * AudioCodec.BytesPerSample(format);
+
+            // v1 的包头没有格式字段，载荷按约定必须是 pcm16
+            if (version == 1 && format != SampleFormat.Pcm16)
+            {
+                Console.WriteLine("v1 协议不支持 " + AudioCodec.Name(format) + "，已改为 pcm16");
+                format = SampleFormat.Pcm16;
+                payloadBytes = framesPerPacket * channels * AudioCodec.BytesPerSample(format);
+            }
 
             Console.WriteLine("SNAD 发包器");
             Console.WriteLine("  目标      " + host + ":" + port);
@@ -107,6 +128,9 @@ namespace Snad
             Console.WriteLine("  音调      " + toneHz.ToString("F0") + " Hz" + (silent ? "（静默）" : ""));
             Console.WriteLine("  丢包      " + lossPct.ToString("F1") + " %");
             Console.WriteLine("  抖动      0.." + jitterMs.ToString("F1") + " ms 随机（叠加在基准延迟上）");
+            Console.WriteLine("  协议      v" + version + "（包头 " +
+                              (version == 2 ? WireProtocol.HeaderSizeV2 : WireProtocol.HeaderSizeV1) + " 字节）" +
+                              "，位深 " + AudioCodec.Name(format));
             Console.WriteLine("  基准延迟  " + baseDelayMs.ToString("F1") + " ms（抖动摆动空间，需 ≥ 最大抖动）");
             Console.WriteLine("  乱序      " + reorderPct.ToString("F1") + " %");
             if (timestampOffsetMs != 0)
@@ -178,11 +202,12 @@ namespace Snad
                     bool drop = rnd.NextDouble() * 100 < lossPct;
                     if (!drop)
                     {
-                        FillTone(pcm, framesPerPacket, channels, toneHz, ref phase, silent);
+                        FillTone(pcm, framesPerPacket, channels, toneHz, ref phase, silent, format);
 
                         long tsRaw = (long)captureAt + timestampOffsetMs;
                         int ts = (int)(tsRaw & 0xFFFFFFFFL);
-                        byte[] pkt = BuildPacket(channels, rate, seq, ts, payloadBytes, pcm);
+                        byte[] pkt = BuildPacket(channels, rate, seq, ts, payloadBytes, pcm,
+                                                 version, format);
 
                         // 释放时刻 = 采集 + 基础延迟 + 独立抖动。
                         // 基础延迟给抖动留出摆动空间，使平均到达间隔仍等于采集间隔；
@@ -231,18 +256,34 @@ namespace Snad
         }
 
         /// <summary>按手机端 SnadProtocol.buildHeader 的布局构造包头。</summary>
+        /// <summary>
+        /// 构造音频包。version 决定包头长度：
+        ///   v1 = 22 字节，载荷固定 pcm16（旧手机）
+        ///   v2 = 26 字节，22..23 为格式码（新协议）
+        /// 前 22 字节两者完全一致，因此 v1 接收端能读出 v2 包的核心字段。
+        /// </summary>
         private static byte[] BuildPacket(int channels, int rate, int seq, int timestampMs,
-                                          int payloadBytes, byte[] pcm)
+                                          int payloadBytes, byte[] pcm,
+                                          int version, SampleFormat format)
         {
-            var pkt = new byte[HeaderSize + payloadBytes];
+            int headerSize = version == 2 ? WireProtocol.HeaderSizeV2 : WireProtocol.HeaderSizeV1;
+            var pkt = new byte[headerSize + payloadBytes];
             pkt[0] = (byte)'S'; pkt[1] = (byte)'N'; pkt[2] = (byte)'A'; pkt[3] = (byte)'D';
-            pkt[4] = 1;                          // version
+            pkt[4] = (byte)version;
             pkt[5] = (byte)channels;
             PutIntLE(pkt, 6, rate);
             PutIntLE(pkt, 10, seq);
             PutIntLE(pkt, 14, timestampMs);
             PutIntLE(pkt, 18, payloadBytes);
-            Buffer.BlockCopy(pcm, 0, pkt, HeaderSize, payloadBytes);
+            if (version == 2)
+            {
+                int code = WireProtocol.CodeFromFormat(format);
+                pkt[22] = (byte)(code & 0xFF);
+                pkt[23] = (byte)((code >> 8) & 0xFF);
+                pkt[24] = 0;                     // flags，保留
+                pkt[25] = 0;
+            }
+            Buffer.BlockCopy(pcm, 0, pkt, headerSize, payloadBytes);
             return pkt;
         }
 
@@ -259,8 +300,9 @@ namespace Snad
         /// 脉冲便于人耳核对通路是否连续（能听到规律哒哒声）。
         /// </summary>
         private static void FillTone(byte[] pcm, int frames, int channels, double toneHz,
-                                     ref double phase, bool silent)
+                                     ref double phase, bool silent, SampleFormat format)
         {
+            int bps = AudioCodec.BytesPerSample(format);
             for (int i = 0; i < frames; i++)
             {
                 double v;
@@ -274,13 +316,12 @@ namespace Snad
                 }
                 phase += 1;
 
-                short s = (short)Math.Round(Math.Max(-1, Math.Min(1, v)) * 32767);
-                int off = i * channels * 2;
+                if (v > 1) v = 1;
+                if (v < -1) v = -1;
+
+                int off = i * channels * bps;
                 for (int c = 0; c < channels; c++)
-                {
-                    pcm[off + c * 2] = (byte)(s & 0xFF);
-                    pcm[off + c * 2 + 1] = (byte)((s >> 8) & 0xFF);
-                }
+                    AudioCodec.Encode(pcm, off + c * bps, (float)v, format);
             }
         }
 

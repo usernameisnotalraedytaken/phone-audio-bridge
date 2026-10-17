@@ -129,7 +129,7 @@ $audioCoreSources = @('SnadAudioSink.cs', 'SnadAudioCodec.cs', 'SnadAudioDevices
 # 接收器核心（Logger、接收循环、播放路径）。绝大多数工具都需要它。
 $receiverCoreSources = @('SnadReceiver.cs', 'SnadProfile.cs', 'SnadBeacon.cs', 'SnadBeaconService.cs',
                          'SnadEq.cs', 'SnadSecret.cs', 'SnadArrivalStats.cs',
-                         'SnadBufferPolicy.cs') + $audioCoreSources
+                         'SnadBufferPolicy.cs', 'SnadWireProtocol.cs') + $audioCoreSources
 
 # ---- 1) 控制台版（无 GUI，便于在无桌面环境或脚本中运行）----
 $consoleSources = $receiverCoreSources
@@ -259,7 +259,9 @@ if (Test-Path 'SnadSender.cs') {
     $sndArgs = @('/nologo', '/target:exe', '/platform:x64', '/optimize+',
                  '/main:Snad.Sender', '/out:SnadSender.new.exe')
     foreach ($a in $coreRefs) { $sndArgs += ("/r:" + (Join-Path $fw $a)) }
-    $sndArgs += 'SnadSender.cs'
+    # 需要位深编解码：发包器要能按 v2 协议发 pcm16/24/32/float32，
+    # 且必须与接收端共用同一套编码规则，不能各写一份
+    $sndArgs += @('SnadAudioSink.cs', 'SnadAudioCodec.cs', 'SnadWireProtocol.cs', 'SnadSender.cs')
     & $csc @sndArgs
     if ($LASTEXITCODE -ne 0) { throw "发包器编译失败，csc 退出码 $LASTEXITCODE" }
     Install-Binary 'SnadSender.new.exe' 'SnadSender.exe'

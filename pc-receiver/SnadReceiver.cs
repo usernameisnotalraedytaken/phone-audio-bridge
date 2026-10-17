@@ -120,7 +120,19 @@ namespace Snad
     internal static class Program
     {
         internal const int DefaultPort = 6981;   // 避开 Voicemeeter 的 VBAN 服务（占用 6980）
-        internal const int HeaderSize = 22;
+
+        // 协议定义统一放在 WireProtocol（SnadWireProtocol.cs），
+        // 接收器与发包器共用同一份，避免两处各自臆测包头布局。
+        internal const int HeaderSize = WireProtocol.HeaderSizeV1;
+        internal const int HeaderSizeV2 = WireProtocol.HeaderSizeV2;
+
+        /// <summary>按版本返回包头长度。未知版本返回 0，由调用方报错。</summary>
+        internal static int HeaderSizeFor(byte version) { return WireProtocol.HeaderSizeFor(version); }
+
+        /// <summary>包头里的格式码 ↔ 采样格式。</summary>
+        internal static SampleFormat FormatFromCode(int code) { return WireProtocol.FormatFromCode(code); }
+
+        internal static int CodeFromFormat(SampleFormat f) { return WireProtocol.CodeFromFormat(f); }
 
         /// <summary>日志端口 = 音频端口 + 1。</summary>
         internal const int LogPortOffset = 1;
@@ -1174,8 +1186,22 @@ namespace Snad
         /// </summary>
         public bool Write(byte[] pcm, int channels, int payloadBytes)
         {
+            return Write(pcm, channels, payloadBytes, SampleFormat.Pcm16);
+        }
+
+        /// <summary>
+        /// 按指定位深把载荷写进环形缓冲。
+        ///
+        /// 位深不能假设：v2 协议允许 pcm16/24/32/float32，
+        /// 若仍按"每帧 2 字节、short 组装"处理 24bit 载荷，
+        /// 每帧字节数会算错（高估 50%），解出来的波形则是噪声。
+        /// 解码走 AudioCodec.Decode，与编码端共用同一套位深规则。
+        /// </summary>
+        public bool Write(byte[] pcm, int channels, int payloadBytes, SampleFormat format)
+        {
             if (channels < 1) return false;
-            int bytesPerFrame = channels * 2;
+            int bytesPerSample = AudioCodec.BytesPerSample(format);
+            int bytesPerFrame = channels * bytesPerSample;
             int frames = payloadBytes / bytesPerFrame;
             if (frames <= 0) return false;
 
@@ -1205,12 +1231,12 @@ namespace Snad
                 for (int f = 0; f < frames; f++)
                 {
                     int b = f * bytesPerFrame;
-                    short l = (short)(pcm[b] | (pcm[b + 1] << 8));
-                    short r = channels >= 2 ? (short)(pcm[b + 2] | (pcm[b + 3] << 8)) : l;
+                    float l = AudioCodec.Decode(pcm, b, format);
+                    float r = channels >= 2 ? AudioCodec.Decode(pcm, b + bytesPerSample, format) : l;
 
                     int slot = (int)(_framesWritten % _frameCap) * 2;
-                    _slots[slot] = l / 32768f;
-                    _slots[slot + 1] = r / 32768f;
+                    _slots[slot] = l;
+                    _slots[slot + 1] = r;
                     _framesWritten++;
                 }
                 Interlocked.Add(ref _framesProduced, frames);
@@ -1341,6 +1367,12 @@ namespace Snad
         private bool _formatLogged;
         private int _seqExpected = -1;
         private long _seqGaps, _seqMissing;
+
+        /// <summary>
+        /// 当前接收的载荷位深。v1 恒为 pcm16；v2 由包头声明。
+        /// 变化时必须记日志——它改变每帧字节数，静默切换会让声音突变。
+        /// </summary>
+        private SampleFormat _pktFormat = SampleFormat.Pcm16;
 
         /// <summary>
         /// 最近一次缓冲策略的状态，供周期日志打印。
@@ -1605,11 +1637,15 @@ namespace Snad
                                 Logger.Warn("丢弃 magic 不匹配的包，首字节=" + pkt[0] + "，来自 " + remote);
                             continue;
                         }
-                        if (pkt[4] != 1)
+                        // 版本决定包头长度与载荷含义。v1 的 22 字节核心布局保持不变，
+                        // v2 只在其后追加格式字段，因此旧客户端仍能收下新包的核心部分。
+                        int headerSize = Program.HeaderSizeFor(pkt[4]);
+                        if (headerSize == 0)
                         {
                             Interlocked.Increment(ref _badVersion);
                             if (Interlocked.Read(ref _badVersion) <= 3)
-                                Logger.Warn("丢弃协议版本不支持的包：version=" + pkt[4]);
+                                Logger.Warn("丢弃协议版本不支持的包：version=" + pkt[4] +
+                                            "（支持 1 与 2）");
                             continue;
                         }
 
@@ -1618,6 +1654,23 @@ namespace Snad
                         int seq = BitConverter.ToInt32(pkt, 10);
                         int senderTsMs = BitConverter.ToInt32(pkt, 14);
                         int payload = BitConverter.ToInt32(pkt, 18);
+
+                        // v1 没有格式字段，按约定就是 pcm16；v2 由包头声明
+                        SampleFormat pktFormat = SampleFormat.Pcm16;
+                        if (headerSize >= Program.HeaderSizeV2 && pkt.Length >= Program.HeaderSizeV2)
+                        {
+                            int code = BitConverter.ToUInt16(pkt, 22);
+                            pktFormat = Program.FormatFromCode(code);
+                            if (_pktFormat != pktFormat)
+                            {
+                                // 格式变化必须可见：它改变每帧字节数与解码方式，
+                                // 静默切换会让声音突然变调或变噪声
+                                if (_pktFormat != SampleFormat.Pcm16 || code != 0)
+                                    Logger.Info("接收格式变更为 " + AudioCodec.Name(pktFormat) +
+                                                "（每样本 " + AudioCodec.BytesPerSample(pktFormat) + " 字节）");
+                                _pktFormat = pktFormat;
+                            }
+                        }
 
                         // 用发送端时间戳统计单程延迟的波动。
                         //
@@ -1629,12 +1682,12 @@ namespace Snad
                         //   所依据的量。差值的长期趋势则反映两端时钟速率差（漂移）。
                         //   绝对延迟另用声卡回环测。
                         TrackArrival(senderTsMs);
-                        if (payload <= 0 || Program.HeaderSize + payload > pkt.Length)
+                        if (payload <= 0 || headerSize + payload > pkt.Length)
                         {
                             Interlocked.Increment(ref _badPayload);
                             if (Interlocked.Read(ref _badPayload) <= 3)
                                 Logger.Warn("丢弃负载长度非法的包：声明 " + payload + " 字节，实际可用 " +
-                                            (pkt.Length - Program.HeaderSize) + " 字节");
+                                            (pkt.Length - headerSize) + " 字节");
                             continue;
                         }
 
@@ -1699,11 +1752,16 @@ namespace Snad
                         }
 
                         var pcm = new byte[payload];
-                        Buffer.BlockCopy(pkt, Program.HeaderSize, pcm, 0, payload);
+                        Buffer.BlockCopy(pkt, headerSize, pcm, 0, payload);
+
+                        // 帧数必须按**每样本字节数**算，不能再写死 2 字节：
+                        // 24bit 载荷下写死会让帧数高估 50%，水位与速率全部失真
+                        int bytesPerSample = AudioCodec.BytesPerSample(pktFormat);
+                        int bytesPerFrame = Math.Max(1, _channels * bytesPerSample);
 
                         Interlocked.Increment(ref _packets);
                         Interlocked.Add(ref _bytes, payload);
-                        Interlocked.Add(ref _framesIn, payload / Math.Max(1, _channels * 2));
+                        Interlocked.Add(ref _framesIn, payload / bytesPerFrame);
 
                         if (!_ringReady)
                         {
@@ -1713,7 +1771,7 @@ namespace Snad
                             continue;
                         }
 
-                        if (!_ring.Write(pcm, _channels, payload))
+                        if (!_ring.Write(pcm, _channels, payload, pktFormat))
                         {
                             long ov = Interlocked.Increment(ref _overflow);
                             if (ov <= 3 || ov % 100 == 0)
