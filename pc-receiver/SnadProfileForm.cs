@@ -23,7 +23,7 @@ namespace Snad
 {
     internal sealed class ProfileForm : Form
     {
-        private enum Kind { Int, Double, Enum }
+        private enum Kind { Int, Double, Enum, Bool }
 
         /// <summary>
         /// 一个可编辑项。
@@ -47,6 +47,11 @@ namespace Snad
             public Action<Profile, double> SetNumber;
             public Func<Profile, string> GetText;
             public Action<Profile, string> SetText;
+
+            // 布尔项用 FlatToggle（计划 §4.3）。这类项没有"范围/步长"，
+            // 用数字步进器表达开关是错的——0.00 与 1.00 看不出这是开关。
+            public Func<Profile, bool> GetBool;
+            public Action<Profile, bool> SetBool;
 
             // 运行时控件。生效时机不靠控件表达——
             // 那由字段落在哪个分组里决定（见 LayoutFields），
@@ -269,6 +274,14 @@ namespace Snad
                 Key = "poll", Label = "POLL", Kind = Kind.Int, Restart = false,
                 Min = 1, Max = 20, Step = 1, Unit = "ms",
                 GetNumber = p => p.PollMs, SetNumber = (p, v) => p.PollMs = (int)v
+            });
+            // 位深下转时的抖动（计划 §1.5）。开关项，热改。
+            // 它只在输入精度高于 16bit 时真正生效——这条写进说明，
+            // 否则用户开了 pcm16 + dither 看不到任何变化，会以为是坏的。
+            _fields.Add(new Field
+            {
+                Key = "dither", Label = "DITHER", Kind = Kind.Bool, Restart = false,
+                GetBool = p => p.Dither, SetBool = (p, v) => p.Dither = v
             });
             _fields.Add(new Field
             {
@@ -516,7 +529,14 @@ namespace Snad
                     TextAlign = ContentAlignment.MiddleLeft
                 };
 
-                if (f.Kind == Kind.Enum)
+                if (f.Kind == Kind.Bool)
+                {
+                    // 标签即开关右侧文字：ON/OFF 比一个空的方块清楚
+                    var tg = new FlatToggle("") { Font = fNorm };
+                    tg.CheckedChanged += (s2, e2) => { if (!_loading) { MarkDirty(); UpdateSummary(); } };
+                    f.Editor = tg;
+                }
+                else if (f.Kind == Kind.Enum)
                 {
                     var dd = new FlatDropdown { Font = fNorm };
                     var items = new string[f.Options.Length];
@@ -790,7 +810,12 @@ namespace Snad
             {
                 foreach (var f in _fields)
                 {
-                    if (f.Kind == Kind.Enum)
+                    if (f.Kind == Kind.Bool)
+                    {
+                        var tg = f.Editor as FlatToggle;
+                        if (tg != null) tg.Checked = f.GetBool(p);
+                    }
+                    else if (f.Kind == Kind.Enum)
                     {
                         var dd = f.Editor as FlatDropdown;
                         if (dd == null) continue;
@@ -818,7 +843,12 @@ namespace Snad
             if (p == null) return;
             foreach (var f in _fields)
             {
-                if (f.Kind == Kind.Enum)
+                if (f.Kind == Kind.Bool)
+                {
+                    var tg = f.Editor as FlatToggle;
+                    if (tg != null) f.SetBool(p, tg.Checked);
+                }
+                else if (f.Kind == Kind.Enum)
                 {
                     var dd = f.Editor as FlatDropdown;
                     if (dd == null) continue;

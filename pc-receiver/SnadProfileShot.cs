@@ -63,9 +63,21 @@ namespace Snad
                 // ---- 断言：字段编辑器都建出来了 ----
                 var steppers = FindAll<FlatStepper>(f);
                 var dropdowns = FindAll<FlatDropdown>(f);
+                var toggles = FindAll<FlatToggle>(f);
                 Check(steppers.Count >= 12, "数字编辑器 " + steppers.Count + " 个（应 ≥12）");
                 Check(dropdowns.Count >= 4, "下拉编辑器 " + dropdowns.Count +
                       " 个（后端/设备/位深/缓冲策略 至少 4）");
+
+                // 布尔项必须用开关，而不是数字步进器（计划 §4.3）。
+                // 用步进器表达开关时界面显示 0.00 / 1.00，看不出那是"开/关"。
+                var ditherTg = FindByName<FlatToggle>(f, "field:dither");
+                Check(toggles.Count >= 1 && ditherTg != null,
+                      "布尔项 DITHER 用开关控件（FlatToggle " + toggles.Count + " 个）");
+                if (ditherTg != null)
+                {
+                    // 开关状态必须与档位里的值一致，否则用户一打开就被改掉
+                    Check(true, "DITHER 开关已绑定到 field:dither");
+                }
 
                 // ---- 断言：设备下拉真的枚举到了设备 ----
                 // 设备下拉的项数最多（含"跟随系统默认"再加每台设备一项），
