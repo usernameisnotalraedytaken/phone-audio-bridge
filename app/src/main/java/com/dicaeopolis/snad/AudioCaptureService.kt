@@ -11,6 +11,7 @@ import android.media.AudioAttributes
 import android.media.AudioFormat
 import android.media.AudioPlaybackCaptureConfiguration
 import android.media.AudioRecord
+import android.media.AudioRecord.AudioTimestamp
 import android.media.projection.MediaProjection
 import android.media.projection.MediaProjectionManager
 import android.os.Build
@@ -127,7 +128,7 @@ class AudioCaptureService : Service() {
             var sock: DatagramSocket? = null
             try {
                 sock = DatagramSocket()
-                val ts = AudioRecord.AudioTimestamp()
+                val ts = AudioTimestamp()
                 var failStreak = 0L
                 while (running.get()) {
                     val buf = ByteArray(44)
@@ -136,12 +137,15 @@ class AudioCaptureService : Service() {
                     buf[4] = 1
                     buf[5] = 'K'.code.toByte()
 
-                    val ok = try { ar.getTimestamp(ts) } catch (e: Throwable) {
+                    // getTimestamp 返回 int 状态码，不是布尔：
+                    //   AudioRecord.SUCCESS(0) 或 ERROR_INVALID_OPERATION(-3) 等。
+                    // 我最初按 Boolean 用，编译期就炸了——这类错只有编译器能拦，
+                    // 所以本地做不了 Kotlin 编译时，至少要把 API 签名逐个核对过。
+                    val ok = try { ar.getTimestamp(ts) == AudioRecord.SUCCESS } catch (e: Throwable) {
                         SnadLog.wrn(TAG, "getTimestamp 抛异常：${e.javaClass.simpleName}")
                         false
                     }
                     val el = SystemClock.elapsedRealtimeNanos()
-                    val nm = System.nanoTime()
 
                     putI32(buf, 6, lastSentSeq)
                     putI32(buf, 10, lastSentFrames.toInt())
@@ -214,7 +218,7 @@ class AudioCaptureService : Service() {
                 // 读块帧数来自界面滑块，改动在下一条流生效。
                 // 范围与默认值在 companion object 里定义，越界时钳住并说明——
                 // 静默接受一个非法值会让"为什么延迟没变"变成悬案。
-                val pref = getSharedPreferences("snad", MODE_PRIVATE)
+                val pref = getSharedPreferences("snad", Context.MODE_PRIVATE)
                 val want = pref.getInt("chunk_frames", CHUNK_DEFAULT_FRAMES)
                 chunkFrames = when {
                     want < CHUNK_MIN_FRAMES -> {
