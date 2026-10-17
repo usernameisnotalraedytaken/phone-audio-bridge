@@ -790,9 +790,25 @@ namespace Snad
                 double queueSum = 0; long queueN = 0;
                 double minQueue = double.MaxValue, maxQueue = 0;
                 long bytesWritten = 0;
+                int lastPullFrames = 0;      // 上一次 pull 交出的帧数，用来判断 sink 有没有空位
+                long blockedOnFull = 0;      // 因为 sink 满而没去取数据的次数
 
                 while (!token.IsCancellationRequested)
                 {
+                    // 先确认 sink 有空位再取数据。
+                    //
+                    // 反过来（先 pull 再阻塞在 Write）会把接收器的环形缓冲抽干，
+                    // 等待期间到达的新包只能把环灌满并溢出——实测 WASAPI 路径
+                    // 读速率只有 36701/s（应 48000）、丢最旧帧 4128、欠载 2032，
+                    // 而 sink 自己的渲染其实是准的。根因就是拉取早于消费。
+                    int needFrames = lastPullFrames > 0 ? lastPullFrames : 1;
+                    if (sink.FreeFrames < needFrames)
+                    {
+                        blockedOnFull++;
+                        Thread.Sleep(1);
+                        continue;
+                    }
+
                     var data = pull();
                     pullCalls++;
                     if (data == null)
@@ -834,6 +850,7 @@ namespace Snad
                         bytesAccepted += n;
                     }
                     writeAttempts += attempts;
+                    lastPullFrames = data.Length / 4;   // 立体声 16bit：每帧 4 字节
 
                     double q = sink.QueuedMs;
                     queueSum += q; queueN++;
@@ -858,13 +875,14 @@ namespace Snad
                         double secs = (now - lastStat).TotalSeconds;
                         Logger.Info(string.Format(CultureInfo.InvariantCulture,
                             "[WASAPI 状态] 队列 均{0:F1} 低{1:F1} 高{2:F1} ms（上限 {3:F1}），" +
-                            "无数据 {4}，见底 {5}，写满等待 {6}" +
+                            "无数据 {4}，见底 {5}，写满等待 {6}，sink满未取 {10}" +
                             "  |  实际接受 {7:F0} 帧/秒（实时 {8}），每块试 {9:F2} 次",
                             queueN > 0 ? queueSum / queueN : 0,
                             minQueue == double.MaxValue ? 0 : minQueue, maxQueue, sink.CapacityMs,
                             nullPulls, starved, fullWaits,
                             bytesAccepted / 4.0 / secs, sampleRate,
-                            writes > 0 ? (double)writeAttempts / writes : 0));
+                            writes > 0 ? (double)writeAttempts / writes : 0,
+                            blockedOnFull));
 
                         // 累计值对比：写入侧与渲染侧的差额就是"写进去但还没播出"的量。
                         // 若它远超队列容量，说明有帧既不在队列也没被播出——那才是真问题。
@@ -2059,6 +2077,20 @@ namespace Snad
                     // （丢帧 3129 帧），说明余量不足以吸收 Windows 线程调度抖动；
                     // 120 ms 则从未欠载但延迟偏高。80 ms 是两者之间的折中。
                     int avail = _ring.AvailableFrames;
+
+                    // 数据不足一整块时返回 null，让调用方等待，而不是补静音。
+                    //
+                    // 补静音会把"没有数据"伪装成"有数据"：调用方以为拿到了音频、
+                    // 照常写进声卡；与此同时抖动缓冲的欠载计数与读速率都被静音污染，
+                    // 事后看指标完全对不上（实测 WASAPI 路径读速率 37k/s、
+                    // 而 sink 自己按 48k 正常渲染，就是这种错位）。
+                    // 两条播放路径都正确把 null 当作"暂无数据"处理。
+                    if (avail < framesPerBuffer)
+                    {
+                        policy.Observe(avail, _sampleRate);
+                        _lastPolicyStatus = policy.Status();
+                        return null;
+                    }
 
                     // 目标水位每块向策略要一次：adaptive/calibrated 会据此更新
                     int targetFrames = _sampleRate * policy.TargetMs / 1000;

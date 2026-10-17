@@ -73,6 +73,19 @@ namespace Snad
         public string Name { get { return _name; } }
         public double CapacityMs { get { return _rate > 0 ? _ringFrames * 1000.0 / _rate : 0; } }
 
+        /// <summary>
+        /// 环形缓冲还能立刻接受多少帧。
+        ///
+        /// 调用方应当**先看这个再取数据**：先 pull 再阻塞在 Write 里，
+        /// 会把上游（接收器环形缓冲）抽干，而这段等待期间到达的新数据
+        /// 只能把上游灌满并溢出——实测表现为上游读速率只有实时的 76%、
+        /// 大量丢最旧帧，而 sink 自己其实是按 48000/s 正常渲染的。
+        /// </summary>
+        public int FreeFrames
+        {
+            get { lock (_ringGate) return Math.Max(0, _ringFrames - _ringCount); }
+        }
+
         /// <summary>当前排队等待播放的毫秒数。延迟估计里 soundcard 那一项取自这里。</summary>
         public double QueuedMs
         {

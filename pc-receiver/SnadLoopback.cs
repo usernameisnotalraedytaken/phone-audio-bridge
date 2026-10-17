@@ -276,19 +276,26 @@ namespace Snad
                     // 端到端：信号经由真实的接收器（环形缓冲 → 输出）再被录回。
                     // 直接写 sink 的测法绕过了抖动缓冲，只覆盖输出段；
                     // 计划 §3.2 要求覆盖"抖动缓冲 + 播放池 + 声卡"，必须走这一条。
-                    using (var recv = StartReceiver(e2eProfile))
+                    // 每轮都重启接收器。
+                    //
+                    // 复用同一个接收器时，轮与轮之间会累积积压：
+                    // 发送端的节拍用 Thread.Sleep 实现，平均略慢于实时，
+                    // 于是环里的积压逐轮减少，测出来的延迟也跟着逐轮变小
+                    // （实测 335 → 201 → 184 ms）。这种数不能比较。
+                    // 每轮从同一个初始状态起测，才是可比的。
+                    for (int r = 0; r < repeat; r++)
                     {
-                        try
+                        using (var recv = StartReceiver(e2eProfile))
                         {
-                            for (int r = 0; r < repeat; r++)
+                            try
                             {
                                 double ms = RunEndToEnd(cap, recv, e2ePort, deviceIndex,
                                                         primeSec, r + 1, repeat);
                                 if (ms > 0) results.Add(ms);
-                                Thread.Sleep(220);
                             }
+                            finally { StopReceiver(recv); }
                         }
-                        finally { StopReceiver(recv); }
+                        Thread.Sleep(300);
                     }
                 }
                 else
@@ -445,7 +452,13 @@ namespace Snad
             }
 
             float[] all = cap.Samples;
-            int from = (int)Math.Max(0, handedAt - rate / 4);   // 允许采集端略早于交付
+
+            // 只从"交出时刻"往后找。
+            //
+            // 之前从 handedAt - 250ms 开始搜，结果相关器在静音段锁到窗口起点，
+            // 算出 -250ms 这种负数；而信号物理上不可能早于它被交出的时刻。
+            // 采集端自身有缓冲，可能让首个样本略晚出现，但绝不会更早。
+            int from = (int)Math.Max(0, handedAt);
             if (all.Length <= from + 1000)
             {
                 Console.WriteLine("  第 " + round + " 次：采集样本不足（共 " + all.Length +
@@ -775,6 +788,17 @@ namespace Snad
             int hi = capture.Length - len;
             if (hi <= from) return -1;
 
+            // 先看窗口里到底有没有信号。
+            // 全是静音时相关系数处处为 0，最佳位置会退化成搜索起点，
+            // 于是算出 0.00 ms 甚至负数——那种数是假的，要说"未找到"。
+            double peak = 0;
+            for (int i = Math.Max(0, from); i < Math.Min(capture.Length, hi + len); i++)
+            {
+                double a = Math.Abs(capture[i]);
+                if (a > peak) peak = a;
+            }
+            if (peak < 0.005) return -1;      // 明显低于噪声地板，视作没有信号
+
             double best = double.MinValue;
             int bestAt = -1;
 
@@ -785,6 +809,12 @@ namespace Snad
                 if (s > best) { best = s; bestAt = off; }
             }
             if (bestAt < 0) return -1;
+
+            // 相关峰必须为正，且要明显高于搜索起点处的值。
+            // 否则说明只是噪声里的偶然最大值，宁可报未找到。
+            double atStart = 0;
+            for (int i = 0; i < len; i += 4) atStart += capture[from + i] * tmpl[i];
+            if (best <= 0 || best < atStart * 4) return -1;
 
             int lo = Math.Max(from, bestAt - 12), hh = Math.Min(hi, bestAt + 12);
             for (int off = lo; off < hh; off++)
