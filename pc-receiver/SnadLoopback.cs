@@ -219,6 +219,7 @@ namespace Snad
             string e2eProfile = null;
             int e2ePort = 6981;
             double primeSec = 3.0;
+            double watchSec = 0;      // >0 时只监听并报峰值，不播放、不测量
 
             for (int i = 0; i + 1 < args.Length; i += 2)
             {
@@ -233,6 +234,7 @@ namespace Snad
                     case "repeat": repeat = Math.Max(1, int.Parse(v, CultureInfo.InvariantCulture)); break;
                     case "prebuffer": prebufferMs = Math.Max(0, int.Parse(v, CultureInfo.InvariantCulture)); break;
                     case "e2e": e2eProfile = v; break;
+                    case "watch": watchSec = double.Parse(v, CultureInfo.InvariantCulture); break;
                     case "port": e2ePort = int.Parse(v, CultureInfo.InvariantCulture); break;
                     case "prime": primeSec = double.Parse(v, CultureInfo.InvariantCulture); break;
                 }
@@ -270,6 +272,31 @@ namespace Snad
                 Console.WriteLine("采集设备就绪：" + cap.SampleRate + " Hz（已启动，累计 " +
                                   cap.Frames + " 帧）");
                 Console.WriteLine();
+
+                if (watchSec > 0)
+                {
+                    // 只监听：报出窗口内峰值与过阈样本占比。
+                    // 用来分辨"设备根本没出声"和"出了声但不是我们要的串"——
+                    // 这两种成因的处理完全不同。
+                    long startFrames = cap.Frames;
+                    Thread.Sleep((int)(watchSec * 1000));
+                    float[] all = cap.Samples;
+                    int from = (int)Math.Max(0, startFrames);
+                    double peak = 0;
+                    long above = 0;
+                    for (int i = from; i < all.Length; i++)
+                    {
+                        double a = Math.Abs(all[i]);
+                        if (a > peak) peak = a;
+                        if (a >= 0.01) above++;
+                    }
+                    int total = Math.Max(1, all.Length - from);
+                    Console.WriteLine("监听 " + watchSec.ToString("F1") + " 秒（" + total + " 帧）：");
+                    Console.WriteLine("  峰值        " + peak.ToString("F5"));
+                    Console.WriteLine("  ≥0.01 占比  " + (above * 100.0 / total).ToString("F2") + " %");
+                    Console.WriteLine("  结论        " + (peak < 0.005 ? "设备基本静音" : "设备有输出"));
+                    return 0;
+                }
 
                 if (e2eProfile != null)
                 {
@@ -475,7 +502,21 @@ namespace Snad
                 if (a > peakAmp) peakAmp = a;
             }
 
-            int found = FindBurst(all, from, BuildBurstFloat(rate, channels), rate);
+            // 先用包络找到"真的有声音"的起点，再在它附近用相关细化。
+            // 直接全局相关会在静音段锁到起点，给出 0 或负数的假结果。
+            int found = FindBurstEnvelope(all, from, 8, 0.08);
+            if (found >= 0)
+            {
+                var burstF = BuildBurstFloat(rate, channels);
+                int coarse = found;
+                int fine = FindBurst(all, Math.Max(from, coarse - 400), burstF, rate);
+                if (fine >= 0 && Math.Abs(fine - coarse) <= 400) found = fine;
+            }
+            else
+            {
+                // 包络没找到时再退回全局相关，但要求相关峰足够显著
+                found = FindBurst(all, from, BuildBurstFloat(rate, channels), rate);
+            }
             if (found < 0)
             {
                 Console.WriteLine("  第 " + round + " 次：采集中未找到信号" +
@@ -836,6 +877,27 @@ namespace Snad
             }
             _ = rate;
             return bestAt;
+        }
+
+        /// <summary>
+        /// 按包络定位噪声串起点：连续若干个样本同时超过阈值，才算"这里真的是信号"。
+        ///
+        /// 为什么不用全局相关：静音段的相关值恒为 0，最大值会退化成搜索起点，
+        /// 于是算出 0.00 或负的假数。先按幅度找到候选区间，
+        /// 再在局部做相关细化，才能既稳又准。
+        /// </summary>
+        private static int FindBurstEnvelope(float[] capture, int from, int minAmpSamples, double threshold)
+        {
+            int n = 0;
+            for (int i = from; i < capture.Length; i++)
+            {
+                if (Math.Abs(capture[i]) >= threshold)
+                {
+                    if (++n >= minAmpSamples) return i - n + 1;
+                }
+                else n = 0;
+            }
+            return -1;
         }
     }
 }
