@@ -297,8 +297,26 @@ namespace Snad
 
         public int Write(byte[] buffer, int offset, int count)
         {
+            return Write(buffer, offset, count, _format);
+        }
+
+        /// <summary>
+        /// 写入音频，并显式声明**输入数据的位深**。
+        ///
+        /// 这一条是修 bug 修的：接收器的 pull 交出的是 PCM16（环形缓冲的出口固定是 16bit），
+        /// 而共享模式下 sink 的设备格式是 float32。原先 Write 一律按设备格式解码，
+        /// 于是把两字节样本当四字节浮点读——设备收到的是稀疏的满幅垃圾。
+        /// 实测证据：接上接收器后设备输出峰值 0.99999、但只有 3% 的样本有内容；
+        /// 而同一 sink 直连测试（写入方按 float32 供数）一切正常。
+        ///
+        /// 因此输入格式与设备格式必须分开：输入按 <paramref name="inputFormat"/> 解码，
+        /// 存进环形缓冲的中间表示始终是 float，输出时再按设备格式编码。
+        /// </summary>
+        public int Write(byte[] buffer, int offset, int count, SampleFormat inputFormat)
+        {
             if (_ring == null) return 0;
-            int frameBytes = _bytesPerSample * _channels;
+            int inBytesPerSample = AudioCodec.BytesPerSample(inputFormat);
+            int frameBytes = inBytesPerSample * _channels;
             int frames = count / frameBytes;
             if (frames <= 0) return 0;
 
@@ -311,7 +329,7 @@ namespace Snad
                     int src = offset + i * frameBytes;
                     int dst = _ringWrite * _channels;
                     for (int c = 0; c < _channels; c++)
-                        _ring[dst + c] = AudioCodec.Decode(buffer, src + c * _bytesPerSample, _format);
+                        _ring[dst + c] = AudioCodec.Decode(buffer, src + c * inBytesPerSample, inputFormat);
                     _ringWrite = (_ringWrite + 1) % _ringFrames;
                 }
                 _ringCount += taken;

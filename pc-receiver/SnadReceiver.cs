@@ -848,7 +848,10 @@ namespace Snad
                     int attempts = 0;
                     while (off < data.Length && !token.IsCancellationRequested)
                     {
-                        int n = sink.Write(data, off, data.Length - off);
+                        // pull 交出的固定是 PCM16（环形缓冲的出口就是 16bit），
+                        // 必须显式告诉 sink —— 共享模式下设备格式是 float32，
+                        // 按设备格式解码 PCM16 会得到稀疏满幅噪声。
+                        int n = sink.Write(data, off, data.Length - off, SampleFormat.Pcm16);
                         attempts++;
                         if (n <= 0) { fullWaits++; Thread.Sleep(1); continue; }
                         off += n;
