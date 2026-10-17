@@ -236,6 +236,21 @@ if ((Test-Path 'SnadBufferPolicyTest.cs') -and (Test-Path 'SnadBufferPolicy.cs')
     Install-Binary 'SnadBufferPolicyTest.new.exe' 'SnadBufferPolicyTest.exe'
 }
 
+# ---- 位深路径对拍（计划 §8④）----
+#
+# 不只验比特率与帧率，而是逐样本比对：证明 24bit 的低 8 位真的参与运算、
+# 没有被悄悄截断成 16bit，且超范围时钳位而不回绕。
+# 它直接调用接收器写包用的 SampleRing，不是另写一份公式。
+if ((Test-Path 'SnadBitPathTest.cs') -and (Test-Path 'SnadReceiver.cs')) {
+    $bp2Args = @('/nologo', '/target:exe', '/platform:x64', '/optimize+',
+                 '/main:Snad.BitPathTest', '/out:SnadBitPathTest.new.exe', '/define:CONSOLE_BUILD')
+    foreach ($a in $coreRefs) { $bp2Args += ("/r:" + (Join-Path $fw $a)) }
+    $bp2Args += $receiverCoreSources + @('SnadBitPathTest.cs')
+    & $csc @bp2Args
+    if ($LASTEXITCODE -ne 0) { throw "位深路径对拍工具编译失败，csc 退出码 $LASTEXITCODE" }
+    Install-Binary 'SnadBitPathTest.new.exe' 'SnadBitPathTest.exe'
+}
+
 # ---- 到达统计验证 ----
 #
 # 抖动与漂移这两个数决定"缓冲该留多深"，必须能用已知输入精确验证。
