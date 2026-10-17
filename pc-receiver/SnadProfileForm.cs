@@ -1503,6 +1503,7 @@ namespace Snad
             {
                 Name = src.Name,
                 Description = src.Description,
+                Tags = src.Tags,
                 Backend = src.Backend,
                 DeviceId = src.DeviceId,
                 Format = src.Format,
@@ -1533,6 +1534,7 @@ namespace Snad
                 ReportedCaptureMs = src.ReportedCaptureMs,
                 EqEnabled = src.EqEnabled,
                 EqPreampDb = src.EqPreampDb,
+                Dither = src.Dither,
                 EqGains = src.EqGains
             };
         }
