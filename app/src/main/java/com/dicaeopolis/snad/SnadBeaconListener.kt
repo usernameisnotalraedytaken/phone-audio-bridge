@@ -121,10 +121,14 @@ class SnadBeaconListener(
                 val typeByte = if (packet.length > 9) packet.data[9] else 0
                 if (packet.length >= SnadTimeSync.PROBE_SIZE &&
                     typeByte == SnadTimeSync.TYPE_PROBE) {
-                    if (timeSyncKey == null) {
+                    // 先取到局部变量再判空：timeSyncKey 是 @Volatile 属性，
+                    // Kotlin 不允许对它做智能转换（它可能在判断与使用之间被改）。
+                    // CI 曾因此编译失败：Smart cast to 'ByteArray' is impossible。
+                    val tkey = timeSyncKey
+                    if (tkey == null) {
                         onLog("收到时间同步探测，但密钥未就绪，无法回应")
                     } else {
-                        val reply = SnadTimeSync.replyTo(packet.data, packet.length, timeSyncKey)
+                        val reply = SnadTimeSync.replyTo(packet.data, packet.length, tkey)
                         reply.fold(
                             onSuccess = { bytes ->
                                 try {
