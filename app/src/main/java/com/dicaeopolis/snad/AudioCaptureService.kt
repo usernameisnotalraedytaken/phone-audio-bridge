@@ -11,6 +11,7 @@ import android.media.AudioAttributes
 import android.media.AudioFormat
 import android.media.AudioPlaybackCaptureConfiguration
 import android.media.AudioRecord
+import android.media.AudioTimestamp
 import android.media.projection.MediaProjection
 import android.media.projection.MediaProjectionManager
 import android.os.Build
@@ -128,54 +129,26 @@ class AudioCaptureService : Service() {
             try {
                 sock = DatagramSocket()
 
-                // 用反射拿 AudioRecord.getTimestamp：
-                // 编译期直接用嵌套类 AudioRecord.AudioTimestamp 时，CI 上解析不到
-                // （compileSdk 35、无同名冲突，原因未查明），而手机上是否支持该 API
-                // 本来就因厂商而异。反射可以做到"拿到就用，拿不到如实上报"，
-                // 不会因为一个可选 API 让整个构建失败。
-                var tsCls: Class<*>? = null
-                var tsObj: Any? = null
-                var getTs: java.lang.reflect.Method? = null
-                var fNano: java.lang.reflect.Field? = null
-                var fPos: java.lang.reflect.Field? = null
-                var tsTimebase: Int = 2
+                // 直接用强类型 API，不再用反射。
+                //
+                // 走过两轮反射的弯路，原因是我把类名写成了嵌套类
+                // AudioRecord$AudioTimestamp（不存在），才以为是编译期可用性问题。
+                // 真正正确的写法就是下面这几行：签名由编译器校验，
+                // 有错在构建阶段就报，不必等到装机才发现。
+                //
+                // getTimestamp 是两参数版本：getTimestamp(AudioTimestamp, int timebase)。
+                // TIMEBASE_BOOTTIME 让 nanoTime 落在 elapsedRealtime 时钟域，
+                // 与音频包时间戳同源，省掉跨时钟换算。
+                val ts = AudioTimestamp()
+                var tsUsable = true
                 try {
-                    // 先取成局部 val 再赋值：tsCls 若是 Class<*>?，
-                    // getMethod 的变参会因可空而编译不过。
-                    //
-                    // 类名必须是**顶层类** android.media.AudioTimestamp。
-                    // 我最初写成 AudioRecord$AudioTimestamp（不存在的嵌套类），
-                    // 于是 CI 报"解析不到"、真机抛 ClassNotFoundException，
-                    // 而我当时还把原因归到"厂商 ROM 不支持"上——那是不对的：
-                    // 是我写错了名字，不是设备的问题。
-                    val cls = Class.forName("android.media.AudioTimestamp")
-                    val obj = cls.getDeclaredConstructor().newInstance()
-                    tsCls = cls
-                    tsObj = obj
-                    // 必须是两参数版本：getTimestamp(AudioTimestamp, int timebase)。
-                    // 一参数版本在真机上抛 NoSuchMethodException（已实测），
-                    // 我之前按一参数写，白烧了两轮构建。
-                    getTs = AudioRecord::class.java.getMethod("getTimestamp", cls, Integer.TYPE)
-                    fNano = cls.getField("nanoTime")
-                    fPos = cls.getField("framePosition")
-
-                    // timebase 常量从类里读，不写死 1/2：
-                    //   TIMEBASE_BOOTTIME  —— 与 elapsedRealtime 同一时钟域（首选）
-                    //   TIMEBASE_MONOTONIC —— 退而求其次，需要额外换算
-                    var tb = 2
-                    try { tb = cls.getField("TIMEBASE_BOOTTIME").getInt(null) }
-                    catch (e: Throwable) {
-                        try { tb = cls.getField("TIMEBASE_MONOTONIC").getInt(null) }
-                        catch (e2: Throwable) {
-                            SnadLog.wrn(TAG, "读不到 timebase 常量，按 2(BOOTTIME) 试")
-                        }
-                    }
-                    tsTimebase = tb
-                    SnadLog.info(TAG, "采样钟：getTimestamp 可用（timebase=" + tb + "）")
+                    val rc = ar.getTimestamp(ts, AudioTimestamp.TIMEBASE_BOOTTIME)
+                    tsUsable = (rc == AudioRecord.SUCCESS)
+                    if (tsUsable) SnadLog.info(TAG, "采样钟：getTimestamp 可用（BOOTTIME）")
+                    else SnadLog.wrn(TAG, "采样钟：getTimestamp 返回 $rc，本机不支持")
                 } catch (e: Throwable) {
-                    SnadLog.wrn(TAG, "采样钟：本机不支持 getTimestamp" +
-                            "（${e.javaClass.simpleName}: ${e.message}），" +
-                            "flags 将恒为 0，PC 侧只能退化为 read 时刻")
+                    tsUsable = false
+                    SnadLog.wrn(TAG, "采样钟：getTimestamp 不可用（${e.javaClass.simpleName}: ${e.message}）")
                 }
 
                 var failStreak = 0L
@@ -189,20 +162,16 @@ class AudioCaptureService : Service() {
                     var ok = false
                     var capNs = 0L
                     var capPos = 0
-                    // 取局部非空变量再调用：字段是 var 且可空，直接传参会因可空编译不过。
-                    val mGet = getTs
-                    val tObj = tsObj
-                    if (mGet != null && tObj != null) {
+                    if (tsUsable) {
                         try {
-                            // 返回 int 状态码：0 = SUCCESS，非 0 表示该设备不支持。
-                            val rc = mGet.invoke(ar, tObj, tsTimebase) as? Int ?: -1
-                            ok = rc == 0
+                            val rc = ar.getTimestamp(ts, AudioTimestamp.TIMEBASE_BOOTTIME)
+                            ok = (rc == AudioRecord.SUCCESS)
                             if (ok) {
-                                capNs = fNano?.getLong(tObj) ?: 0L
-                                capPos = fPos?.getInt(tObj) ?: 0
+                                capNs = ts.nanoTime
+                                capPos = ts.framePosition
                             }
                         } catch (e: Throwable) {
-                            SnadLog.wrn(TAG, "getTimestamp 反射调用失败：${e.javaClass.simpleName}")
+                            SnadLog.wrn(TAG, "getTimestamp 调用失败：${e.javaClass.simpleName}")
                         }
                     }
                     val el = SystemClock.elapsedRealtimeNanos()
