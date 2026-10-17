@@ -23,6 +23,7 @@ namespace Snad
         private WheelSelector _deviceBox;
         private FlatButton _startBtn;
         private FlatButton _eqBtn;
+        private FlatButton _cfgBtn;
         private SpectrumGraph _graph;
         private MetricStrip _metrics;
         private Panel _logBar;                 // 底部一行状态，点击弹出日志窗口
@@ -42,6 +43,14 @@ namespace Snad
         // ---- 状态 ----
         private Dictionary<string, Profile> _profiles;
         private string _cfgPath;
+
+        /// <summary>
+        /// 重填下拉时抑制 SelectedIndexChanged。
+        ///
+        /// 否则重新载入档位列表会把"程序设置选中项"误当成"用户切了档位"，
+        /// 从而触发一次 StopReceiver/StartReceiver——那是可听见的音频中断。
+        /// </summary>
+        private bool _suppressProfileEvent;
         private List<DeviceInfo> _devices;
         private int _deviceIndex = -1;
 
@@ -207,7 +216,10 @@ namespace Snad
             _eqBtn = new FlatButton("EQ") { Width = 88, Height = 32, Location = new Point(0, 10) };
             _eqBtn.Click += OnOpenEq;
 
-            controls.Controls.AddRange(new Control[] { _profileBox, _deviceBox, _startBtn, _eqBtn });
+            _cfgBtn = new FlatButton("CONFIG") { Width = 88, Height = 32, Location = new Point(0, 10) };
+            _cfgBtn.Click += OnOpenConfig;
+
+            controls.Controls.AddRange(new Control[] { _profileBox, _deviceBox, _startBtn, _eqBtn, _cfgBtn });
             controls.Resize += (s, e) => LayoutControlRow();
 
             // ---- 底部日志状态行 ----
@@ -460,9 +472,11 @@ namespace Snad
             CenterInRow(_deviceBox, midY);
             CenterInRow(_startBtn, midY);
             CenterInRow(_eqBtn, midY);
+            CenterInRow(_cfgBtn, midY);
 
-            // 右侧两个按钮先定位
-            _eqBtn.Left = right - _eqBtn.Width;
+            // 右侧按钮从右往左排：CONFIG | EQ | START
+            _cfgBtn.Left = right - _cfgBtn.Width;
+            _eqBtn.Left = _cfgBtn.Left - 8 - _eqBtn.Width;
             _startBtn.Left = _eqBtn.Left - 8 - _startBtn.Width;
 
             // 设备滚轮吃掉左侧剩余的全部宽度。
@@ -602,6 +616,9 @@ namespace Snad
 
         private void OnProfileChanged(object sender, EventArgs e)
         {
+            // 程序性重填下拉时不要当成用户切换，否则会白重启一次
+            if (_suppressProfileEvent) return;
+
             string name = _profileBox.SelectedItem;
             if (name == null || _profiles == null || !_profiles.ContainsKey(name)) return;
 
@@ -630,6 +647,68 @@ namespace Snad
         }
 
         // ------------------------------------------------------------------ 启停
+
+        /// <summary>
+        /// 打开配置编辑器。
+        ///
+        /// 保存后**不做自动重启**：编辑器里改了后端/设备/位深，需要重开流才生效，
+        /// 但用户可能还在改好几项。这里只刷新档位下拉并提示，
+        /// 由用户自己决定何时重启——静默重启会打断正在播放的音频。
+        /// </summary>
+        private void OnOpenConfig(object sender, EventArgs e)
+        {
+            if (_profiles == null) return;
+
+            // 编辑器直接读写内存里的档位字典与配置文件；
+            // 保存后重新载入一份，确保下拉里看到的就是磁盘上的内容
+            try
+            {
+                using (var f = new ProfileForm(_profiles, _cfgPath,
+                         _active != null ? _active.Name : null,
+                         AppendLog,
+                         () => { }))
+                {
+                    f.ShowDialog(this);
+                }
+            }
+            catch (Exception ex)
+            {
+                AppendLog("Config window failed: " + ex.GetType().Name + ": " + ex.Message);
+                Logger.Err("配置编辑器异常", ex);
+                return;
+            }
+
+            // 磁盘可能已被编辑器改动（新增/删除/改名），重新载入并保持当前选择
+            string keep = _active != null ? _active.Name : null;
+            string selected;
+            var reloaded = ProfileLibrary.Load(_cfgPath, out selected);
+
+            _profiles = reloaded;
+            var names = new List<string>(_profiles.Keys);
+            names.Sort(StringComparer.OrdinalIgnoreCase);
+
+            _suppressProfileEvent = true;
+            try
+            {
+                _profileBox.Items = names.ToArray();
+                int idx = keep != null ? names.IndexOf(keep) : -1;
+                if (idx < 0) idx = names.IndexOf(selected);
+                _profileBox.SelectedIndex = idx >= 0 ? idx : (names.Count > 0 ? 0 : -1);
+            }
+            finally { _suppressProfileEvent = false; }
+
+            Profile cur;
+            if (_active != null && _profiles.TryGetValue(_active.Name, out cur))
+            {
+                _active = cur;
+                ProfileLibrary.ApplyEq(_active, _idleEq);
+            }
+
+            AppendLog("Config reloaded: " + _profiles.Count + " profiles");
+
+            if (_receiver != null)
+                AppendLog("Note: backend/device/bit-depth changes need a restart to take effect.");
+        }
 
         private void OnStartStop(object sender, EventArgs e)
         {

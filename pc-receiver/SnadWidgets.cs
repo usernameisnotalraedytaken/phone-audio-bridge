@@ -423,6 +423,14 @@ namespace Snad
             Value = _value;
         }
 
+        // 只读访问器：供界面自渲染检查按语义挑控件并验证取值，
+        // 也便于外部把控件当前状态回报到日志。
+        public double Min { get { return _min; } }
+        public double Max { get { return _max; } }
+        public double Step { get { return _step; } }
+        public int Decimals { get { return _decimals; } }
+        public string Unit { get { return _unit; } }
+
         private Rectangle UpRect { get { return new Rectangle(Width - 18, 0, 18, Height / 2); } }
         private Rectangle DownRect { get { return new Rectangle(Width - 18, Height / 2, 18, Height - Height / 2); } }
 
@@ -435,30 +443,35 @@ namespace Snad
                 g.FillRectangle(bg, ClientRectangle);
 
             var r = new RectangleF(0.5f, 0.5f, Width - 1, Height - 1);
-            Theme.FillRoundGradient(g, r, 3f, Theme.Scale(Theme.BgRaised, 1.12f), Theme.Scale(Theme.BgRaised, 0.95f));
-            using (var pen = new Pen(Color.FromArgb(130, Theme.Line), 1f))
+            // 禁用态整体压暗：这类控件是自绘的，不压暗的话
+            // 用户看不出"这个值当前不生效"，会以为调了有用
+            bool on = Enabled;
+            Theme.FillRoundGradient(g, r, 3f,
+                Theme.Scale(Theme.BgRaised, on ? 1.12f : 0.80f),
+                Theme.Scale(Theme.BgRaised, on ? 0.95f : 0.70f));
+            using (var pen = new Pen(Color.FromArgb(on ? 130 : 60, Theme.Line), 1f))
                 Theme.DrawRound(g, pen, r, 3f);
 
             // 数值右对齐到按钮区左侧，等宽字体保证位数变化时不左右跳
             string text = _value.ToString("0." + new string('0', _decimals)) + " " + _unit;
             var sz = g.MeasureString(text, Font);
-            using (var br = new SolidBrush(Theme.TextPrimary))
+            using (var br = new SolidBrush(on ? Theme.TextPrimary : Theme.TextTertiary))
                 g.DrawString(text, Font, br, Width - 18 - sz.Width - 6, (Height - sz.Height) / 2f);
 
             // 上下按钮区：细分隔线 + 三角
-            using (var pen = new Pen(Color.FromArgb(110, Theme.Line), 1f))
+            using (var pen = new Pen(Color.FromArgb(on ? 110 : 55, Theme.Line), 1f))
             {
                 g.DrawLine(pen, Width - 18, 0, Width - 18, Height);
                 g.DrawLine(pen, Width - 18, Height / 2, Width, Height / 2);
             }
-            DrawArrow(g, UpRect, true, _hotZone == 1);
-            DrawArrow(g, DownRect, false, _hotZone == 2);
+            DrawArrow(g, UpRect, true, on && _hotZone == 1);
+            DrawArrow(g, DownRect, false, on && _hotZone == 2);
         }
 
         private void DrawArrow(Graphics g, Rectangle r, bool up, bool hot)
         {
             float cx = r.Left + r.Width / 2f, cy = r.Top + r.Height / 2f;
-            Color c = hot ? Theme.Accent : Theme.TextSecondary;
+            Color c = !Enabled ? Theme.TextTertiary : (hot ? Theme.Accent : Theme.TextSecondary);
             using (var br = new SolidBrush(c))
             {
                 PointF[] pts = up
@@ -492,6 +505,305 @@ namespace Snad
         {
             base.OnMouseWheel(e);
             Value = _value + (e.Delta > 0 ? _step : -_step);
+        }
+    }
+
+    /// <summary>
+    /// 下拉选择器：显示当前值，点击弹出一个列表窗口。
+    ///
+    /// 为什么用独立小窗口而不是就地展开：
+    ///   WheelSelector 那种"就地改变 Height 展开"的做法在密集表单里会压住
+    ///   相邻行，且展开高度受父容器裁剪。独立弹窗不受父容器裁剪，
+    ///   也不会打乱布局——标准下拉本来就是这么做的。
+    ///
+    /// 选项由外部给出，因此可以承载"设备能力决定的可选项"：
+    /// 只把设备真正支持的组合放进 Items，用户就选不出跑不起来的配置。
+    /// </summary>
+    internal sealed class FlatDropdown : Control
+    {
+        private string[] _items = new string[0];
+        private int _index;
+
+        public event EventHandler SelectionChanged;
+
+        public FlatDropdown()
+        {
+            SetStyle(ControlStyles.AllPaintingInWmPaint | ControlStyles.UserPaint |
+                     ControlStyles.OptimizedDoubleBuffer | ControlStyles.ResizeRedraw, true);
+            BackColor = Theme.BgRaised;
+            Font = Theme.Metric(8.5f);
+            Cursor = Cursors.Hand;
+            Width = 180;
+            Height = 24;
+        }
+
+        public string[] Items
+        {
+            get { return _items; }
+            set
+            {
+                _items = value ?? new string[0];
+                if (_index >= _items.Length) _index = Math.Max(0, _items.Length - 1);
+                Invalidate();
+            }
+        }
+
+        public int SelectedIndex
+        {
+            get { return _index; }
+            set
+            {
+                int v = value;
+                if (v < 0) v = 0;
+                if (v >= _items.Length) v = Math.Max(0, _items.Length - 1);
+                if (v == _index) return;
+                _index = v;
+                Invalidate();
+                if (SelectionChanged != null) SelectionChanged(this, EventArgs.Empty);
+            }
+        }
+
+        public string SelectedItem
+        {
+            get { return _index >= 0 && _index < _items.Length ? _items[_index] : ""; }
+        }
+
+        /// <summary>按内容选中。找不到时保持原样并返回 false。</summary>
+        public bool SelectText(string text)
+        {
+            for (int i = 0; i < _items.Length; i++)
+                if (string.Equals(_items[i], text, StringComparison.Ordinal)) { SelectedIndex = i; return true; }
+            return false;
+        }
+
+        protected override void OnPaint(PaintEventArgs e)
+        {
+            var g = e.Graphics;
+            Theme.SetupQuality(g);
+
+            bool on = Enabled;
+            bool active = on && (_hover || _open);
+            using (var bg = new SolidBrush(active ? Theme.BgActive
+                                        : on ? BackColor : Theme.Scale(BackColor, 0.82f)))
+                g.FillRectangle(bg, ClientRectangle);
+            using (var pen = new Pen(Color.FromArgb(active ? 150 : on ? 90 : 55, Theme.Line), 1f))
+                g.DrawRectangle(pen, 0, 0, Width - 1, Height - 1);
+
+            // 右侧箭头
+            int aw = 10;
+            float cx = Width - aw - 6, cy = Height / 2f;
+            using (var pen = new Pen(!on ? Theme.TextTertiary
+                                    : active ? Theme.Accent : Theme.TextTertiary, 1.6f))
+            {
+                g.DrawLine(pen, cx - 3, cy - 1.5f, cx, cy + 1.5f);
+                g.DrawLine(pen, cx, cy + 1.5f, cx + 3, cy - 1.5f);
+            }
+
+            // 文本：超出时截断并加省略号——宁可显示不全也不越界压住箭头
+            string text = SelectedItem;
+            float maxW = Width - aw - 14;
+            var sz = g.MeasureString(text, Font);
+            if (sz.Width > maxW)
+            {
+                string ell = "…";
+                float ellW = g.MeasureString(ell, Font).Width;
+                int lo = 0, hi = text.Length;
+                while (lo < hi)
+                {
+                    int mid = (lo + hi + 1) / 2;
+                    if (g.MeasureString(text.Substring(0, mid), Font).Width + ellW <= maxW) lo = mid;
+                    else hi = mid - 1;
+                }
+                text = lo > 0 ? text.Substring(0, lo) + ell : ell;
+                sz = g.MeasureString(text, Font);
+            }
+            using (var br = new SolidBrush(!on || _items.Length == 0 ? Theme.TextTertiary : Theme.TextPrimary))
+                g.DrawString(text, Font, br, 6, (Height - sz.Height) / 2f);
+        }
+
+        private bool _hover, _open;
+        private Form _popup;
+
+        protected override void OnMouseEnter(EventArgs e) { base.OnMouseEnter(e); _hover = true; Invalidate(); }
+        protected override void OnMouseLeave(EventArgs e) { base.OnMouseLeave(e); _hover = false; Invalidate(); }
+
+        protected override void OnMouseDown(MouseEventArgs e)
+        {
+            base.OnMouseDown(e);
+            if (_items.Length == 0) return;
+            ShowPopup();
+        }
+
+        private void ShowPopup()
+        {
+            if (_popup != null) { ClosePopup(); return; }
+
+            _open = true;
+            Invalidate();
+
+            var popup = new Form
+            {
+                FormBorderStyle = FormBorderStyle.None,
+                ShowInTaskbar = false,
+                StartPosition = FormStartPosition.Manual,
+                BackColor = Theme.BgPanel,
+                MinimumSize = Size.Empty
+            };
+
+            var f = Font;
+            int rowH = Math.Max(22, (int)Math.Ceiling(f.Height * 1.6f));
+            int rows = Math.Min(_items.Length, 12);
+            int w = Math.Max(Width, 160);
+            // 宽度按最长项撑开，但不超过 520——设备名可能很长
+            using (var g = CreateGraphics())
+            {
+                foreach (var it in _items)
+                {
+                    int need = (int)Math.Ceiling(g.MeasureString(it, f).Width) + 20;
+                    if (need > w) w = Math.Min(520, need);
+                }
+            }
+            popup.ClientSize = new Size(w, rows * rowH + 2);
+
+            var list = new DropList(this, rowH) { Dock = DockStyle.Fill };
+            popup.Controls.Add(list);
+
+            // 定位到本控件下方；下方空间不足时改到上方
+            var screen = PointToScreen(new Point(0, Height));
+            var wa = Screen.FromControl(this).WorkingArea;
+            int y = screen.Y;
+            if (y + popup.Height > wa.Bottom) y = PointToScreen(Point.Empty).Y - popup.Height;
+            popup.Location = new Point(screen.X, y);
+
+            popup.Deactivate += (s, e) => ClosePopup();
+            popup.FormClosed += (s, e) => { _open = false; _popup = null; Invalidate(); };
+            _popup = popup;
+            popup.Show(this);
+            popup.BringToFront();
+        }
+
+        private void ClosePopup()
+        {
+            if (_popup == null) return;
+            var p = _popup;
+            _popup = null;
+            _open = false;
+            try { p.Close(); } catch { }
+            Invalidate();
+        }
+
+        /// <summary>弹窗内的列表：点选即生效并关闭。键盘上下键也能选。</summary>
+        private sealed class DropList : Control
+        {
+            private readonly FlatDropdown _owner;
+            private readonly int _rowH;
+            private int _hot = -1;
+
+            public DropList(FlatDropdown owner, int rowH)
+            {
+                _owner = owner;
+                _rowH = rowH;
+                SetStyle(ControlStyles.AllPaintingInWmPaint | ControlStyles.UserPaint |
+                         ControlStyles.OptimizedDoubleBuffer | ControlStyles.ResizeRedraw, true);
+                BackColor = Theme.BgPanel;
+                TabStop = true;
+            }
+
+            protected override void OnPaint(PaintEventArgs e)
+            {
+                var g = e.Graphics;
+                Theme.SetupQuality(g);
+                using (var bg = new SolidBrush(Theme.BgPanel)) g.FillRectangle(bg, ClientRectangle);
+                using (var pen = new Pen(Theme.Line, 1f))
+                    g.DrawRectangle(pen, 0, 0, Width - 1, Height - 1);
+
+                var f = _owner.Font;
+                for (int i = 0; i < _owner._items.Length; i++)
+                {
+                    int y = 1 + i * _rowH;
+                    if (y > Height) break;
+                    bool sel = i == _owner._index;
+                    bool hot = i == _hot;
+                    if (sel || hot)
+                    {
+                        using (var br = new SolidBrush(sel ? Theme.BgActive : Theme.BgHover))
+                            g.FillRectangle(br, 1, y, Width - 2, _rowH);
+                    }
+                    if (sel)
+                    {
+                        using (var br = new SolidBrush(Theme.Accent))
+                            g.FillRectangle(br, 1, y, 2, _rowH);
+                    }
+                    using (var br = new SolidBrush(sel ? Theme.TextPrimary : Theme.TextSecondary))
+                        g.DrawString(_owner._items[i], f, br, 10, y + (_rowH - f.Height) / 2f);
+                }
+            }
+
+            protected override void OnMouseMove(MouseEventArgs e)
+            {
+                base.OnMouseMove(e);
+                int idx = (e.Y - 1) / Math.Max(1, _rowH);
+                if (idx < 0 || idx >= _owner._items.Length) idx = -1;
+                if (idx != _hot) { _hot = idx; Invalidate(); }
+            }
+
+            protected override void OnMouseDown(MouseEventArgs e)
+            {
+                base.OnMouseDown(e);
+                int idx = (e.Y - 1) / Math.Max(1, _rowH);
+                if (idx >= 0 && idx < _owner._items.Length)
+                {
+                    _owner.SelectedIndex = idx;
+                    _owner.ClosePopup();
+                }
+                else _owner.ClosePopup();
+            }
+
+            protected override bool IsInputKey(Keys keyData)
+            {
+                if ((keyData & Keys.KeyCode) == Keys.Up || (keyData & Keys.KeyCode) == Keys.Down ||
+                    (keyData & Keys.KeyCode) == Keys.Enter || (keyData & Keys.KeyCode) == Keys.Escape)
+                    return true;
+                return base.IsInputKey(keyData);
+            }
+
+            protected override void OnKeyDown(KeyEventArgs e)
+            {
+                base.OnKeyDown(e);
+                if (e.KeyCode == Keys.Escape) { _owner.ClosePopup(); e.Handled = true; return; }
+                if (e.KeyCode == Keys.Enter)
+                {
+                    if (_hot >= 0) _owner.SelectedIndex = _hot;
+                    _owner.ClosePopup();
+                    e.Handled = true;
+                    return;
+                }
+                if (e.KeyCode == Keys.Up) { _hot = Math.Max(0, (_hot < 0 ? _owner._index : _hot) - 1); Invalidate(); e.Handled = true; }
+                if (e.KeyCode == Keys.Down)
+                {
+                    _hot = Math.Min(_owner._items.Length - 1, (_hot < 0 ? _owner._index : _hot) + 1);
+                    Invalidate(); e.Handled = true;
+                }
+            }
+
+            protected override void OnMouseWheel(MouseEventArgs e)
+            {
+                base.OnMouseWheel(e);
+                _hot = Math.Max(0, Math.Min(_owner._items.Length - 1,
+                       (_hot < 0 ? _owner._index : _hot) + (e.Delta > 0 ? -1 : 1)));
+                Invalidate();
+            }
+
+            protected override void OnParentChanged(EventArgs e)
+            {
+                base.OnParentChanged(e);
+                // 弹出后立刻拿焦点，方向键才有效。
+                // Control.Focus() 返回 bool，不能直接当 Action，这里包一层。
+                System.Threading.Tasks.Task.Run(new Action(() =>
+                {
+                    try { BeginInvoke(new Action(() => { Focus(); })); } catch { }
+                }));
+            }
         }
     }
 }

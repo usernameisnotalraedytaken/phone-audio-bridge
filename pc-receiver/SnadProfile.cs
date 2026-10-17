@@ -123,8 +123,18 @@ namespace Snad
         /// </summary>
         public int EstimatedPipelineLatencyMs()
         {
+            return EstimatedPipelineLatencyMs(true);
+        }
+
+        /// <summary>
+        /// 估算延迟。<paramref name="includeOutputPool"/> = false 时不计输出缓冲池，
+        /// 用于 WASAPI 后端——那里的在飞量由驱动的设备缓冲与 sink 队列决定，
+        /// 不受 <see cref="WaveOutBuffers"/> 影响，算进去会得出一个虚高的数。
+        /// </summary>
+        public int EstimatedPipelineLatencyMs(bool includeOutputPool)
+        {
             return AndroidCaptureMs + NetworkMs + TargetBufferMs + BlockMs
-                 + WaveOutBuffers * BlockMs + LeadMs;
+                 + (includeOutputPool ? WaveOutBuffers * BlockMs : 0) + LeadMs;
         }
 
         /// <summary>
@@ -135,14 +145,37 @@ namespace Snad
         public const int AndroidCaptureMs = 8;
         public const int NetworkMs = 21;
 
+        /// <summary>后端是否走 WASAPI（决定估算里要不要计入 waveOut 缓冲池）。</summary>
+        public bool UsesWasapi
+        {
+            get
+            {
+                return Backend != null &&
+                       Backend.StartsWith("wasapi", StringComparison.OrdinalIgnoreCase);
+            }
+        }
+
         /// <summary>延迟构成的明细，供界面或日志展示估计的依据。</summary>
         public string LatencyBreakdown()
         {
+            return LatencyBreakdown(true);
+        }
+
+        /// <summary>
+        /// 延迟构成明细。<paramref name="includeOutputPool"/> = false 时，
+        /// 输出缓冲项改写为"由驱动决定"，因为那个量在启动前无法从配置推出。
+        /// </summary>
+        public string LatencyBreakdown(bool includeOutputPool)
+        {
+            string output = includeOutputPool
+                ? "pool " + (WaveOutBuffers * BlockMs)
+                : "driver buffers";
             return "capture " + AndroidCaptureMs + " + net " + NetworkMs
                  + " + jitter " + TargetBufferMs + " + block " + BlockMs
-                 + " + soundcard " + (WaveOutBuffers * BlockMs)
+                 + " + " + output
                  + " + lead " + LeadMs
-                 + " = " + EstimatedPipelineLatencyMs() + " ms";
+                 + " = " + (includeOutputPool ? "" : "at least ")
+                 + EstimatedPipelineLatencyMs(includeOutputPool) + " ms";
         }
 
         public override string ToString()
@@ -730,6 +763,67 @@ namespace Snad
         {
             if (p == null) return false;
             return SaveFields(path, p.Name, ToPairs(p), "此段落由配置编辑器保存");
+        }
+
+        /// <summary>
+        /// 从配置文件里删除某个档位的段落。
+        ///
+        /// 只删该段落本身（从段头到下一个段头之前），不触碰其他段落与注释。
+        /// 内置档位即使删掉段落也会回退到代码里的默认值——这是有意的：
+        /// 内置档位的默认值应当在代码里，配置文件只是覆盖。
+        /// </summary>
+        public static bool DeleteProfile(string path, string profileName)
+        {
+            if (string.IsNullOrEmpty(path) || string.IsNullOrEmpty(profileName)) return false;
+            if (!File.Exists(path)) return false;
+
+            string[] lines;
+            try { lines = File.ReadAllLines(path); }
+            catch (Exception ex) { Logger.Err("读取配置失败，未删除：" + path, ex); return false; }
+
+            string target = "[profile:" + profileName + "]";
+            var outLines = new List<string>(lines);
+            int start = -1, end = -1;
+
+            for (int i = 0; i < outLines.Count; i++)
+            {
+                string t = outLines[i].Trim();
+                if (!(t.StartsWith("[") && t.EndsWith("]"))) continue;
+
+                if (start < 0)
+                {
+                    if (string.Equals(t, target, StringComparison.OrdinalIgnoreCase))
+                    {
+                        start = i;
+                        // 顺带吃掉紧邻上方的自动生成注释，避免留下孤立注释
+                        int up = i - 1;
+                        while (up >= 0 && outLines[up].Trim().StartsWith("#"))
+                        {
+                            if (outLines[up].Contains("自动创建") || outLines[up].Contains("配置编辑器"))
+                                start = up;
+                            up--;
+                        }
+                    }
+                }
+                else { end = i; break; }
+            }
+
+            if (start < 0) return false;
+            if (end < 0) end = outLines.Count;
+
+            outLines.RemoveRange(start, end - start);
+
+            try
+            {
+                File.WriteAllLines(path, outLines.ToArray());
+                Logger.Info("已从 " + path + " 删除档位 " + profileName);
+                return true;
+            }
+            catch (Exception ex)
+            {
+                Logger.Err("写入配置失败，未删除：" + path, ex);
+                return false;
+            }
         }
 
         /// <summary>把档位里保存的均衡器设置套用到均衡器实例上。</summary>

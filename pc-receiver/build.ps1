@@ -183,6 +183,42 @@ if (Test-Path 'SnadWaveOutTest.cs') {
     Install-Binary 'SnadWaveOutTest.new.exe' 'SnadWaveOutTest.exe'
 }
 
+# ---- 配置编辑器自渲染检查 ----
+#
+# 界面问题只有画出来才看得见。除出图外还断言"看着对但可能没接上"的几件事：
+# 字段编辑器都建出来了、设备下拉真枚举到了设备、改参数后延迟读数会变、
+# 切档位后控件值会跟着变。
+if ((Test-Path 'SnadProfileShot.cs') -and (Test-Path 'SnadProfileForm.cs')) {
+    $psArgs = @('/nologo', '/target:winexe', '/platform:x64', '/optimize+',
+                '/main:Snad.ProfileShot', '/out:SnadProfileShot.new.exe')
+    foreach ($a in $coreRefs) { $psArgs += ("/r:" + (Join-Path $fw $a)) }
+    $psArgs += $receiverCoreSources + @('SnadTheme.cs', 'SnadControls.cs', 'SnadWidgets.cs',
+                                        'SnadProfileForm.cs', 'SnadLogView.cs', 'SnadLogForm.cs',
+                                        'SnadProfileShot.cs')
+    & $csc @psArgs
+    if ($LASTEXITCODE -ne 0) { throw "配置编辑器检查工具编译失败，csc 退出码 $LASTEXITCODE" }
+    Install-Binary 'SnadProfileShot.new.exe' 'SnadProfileShot.exe'
+}
+
+# ---- 回环测量 ----
+#
+# 计划 §3.2：用 WASAPI loopback 录下接收器实际放出来的声音，
+# 与"交出去的样本"对齐，得到**真实**的输出链路延迟。
+# 没有它，三档位的延迟数字只能是公式推的，而其中最大一项（缓冲池）
+# 从未被验证过——③ 的缓冲策略也就没有可比较的基准。
+#
+# 它要用生产的播放路径（WaveOut.Play / WasapiSink），因此必须带上
+# 接收器全套源文件，不能简化成独立的小程序。
+if (Test-Path 'SnadLoopback.cs') {
+    $lbArgs = @('/nologo', '/target:exe', '/platform:x64', '/optimize+',
+                '/main:Snad.LoopbackTest', '/out:SnadLoopback.new.exe', '/define:CONSOLE_BUILD')
+    foreach ($a in $coreRefs) { $lbArgs += ("/r:" + (Join-Path $fw $a)) }
+    $lbArgs += $receiverCoreSources + @('SnadLoopback.cs')
+    & $csc @lbArgs
+    if ($LASTEXITCODE -ne 0) { throw "回环测量工具编译失败，csc 退出码 $LASTEXITCODE" }
+    Install-Binary 'SnadLoopback.new.exe' 'SnadLoopback.exe'
+}
+
 # ---- 到达统计验证 ----
 #
 # 抖动与漂移这两个数决定"缓冲该留多深"，必须能用已知输入精确验证。
@@ -262,7 +298,7 @@ if (Test-Path 'SnadShot.cs') {
     $shotArgs = @('/nologo', '/target:winexe', '/platform:x64', '/optimize+',
                   '/main:Snad.Shot', '/out:SnadShot.exe')
     foreach ($a in $guiRefs) { $shotArgs += ("/r:" + (Join-Path $fw $a)) }
-    $shotArgs += $receiverCoreSources + @('SnadEqForm.cs', 'SnadSpectrum.cs', 'SnadGui.cs',
+    $shotArgs += $receiverCoreSources + @('SnadEqForm.cs', 'SnadProfileForm.cs', 'SnadSpectrum.cs', 'SnadGui.cs',
                    'SnadTheme.cs', 'SnadControls.cs', 'SnadWidgets.cs', 'SnadWordmark.cs',
                    'SnadChannelStrip.cs', 'SnadLogView.cs', 'SnadStereo.cs', 'SnadLogForm.cs',
                    'SnadGraph.cs', 'SnadMetricStrip.cs', 'SnadShot.cs')
@@ -293,7 +329,7 @@ if (Test-Path 'SnadPreview.cs') {
 
 # ---- 2) GUI 版 ----
 if ($buildGui) {
-    $guiSources = $receiverCoreSources + @('SnadEqForm.cs',
+    $guiSources = $receiverCoreSources + @('SnadEqForm.cs', 'SnadProfileForm.cs',
                     'SnadTheme.cs', 'SnadControls.cs', 'SnadWidgets.cs', 'SnadWordmark.cs', 'SnadChannelStrip.cs', 'SnadLogView.cs', 'SnadStereo.cs', 'SnadLogForm.cs', 'SnadGraph.cs', 'SnadMetricStrip.cs',
                     'SnadGui.cs', 'SnadSpectrum.cs')
     $missing = $guiSources | Where-Object { -not (Test-Path $_) }
