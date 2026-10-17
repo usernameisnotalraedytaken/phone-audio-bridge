@@ -466,10 +466,21 @@ namespace Snad
                 return -1;
             }
 
+            // 先报出窗口内峰值：区分"设备根本没出声"与"出了声但不是我们要的串"。
+            // 这两种成因的处理完全不同，不能只回一句"未找到"。
+            double peakAmp = 0;
+            for (int i = from; i < all.Length; i++)
+            {
+                double a = Math.Abs(all[i]);
+                if (a > peakAmp) peakAmp = a;
+            }
+
             int found = FindBurst(all, from, BuildBurstFloat(rate, channels), rate);
             if (found < 0)
             {
-                Console.WriteLine("  第 " + round + " 次：采集中未找到信号");
+                Console.WriteLine("  第 " + round + " 次：采集中未找到信号" +
+                                  "（窗口 " + from + ".." + all.Length + "，峰值 " +
+                                  peakAmp.ToString("F4") + (peakAmp < 0.005 ? "，几乎是静音" : "") + "）");
                 return -1;
             }
 

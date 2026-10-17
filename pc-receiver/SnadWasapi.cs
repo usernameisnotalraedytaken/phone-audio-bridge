@@ -120,6 +120,19 @@ namespace Snad
         public void Open(DeviceCapability device, SampleFormat format, int sampleRate, int channels,
                          int periodMs, bool exclusive)
         {
+            Open(device, format, sampleRate, channels, periodMs, exclusive, 0, 0);
+        }
+
+        /// <summary>
+        /// 打开设备。<paramref name="queueMs"/> 是调用方希望队列能容纳的深度
+        /// （通常取上游抖动缓冲的目标水位），<paramref name="maxQueueMs"/> 是上限。
+        ///
+        /// 队列深度本身就是延迟，所以不是越大越好；但它必须容得下上游维持的水位，
+        /// 否则上游会被反复抽干——这正是 WASAPI 路径读速率只有 30k/s 的成因。
+        /// </summary>
+        public void Open(DeviceCapability device, SampleFormat format, int sampleRate, int channels,
+                         int periodMs, bool exclusive, int queueMs, int maxQueueMs)
+        {
             if (device == null) throw new ArgumentNullException("device");
 
             _exclusive = exclusive;
@@ -242,10 +255,21 @@ namespace Snad
             // 整个容量的时间才轮到播放——**它直接等于该后端的稳态延迟**。
             // 所以它不是"越大越安全"，而是"多大就加多少延迟"。
             //
-            // 设备自身的缓冲（本机独占 42.7ms / 共享约 10ms）已经提供了
-            // 抗调度抖动的余量，环形缓冲只需覆盖"渲染线程两次取数之间"
-            // 写入侧的突发，不需要更深。取 2 倍设备缓冲与 40ms 的较大者。
-            int ringMs = Math.Max(40, (int)Math.Ceiling(_bufferFrames * 1000.0 / _rate) * 2);
+            // 容量由"上游愿意供多少"决定，而不是只看设备缓冲。
+            //
+            // 这一条是实测改出来的：原先取 max(40ms, 2×设备缓冲)=44ms，
+            // 结果上游的 80ms 抖动缓冲被 sink 一次灌满就抽到 16ms，
+            // 之后整条链路在"刚好够"的状态下跑，读速率只有 30k/s（应 48k），
+            // 设备大量时间在放静音，采集里根本听不到送出的信号。
+            //
+            // 队列必须容得下上游打算维持的水位（QueueMs 由调用方按档位给出），
+            // 否则水位会被 sink 反复抽干。上限仍受 maxQueueMs 约束，
+            // 因为队列深度本身也是延迟。
+            int wantMs = Math.Max(40, (int)Math.Ceiling(_bufferFrames * 1000.0 / _rate) * 2);
+            if (queueMs > 0) wantMs = Math.Max(wantMs, queueMs);
+            if (maxQueueMs > 0 && wantMs > maxQueueMs) wantMs = maxQueueMs;
+
+            int ringMs = wantMs;
             _ringFrames = Math.Max(_bufferFrames * 2, _rate * ringMs / 1000);
             _ring = new float[_ringFrames * _channels];
         }

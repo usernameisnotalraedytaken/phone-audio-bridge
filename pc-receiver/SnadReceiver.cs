@@ -775,7 +775,12 @@ namespace Snad
                 // "队列贴上限"这类异常的成因在渲染线程里，只有两边数据放一起才看得出
                 sink.SetVerbose(m => Logger.Info(m));
 
-                sink.Open(dev, fmt, sampleRate, channels, periodMs, exclusive);
+                // 队列要容得下上游打算维持的水位，否则会被反复抽干：
+                // 实测容量只有 44ms 时，80ms 的抖动缓冲一填满就被抽到 16ms，
+                // 之后读速率只有 30k/s（应 48k），设备大半时间在放静音。
+                // 上限取环形缓冲容量，避免队列本身变成延迟的大头。
+                sink.Open(dev, fmt, sampleRate, channels, periodMs, exclusive,
+                          profile.TargetBufferMs, profile.RingCapacityMs);
                 Logger.Info("WASAPI 已打开：" + sink.Name +
                             "  设备=" + dev.Name +
                             "  设备缓冲=" + sink.DeviceBufferMs.ToString("F1") + "ms" +
@@ -1304,7 +1309,8 @@ namespace Snad
                 int produced = 0;
                 for (int f = 0; f < outFrames; f++)
                 {
-                    if (_readFrame + 1 >= _framesWritten)
+                    // 真没数据：当前帧本身就不存在
+                    if (_readFrame >= _framesWritten)
                     {
                         if (countAsUnderrun) Interlocked.Increment(ref _underrunEvents);
                         else Interlocked.Increment(ref _primeFills);
@@ -1320,12 +1326,23 @@ namespace Snad
                     int s1 = (int)((_readFrame + 1) % _frameCap) * 2;
                     double frac = _readFrac;
 
+                    // 没有下一帧可供插值时，退化为直接取当前帧。
+                    // 旧代码把这种情况判成"没数据"，于是环形缓冲里的**最后一帧
+                    // 永远读不出来**（实测：只写 1 帧时 Read 返回 0 帧）。
+                    // 比率为 1.0 时本就不需要插值，这个退化是正确的。
+                    if (_readFrame + 1 >= _framesWritten) frac = 0;
+
                     float l = (float)(_slots[s0] * (1 - frac) + _slots[s1] * frac);
                     float r = (float)(_slots[s0 + 1] * (1 - frac) + _slots[s1 + 1] * frac);
                     if (frac > 0.0001) Interlocked.Increment(ref _interpolatedFrames);
 
-                    short ls = (short)Math.Max(-32768, Math.Min(32767, l * 32767f));
-                    short rs = (short)Math.Max(-32768, Math.Min(32767, r * 32767f));
+                    // 输出用 32768 还原，而不是 32767。
+                    //
+                    // 写侧是 s/32768，读侧若乘 32767 就会留下恒定 −1 LSB 偏差
+                    // （实测 1234 → 1233、32767 → 32766）。乘 32768 才是它的逆运算，
+                    // pcm16 输入可以逐位无损往返；+1.0 会得到 32768，靠钳位收住。
+                    short ls = (short)Math.Max(-32768, Math.Min(32767, l * 32768f));
+                    short rs = (short)Math.Max(-32768, Math.Min(32767, r * 32768f));
                     dest[f * 4] = (byte)(ls & 0xFF);
                     dest[f * 4 + 1] = (byte)((ls >> 8) & 0xFF);
                     dest[f * 4 + 2] = (byte)(rs & 0xFF);
