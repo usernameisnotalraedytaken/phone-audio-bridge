@@ -390,7 +390,7 @@ class AudioCaptureService : Service() {
                         sequence = seq++,
                         timestampMs = (SystemClock.elapsedRealtime() and 0xFFFFFFFFL).toInt(),
                         payloadBytes = filled,
-                        formatCode = formatCodeFor(chosenEncoding)
+                        formatCode = formatCodeFor(captureEncoding)
                     )
                     val buf = ByteArray(header.size + filled)
                     System.arraycopy(header, 0, buf, 0, header.size)
