@@ -22,6 +22,12 @@ namespace Snad
         public string Name = "balanced";
         public string Description = "";
 
+        /// <summary>
+        /// 标签，逗号分隔（计划 §1.7）。纯元信息，不参与任何计算，
+        /// 用途是让"低延迟""抗抖动""标定结果"这类档位能被一眼分辨与筛选。
+        /// </summary>
+        public string Tags = "";
+
         // ---- 延迟相关 ----
         /// <summary>抖动缓冲目标水位（毫秒）。这是延迟的最大单项。</summary>
         public int TargetBufferMs = 80;
@@ -471,6 +477,7 @@ namespace Snad
             {
                 case "name": p.Name = val; break;
                 case "description": p.Description = val; break;
+                case "tags": p.Tags = val.Trim(); break;
 
                 // ---- 输出后端 ----
                 case "backend":
@@ -894,6 +901,7 @@ namespace Snad
             var ci = CultureInfo.InvariantCulture;
 
             if (!string.IsNullOrEmpty(p.Description)) list.Add(kv("description", p.Description));
+            if (!string.IsNullOrEmpty(p.Tags)) list.Add(kv("tags", p.Tags));
 
             // 输出后端
             list.Add(kv("backend", p.Backend));

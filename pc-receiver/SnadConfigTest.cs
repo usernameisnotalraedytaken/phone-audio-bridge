@@ -150,6 +150,9 @@ namespace Snad
                 Name = "往返测试",
                 Backend = "wasapi_exclusive",
                 DeviceId = deviceId,
+                Description = "含中文的说明",
+                Tags = "lowlatency,wasapi",
+                Dither = true,
                 Format = "pcm24",
                 SampleRate = "48000",
                 WasapiPeriodMs = 3,
@@ -185,6 +188,8 @@ namespace Snad
                 Check(rt.DeviceId == deviceId, "device 读回正确（" + rt.DeviceId + "）");
                 Check(rt.Format == "pcm24", "format 读回正确（" + rt.Format + "）");
                 Check(rt.SampleRate == "48000", "samplerate 读回正确（" + rt.SampleRate + "）");
+                Check(rt.Tags == "lowlatency,wasapi", "tags 读回正确（" + rt.Tags + "）");
+                Check(rt.Dither, "dither 读回为 true");
                 Check(rt.DeclaredSampleRate() == 48000, "DeclaredSampleRate 解析为 48000");
                 Check(new Profile { SampleRate = "follow" }.DeclaredSampleRate() == 0,
                       "follow 解析为 0（跟随源）");
