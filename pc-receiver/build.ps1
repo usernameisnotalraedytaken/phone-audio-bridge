@@ -128,7 +128,7 @@ $audioCoreSources = @('SnadAudioSink.cs', 'SnadAudioCodec.cs', 'SnadAudioDevices
 
 # 接收器核心（Logger、接收循环、播放路径）。绝大多数工具都需要它。
 $receiverCoreSources = @('SnadReceiver.cs', 'SnadProfile.cs', 'SnadBeacon.cs', 'SnadBeaconService.cs',
-                         'SnadEq.cs', 'SnadSecret.cs') + $audioCoreSources
+                         'SnadEq.cs', 'SnadSecret.cs', 'SnadArrivalStats.cs') + $audioCoreSources
 
 # ---- 1) 控制台版（无 GUI，便于在无桌面环境或脚本中运行）----
 $consoleSources = $receiverCoreSources
@@ -181,6 +181,21 @@ if (Test-Path 'SnadWaveOutTest.cs') {
     & $csc @woArgs
     if ($LASTEXITCODE -ne 0) { throw "waveOut 基线测量工具编译失败，csc 退出码 $LASTEXITCODE" }
     Install-Binary 'SnadWaveOutTest.new.exe' 'SnadWaveOutTest.exe'
+}
+
+# ---- 到达统计验证 ----
+#
+# 抖动与漂移这两个数决定"缓冲该留多深"，必须能用已知输入精确验证。
+# 端到端注入受发包器调度误差与接收端欠载干扰，噪声远大于被测的量，
+# 因此这里直接对纯函数喂合成序列，结果是确定的。
+if ((Test-Path 'SnadArrivalStats.cs') -and (Test-Path 'SnadArrivalStatsTest.cs')) {
+    $arrArgs = @('/nologo', '/target:exe', '/platform:x64', '/optimize+',
+                 '/main:Snad.ArrivalStatsTest', '/out:SnadArrivalStatsTest.new.exe')
+    foreach ($a in $coreRefs) { $arrArgs += ("/r:" + (Join-Path $fw $a)) }
+    $arrArgs += @('SnadArrivalStats.cs', 'SnadArrivalStatsTest.cs')
+    & $csc @arrArgs
+    if ($LASTEXITCODE -ne 0) { throw "到达统计验证工具编译失败，csc 退出码 $LASTEXITCODE" }
+    Install-Binary 'SnadArrivalStatsTest.new.exe' 'SnadArrivalStatsTest.exe'
 }
 
 # ---- 发包器 ----

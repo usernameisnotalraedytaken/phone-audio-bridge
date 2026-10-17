@@ -675,6 +675,7 @@ namespace Snad
         [DllImport("ole32.dll")]
         private static extern int PropVariantClear(ref PROPVARIANT pvar);
 
+
         /// <summary>
         /// 按 profile 选定的后端播放。这是对外的统一入口。
         ///
@@ -1340,6 +1341,93 @@ namespace Snad
         private bool _formatLogged;
         private int _seqExpected = -1;
         private long _seqGaps, _seqMissing;
+
+        // ------------------------------------------------------------------ 到达时间统计
+        //
+        // 目的：把"网络与发送侧的抖动"变成可读数字，从而回答"缓冲该留多深"。
+        // 协议里一直带着发送端时间戳（偏移 14），但此前接收器根本没读它。
+        //
+        // 为什么不能直接算绝对延迟：
+        //   发送端时间戳来自手机的单调时钟，接收端用本机时钟，
+        //   两者起点与速率都不同，且没有往返测量可确定偏移。
+        //   但差值的**变化量**与偏移无关，因此抖动与漂移可以精确得出。
+        //   绝对延迟另用声卡回环测。
+        //
+        // 用滑动窗口而不是全局极值：
+        //   全局极值会被一次偶发尖峰永久污染，之后测什么都显示"抖动很大"。
+        //   窗口统计反映当前状态，与"当前需要多深的缓冲"一致。
+
+        private const int ArrivalWindow = 256;
+        private readonly double[] _arrivalOffset = new double[ArrivalWindow];
+        /// <summary>与 _arrivalOffset 对应的本地到达时刻，用于按实际窗口时长算漂移。</summary>
+        private readonly double[] _arrivalLocalMs = new double[ArrivalWindow];
+        private int _arrivalCount;
+        private int _arrivalWrite;
+        private long _arrivalTotal;
+        private double _tsFirstArrivalMs;
+        private int _tsFirstSender;
+
+        /// <summary>
+        /// 单调时钟（毫秒）。
+        ///
+        /// 不能用 Environment.TickCount：它是 **32 位**，约 49.7 天回绕一次，
+        /// 回绕时"本地经过时间"会跳成负数；而漂移用首尾均值斜率算，
+        /// 一次跳变就能把它污染成几十上百 ms/分（实测如此）。
+        /// Stopwatch 是 64 位单调时钟，不受系统时间调整影响。
+        /// （Environment.TickCount64 是 .NET Core 才有的 API，此处不可用。）
+        /// </summary>
+        private static readonly System.Diagnostics.Stopwatch Clock = System.Diagnostics.Stopwatch.StartNew();
+
+        /// <summary>记录一个包的"到达时刻 − 发送时刻"差值。</summary>
+        private void TrackArrival(int senderTsMs)
+        {
+            double nowMs = Clock.Elapsed.TotalMilliseconds;
+            if (_arrivalTotal == 0)
+            {
+                _tsFirstArrivalMs = nowMs;
+                _tsFirstSender = senderTsMs;
+            }
+
+            // 都取相对第一个包的增量，避免 senderTsMs 的低 32 位回绕影响
+            double senderElapsed = senderTsMs - (double)_tsFirstSender;
+            if (senderElapsed < -2147483648.0) senderElapsed += 4294967296.0;
+            double localElapsed = nowMs - _tsFirstArrivalMs;
+
+            // 差值 = 时钟偏移 + (网络与发送侧延迟)。偏移是常数，
+            // 因此差值的**变化**就是延迟的变化。
+            _arrivalOffset[_arrivalWrite] = localElapsed - senderElapsed;
+            _arrivalLocalMs[_arrivalWrite] = nowMs;
+            _arrivalWrite = (_arrivalWrite + 1) % ArrivalWindow;
+            if (_arrivalCount < ArrivalWindow) _arrivalCount++;
+            _arrivalTotal++;
+        }
+
+        /// <summary>
+        /// 到达抖动与漂移。返回 false 表示样本不足——此时不给数字，
+        /// 因为样本太少算出的"抖动"没有意义，报一个数反而误导。
+        /// 计算本身在 ArrivalStats 里，是纯函数，可脱离网络单独验证。
+        /// </summary>
+        public bool TryGetArrivalStats(out double jitterMs, out double driftMsPerMin, out double spanMs)
+        {
+            jitterMs = driftMsPerMin = spanMs = 0;
+            int n = _arrivalCount;
+            if (n < ArrivalStats.MinSamples) return false;
+
+            // 按时间顺序展开环形缓冲，连同各自的本地到达时刻一起交给纯函数。
+            // 传本地时刻是为了让漂移按**实际窗口时长**归一——
+            // 先前按固定的 21ms 包间隔估算，换个 block 大小就错了。
+            var offsets = new double[n];
+            var times = new double[n];
+            int start = n < ArrivalWindow ? 0 : _arrivalWrite;
+            for (int i = 0; i < n; i++)
+            {
+                int idx = (start + i) % ArrivalWindow;
+                offsets[i] = _arrivalOffset[idx];
+                times[i] = _arrivalLocalMs[idx];
+            }
+
+            return ArrivalStats.Compute(offsets, times, out jitterMs, out driftMsPerMin, out spanMs);
+        }
         private long _framesIn;            // 从网络收到的累计帧数（包级，未丢）
         private long _lastFramesIn, _lastFramesWritten, _lastFramesRead, _lastReadCalls;
         // 最近一次统计周期的速率，供 GUI 快照读取（避免 GUI 自己再算一遍）。
@@ -1522,7 +1610,19 @@ namespace Snad
                         int rate = BitConverter.ToInt32(pkt, 6);
                         int ch = pkt[5];
                         int seq = BitConverter.ToInt32(pkt, 10);
+                        int senderTsMs = BitConverter.ToInt32(pkt, 14);
                         int payload = BitConverter.ToInt32(pkt, 18);
+
+                        // 用发送端时间戳统计单程延迟的波动。
+                        //
+                        // 能得出什么、不能得出什么（重要）：
+                        //   两端时钟不同源，偏移未知，且拿不到往返时延，
+                        //   因此**无法**由它算出绝对延迟。
+                        //   但"到达时刻 − 发送时刻"这个差值的**变化量**与时钟偏移无关，
+                        //   它精确反映网络与发送侧的抖动——而这正是"缓冲要留多深"
+                        //   所依据的量。差值的长期趋势则反映两端时钟速率差（漂移）。
+                        //   绝对延迟另用声卡回环测。
+                        TrackArrival(senderTsMs);
                         if (payload <= 0 || Program.HeaderSize + payload > pkt.Length)
                         {
                             Interlocked.Increment(ref _badPayload);
@@ -1651,6 +1751,17 @@ namespace Snad
                                 _seqGaps, _seqMissing,
                                 Interlocked.Read(ref _shortPkt), Interlocked.Read(ref _badMagic),
                                 Interlocked.Read(ref _badVersion), Interlocked.Read(ref _badPayload)));
+
+                            // 到达抖动与漂移：这两个数决定"缓冲该留多深"，
+                            // 此前完全不可见（协议里一直带着时间戳但没人读）。
+                            double jit, drift, span;
+                            if (TryGetArrivalStats(out jit, out drift, out span))
+                            {
+                                Logger.Info(string.Format(
+                                    "[到达统计] 抖动 {0:F2} ms/包（相邻差值变化），" +
+                                    "窗口极差 {1:F1} ms，漂移 {2:+0.0;-0.0;0.0} ms/分",
+                                    jit, span, drift));
+                            }
 
                             _lastFramesIn = fIn;
                             _lastFramesWritten = fWr;

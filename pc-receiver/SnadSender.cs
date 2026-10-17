@@ -97,7 +97,7 @@ namespace Snad
                               payloadBytes + " 字节）");
             Console.WriteLine("  音调      " + toneHz.ToString("F0") + " Hz" + (silent ? "（静默）" : ""));
             Console.WriteLine("  丢包      " + lossPct.ToString("F1") + " %");
-            Console.WriteLine("  抖动      " + jitterMs.ToString("F1") + " ms");
+            Console.WriteLine("  抖动      0.." + jitterMs.ToString("F1") + " ms 随机（独立，不追补）");
             Console.WriteLine("  乱序      " + reorderPct.ToString("F1") + " %");
             if (timestampOffsetMs != 0)
                 Console.WriteLine("  时间戳偏移 " + timestampOffsetMs + " ms（故意错开，用于验证测量）");
@@ -132,18 +132,16 @@ namespace Snad
 
                 int packets = (int)(seconds * 1000 / blockMs);
 
+                long nextSendMs = 0;
                 for (int p = 0; p < packets; p++)
                 {
-                    // 按真实节奏发：每 blockMs 一个包
-                    long want = (long)p * blockMs;
-                    while (sw.ElapsedMilliseconds < want) Thread.Sleep(1);
-
-                    // 抖动：发送时刻随机偏移
-                    if (jitterMs > 0)
-                    {
-                        double j = (rnd.NextDouble() * 2 - 1) * jitterMs;
-                        if (j > 0) Thread.Sleep((int)Math.Round(j));
-                    }
+                    // 节奏：采集时刻严格每 blockMs 一次。
+                    //
+                    // 采集必须按固定时钟走——真实手机的采集缓冲是固定节拍，
+                    // 抖动发生在**采集之后**的网络传输上。
+                    // 因此这里先等到采集时刻、打时间戳，再施加传输延迟。
+                    while (sw.ElapsedMilliseconds < nextSendMs) Thread.Sleep(1);
+                    nextSendMs += blockMs;
 
                     bool drop = rnd.NextDouble() * 100 < lossPct;
 
@@ -151,10 +149,22 @@ namespace Snad
                     {
                         FillTone(pcm, framesPerPacket, channels, toneHz, ref phase, silent);
 
-                        // 时间戳 = 手机侧单调时钟低 32 位。用本进程启动以来的毫秒数，
-                        // 与实际发送时刻同源，因此接收端若将来用它算延迟，
-                        // 得到的会是真实值（可加偏移来模拟时钟不同步）。
+                        // 时间戳 = 采集时刻（手机侧单调时钟低 32 位），在施加传输抖动**之前**取。
+                        //
+                        // 这一点是注入能否生效的关键：若先延迟再打时间戳，
+                        // 这个包看起来只是"采集得更晚"，接收端算出的
+                        // arrival − timestamp 完全不变，注入等于没做
+                        // ——实测注入 0/8/20ms 测到的抖动都是 0.3ms 正是此因。
+                        // 真实网络是"包已按固定节拍产生，路上被耽搁"，
+                        // 所以先打戳、后延迟。
                         int ts = (int)((sw.ElapsedMilliseconds + timestampOffsetMs) & 0xFFFFFFFFL);
+
+                        // 传输抖动：独立随机延迟，不追补
+                        if (jitterMs > 0)
+                        {
+                            double j = rnd.NextDouble() * jitterMs;
+                            if (j >= 0.5) Thread.Sleep((int)Math.Round(j));
+                        }
 
                         byte[] pkt = BuildPacket(channels, rate, seq, ts, payloadBytes, pcm);
 
