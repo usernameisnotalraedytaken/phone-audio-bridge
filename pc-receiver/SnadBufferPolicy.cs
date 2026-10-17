@@ -47,6 +47,15 @@ namespace Snad
         /// </summary>
         void NotifyUnderrun();
 
+        /// <summary>
+        /// 是否处于振荡状态（计划 §9 风险表）。
+        ///
+        /// 只有自适应会振荡，其余策略恒为 false。
+        /// 判据基于**目标值的方向反转**，而不是目标值的绝对值——
+        /// 追着抖动来回调的目标看起来"一直在 80 附近"，其实一刻没停。
+        /// </summary>
+        bool Oscillating { get; }
+
         /// <summary>一行状态，写进周期日志。</summary>
         string Status();
     }
@@ -63,6 +72,7 @@ namespace Snad
         public string Name { get { return "static"; } }
         public int TargetMs { get { return _targetMs; } }
         public bool Frozen { get { return true; } }
+        public bool Oscillating { get { return false; } }   // 固定深度不会振荡
         public void Observe(int availableFrames, int sampleRate) { }
         public void NotifyUnderrun() { }
         public string Status() { return "固定 " + _targetMs + " ms"; }
@@ -141,15 +151,74 @@ namespace Snad
             _underrunBoostMs *= 0.995;
 
             double want = DesiredTargetMs();
+            double before = _targetMs;
             _targetMs += (want - _targetMs) * _rate;
             _targetMs = Clamp(_targetMs);
+
+            // 用"期望值与当前目标之差"的符号判方向，而不是目标本身的位移。
+            // 平滑后的目标在收敛前是单调的，看不出被拉扯；
+            // 而差值符号翻转，正是控制器一会儿想升、一会儿想降的直接证据。
+            TrackOscillation(want - before);
+        }
+
+        // ---- 振荡检测（计划 §9 风险表）----
+        //
+        // 自适应的经典失效方式是"追着抖动跑"：目标一会儿升一会儿降，
+        // 实际缓冲一直在被拉扯。只看目标值的绝对值看不出来，要看**方向反转**。
+        //
+        // 判据：目标移动超过 ReversalDeadbandMs 才算一次方向变化；
+        // 在一个观察窗口内方向反转达到 OscillationReversals 次即判定振荡。
+        private const double ReversalDeadbandMs = 0.5;
+        private const int OscillationReversals = 6;
+        private const int OscillationWindow = 200;   // 观察多少个 Observe 调用
+
+        private int _lastDir;                        // +1 升 / -1 降 / 0 未定
+        private int _reversals;                      // 当前窗口内
+        private int _reversalsTotal;                 // 累计，不清零
+        private int _windowTicks;
+        private bool _oscillating;
+
+        /// <summary>被判定为振荡中。宿主据此提示用户降低 adapt_rate 或改用静态。</summary>
+        public bool Oscillating { get { return _oscillating; } }
+
+        /// <summary>累计方向反转次数（不清零），供测试与诊断。</summary>
+        public int Reversals { get { return _reversalsTotal; } }
+
+        /// <summary>当前观察窗口内的反转次数。</summary>
+        public int WindowReversals { get { return _reversals; } }
+
+        private void TrackOscillation(double deltaMs)
+        {
+            _windowTicks++;
+
+            int dir = 0;
+            if (deltaMs > ReversalDeadbandMs) dir = 1;
+            else if (deltaMs < -ReversalDeadbandMs) dir = -1;
+
+            if (dir != 0)
+            {
+                if (_lastDir != 0 && dir != _lastDir)
+                {
+                    _reversals++;
+                    _reversalsTotal++;
+                }
+                _lastDir = dir;
+            }
+
+            if (_windowTicks >= OscillationWindow)
+            {
+                _oscillating = _reversals >= OscillationReversals;
+                _windowTicks = 0;
+                _reversals = 0;
+            }
         }
 
         public string Status()
         {
             return string.Format(CultureInfo.InvariantCulture,
-                "{0} 目标 {1:F0} ms（范围 {2}-{3}），平均掉坑 {4:F1} ms，欠载惩罚 {5:F1} ms",
-                Name, _targetMs, _minMs, _maxMs, _emaDipMs, _underrunBoostMs);
+                "{0} 目标 {1:F0} ms（范围 {2}-{3}），平均掉坑 {4:F1} ms，欠载惩罚 {5:F1} ms{6}",
+                Name, _targetMs, _minMs, _maxMs, _emaDipMs, _underrunBoostMs,
+                _oscillating ? "，**振荡中**（建议降低 adapt_rate 或改用 static）" : "");
         }
     }
 
@@ -193,6 +262,7 @@ namespace Snad
         public string Name { get { return "calibrated"; } }
         public int TargetMs { get { return (int)Math.Round(_targetMs); } }
         public bool Frozen { get { return _frozen; } }
+        public bool Oscillating { get { return false; } }   // 锁定后不再调整
 
         /// <summary>
         /// 标定期间发生欠载：记为一次"整段掉光"的样本。
