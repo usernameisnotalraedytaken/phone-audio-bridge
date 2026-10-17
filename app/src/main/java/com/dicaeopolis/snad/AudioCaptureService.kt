@@ -297,6 +297,11 @@ class AudioCaptureService : Service() {
                     "每包 ${pcm.size}B ≈ ${"%.1f".format(pcm.size * 1000.0 / (sampleRate * channels * 2))}ms")
             report("streaming", "$dest:$port  ${sampleRate}Hz/${channels}ch")
 
+            // 上报采集侧能力：让电脑端把"采集延迟"从按典型值猜变成已知。
+            // 采集缓冲取 AudioRecord 的真实值，而不是写死一个数——
+            // 各机型差异很大，猜出来的值会让延迟估算失真。
+            sendCapability(sock, dest, port, ar)
+
             var lastLog = SystemClock.elapsedRealtime()
 
             while (running.get()) {
@@ -388,6 +393,32 @@ class AudioCaptureService : Service() {
         try { ar?.stop() } catch (t: Throwable) { SnadLog.soft(TAG, "AudioRecord.stop", t) }
         try { ar?.release() } catch (t: Throwable) { SnadLog.soft(TAG, "AudioRecord.release", t) }
         try { sock?.close() } catch (t: Throwable) { SnadLog.soft(TAG, "DatagramSocket.close", t) }
+    }
+
+    /**
+     * 上报采集侧能力（type = 'C'，发往日志端口）。
+     *
+     * 采集缓冲取 AudioRecord 的真实 bufferSizeInFrames —— 各机型差异很大，
+     * 写死一个典型值会让电脑端的延迟估算失真。取不到时上报 0，
+     * 电脑端会退回按典型值估算并标注"估计"。
+     */
+    private fun sendCapability(sock: DatagramSocket, dest: InetAddress, port: Int, ar: AudioRecord) {
+        try {
+            val frames = runCatching { ar.bufferSizeInFrames }.getOrDefault(0)
+            val bufferMs = if (frames > 0 && sampleRate > 0) {
+                Math.round(frames * 1000.0 / sampleRate).toInt()
+            } else 0
+
+            // 当前采集固定 16bit；其余位深位置留着，等真正支持时再置位。
+            // 上报不声称没实现的能力。
+            val formatMask = 0x01
+            val pkt = SnadProtocol.buildCapability(sampleRate, bufferMs, formatMask)
+            sock.send(DatagramPacket(pkt, pkt.size, dest, port + 1))
+            SnadLog.info(TAG, "能力上报：${sampleRate}Hz，采集缓冲 ${bufferMs}ms（$frames 帧），位深 pcm16")
+        } catch (t: Throwable) {
+            // 上报失败不影响串流，但必须留痕，否则电脑端会一直用估计值而无人知道原因
+            SnadLog.soft(TAG, "能力上报发送失败", t)
+        }
     }
 
     private fun fail(msg: String) {

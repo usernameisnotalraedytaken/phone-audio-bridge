@@ -6,6 +6,11 @@
 #   但 VS Build Tools 自带 Roslyn 编译器，且系统有 .NET Framework 4.x 运行时程序集，
 #   因此直接调用 csc.exe 针对运行时程序集编译，零依赖、零安装。
 #
+# ⚠ 本文件必须带 UTF-8 BOM。
+#   Windows PowerShell 5.1 在中文系统上对无 BOM 的 .ps1 按 GBK 解码，
+#   于是这里的中文注释会变成乱码并破坏语法，报出难以理解的
+#   "表达式或语句中包含意外的标记"。踩过两次，改完务必确认前三字节是 EF BB BF。
+#
 # 用法：
 #   powershell -NoProfile -ExecutionPolicy Bypass -File build.ps1
 
@@ -15,17 +20,17 @@ $OutputEncoding = [Console]::OutputEncoding = New-Object System.Text.UTF8Encodin
 $here = Split-Path -Parent $MyInvocation.MyCommand.Path
 Set-Location $here
 
-# 正在运行的进程会锁住 exe，导致 csc 报 CS2012 无法写入。
-# 注意两个产物都要停：只停 SnadReceiver 会让 GUI 版编译失败（踩过一次）。
-# 编译后不自动重启，由调用方决定用什么参数启动。
-foreach ($name in @('SnadReceiver', 'SnadGui')) {
-    $running = Get-Process $name -ErrorAction SilentlyContinue
-    if ($running) {
-        Write-Host ("停止正在运行的 " + $name + " pid=" + (($running | ForEach-Object { $_.Id }) -join ','))
-        $running | Stop-Process -Force
-        Start-Sleep -Milliseconds 800
-    }
-}
+# 关于"程序正在运行时编译"：
+#
+# 之前这里会无差别停掉本项目的所有进程，但那是在替使用者做决定——
+# 正在用界面的人会突然被关掉程序。改为**不主动杀进程**：
+# 所有产物都先编译到 .new.exe，最后一步才替换目标文件
+# （见 Install-Binary）。编译阶段完全不碰目标文件，因此运行中的程序不受影响。
+# 只有替换那一瞬间需要文件空闲；若被占用，脚本会明确提示关闭后重试，
+# 而不是把使用者的程序杀掉。
+#
+# 产物若处于"文件已删除但进程仍持有句柄"的僵局（历史上因先杀进程再重建造成），
+# 换名编译也能绕开：csc 写的是 .new.exe，不会与那个残留句柄冲突。
 
 $csc = 'C:\Program Files (x86)\Microsoft Visual Studio\18\BuildTools\MSBuild\Current\Bin\Roslyn\csc.exe'
 if (-not (Test-Path $csc)) {
@@ -90,16 +95,179 @@ foreach ($asm in $coreRefs) {
 Write-Host "csc : $csc"
 Write-Host "refs: $fw"
 
+# ---- 编译产物落地的公共处理 ----
+#
+# 先编译到临时名，再替换目标文件。
+#
+# 原因：曾出现"目标文件不存在、但某进程的 Path 仍指向它"的僵局——
+# 进程运行时文件被删，句柄留在已删除的 inode 上，于是 csc 无法创建同名文件，
+# 而那个进程也不会自己退出，构建永久失败。
+# 先编到 .new 再替换，可保证：编译阶段不碰目标文件，
+# 只有替换那一瞬间需要文件未被占用。
+function Install-Binary {
+    param([string]$Temp, [string]$Target)
+    if (-not (Test-Path $Temp)) { throw ("编译产物缺失：" + $Temp) }
+    for ($i = 0; $i -lt 30; $i++) {
+        try {
+            if (Test-Path $Target) { Remove-Item $Target -Force -ErrorAction Stop }
+            Move-Item $Temp $Target -Force -ErrorAction Stop
+            return
+        } catch {
+            Start-Sleep -Milliseconds 200
+        }
+    }
+    throw ("无法替换 " + $Target + "：文件被占用。请关闭正在运行的本程序后重试。")
+}
+
+# ---- 共用源文件列表 ----
+#
+# 接收器现在可切换输出后端，因此凡是编译 SnadReceiver.cs 的目标都必须
+# 一并带上 WASAPI 那四个文件。这里集中定义，避免每加一个文件就去改多处
+# ——先前正是因为漏改而连续编译失败。
+$audioCoreSources = @('SnadAudioSink.cs', 'SnadAudioCodec.cs', 'SnadAudioDevices.cs', 'SnadWasapi.cs')
+
+# 接收器核心（Logger、接收循环、播放路径）。绝大多数工具都需要它。
+$receiverCoreSources = @('SnadReceiver.cs', 'SnadProfile.cs', 'SnadBeacon.cs', 'SnadBeaconService.cs',
+                         'SnadEq.cs', 'SnadSecret.cs', 'SnadArrivalStats.cs',
+                         'SnadBufferPolicy.cs', 'SnadWireProtocol.cs') + $audioCoreSources
+
 # ---- 1) 控制台版（无 GUI，便于在无桌面环境或脚本中运行）----
-$consoleSources = @('SnadReceiver.cs', 'SnadProfile.cs', 'SnadBeacon.cs', 'SnadBeaconService.cs', 'SnadSecret.cs')
+$consoleSources = $receiverCoreSources
 $consoleArgs = @('/nologo', '/target:exe', '/platform:x64', '/optimize+',
-                 '/out:SnadReceiver.exe', '/define:CONSOLE_BUILD')
+                 '/out:SnadReceiver.new.exe', '/define:CONSOLE_BUILD')
 foreach ($a in $coreRefs) { $consoleArgs += ("/r:" + (Join-Path $fw $a)) }
 $consoleArgs += $consoleSources
 & $csc @consoleArgs
 if ($LASTEXITCODE -ne 0) { throw "控制台版编译失败，csc 退出码 $LASTEXITCODE" }
+Install-Binary 'SnadReceiver.new.exe' 'SnadReceiver.exe'
 
-# ---- 1b) 信标协议验证工具（独立入口，用于在手机端实现前先证明协议可用）----
+# ---- 1b) 音频设备能力探测与后端延迟测量工具 ----
+#
+# 编辑器只允许用户选择"实际可用"的后端与周期组合，因此能力探测必须先行，
+# 且要是可信的工具而不是一次性脚本。探明的事实记录在
+# AUDIO-CAPABILITIES.md（设备能力）与 LATENCY-MEASURED.md（实测延迟）。
+#
+# 这四个工具共用 SnadAudioSink/Codec/Devices/Wasapi：
+#   SnadAudioProbe      设备能力枚举
+#   SnadWasapiTest      WASAPI 播放与延迟测量
+#   SnadWaveOutTest     waveOut 基线测量（对比用）
+#   SnadExclusiveProbe  独占模式可用组合穷举
+$audioCore = @('SnadAudioSink.cs', 'SnadAudioCodec.cs', 'SnadAudioDevices.cs', 'SnadWasapi.cs')
+
+if ((Test-Path 'SnadAudioProbe.cs') -and ($audioCore | Where-Object { Test-Path $_ } | Measure-Object).Count -eq $audioCore.Count) {
+    $audioTools = @(
+        @{ Main = 'Snad.AudioProbe';     Out = 'SnadAudioProbe';     Src = @('SnadAudioProbe.cs') },
+        @{ Main = 'Snad.WasapiTest';     Out = 'SnadWasapiTest';     Src = @('SnadWasapiTest.cs') },
+        @{ Main = 'Snad.ExclusiveProbe'; Out = 'SnadExclusiveProbe'; Src = @('SnadExclusiveProbe.cs') },
+        @{ Main = 'Snad.AudioCodecTest'; Out = 'SnadAudioCodecTest'; Src = @('SnadAudioCodecTest.cs') }
+    )
+    foreach ($t in $audioTools) {
+        if (-not (Test-Path $t.Src[0])) { continue }
+        $a = @('/nologo', '/target:exe', '/platform:x64', '/optimize+',
+               ('/main:' + $t.Main), ('/out:' + $t.Out + '.new.exe'))
+        foreach ($r in $coreRefs) { $a += ("/r:" + (Join-Path $fw $r)) }
+        $a += $audioCore + $t.Src
+        & $csc @a
+        if ($LASTEXITCODE -ne 0) { throw ($t.Out + " 编译失败，csc 退出码 $LASTEXITCODE") }
+        Install-Binary ($t.Out + '.new.exe') ($t.Out + '.exe')
+    }
+}
+
+# waveOut 基线测量不依赖上面的共用代码，单独编译
+if (Test-Path 'SnadWaveOutTest.cs') {
+    $woArgs = @('/nologo', '/target:exe', '/platform:x64', '/optimize+',
+                '/main:Snad.WaveOutTest', '/out:SnadWaveOutTest.new.exe')
+    foreach ($a in $coreRefs) { $woArgs += ("/r:" + (Join-Path $fw $a)) }
+    $woArgs += 'SnadWaveOutTest.cs'
+    & $csc @woArgs
+    if ($LASTEXITCODE -ne 0) { throw "waveOut 基线测量工具编译失败，csc 退出码 $LASTEXITCODE" }
+    Install-Binary 'SnadWaveOutTest.new.exe' 'SnadWaveOutTest.exe'
+}
+
+# ---- 配置编辑器自渲染检查 ----
+#
+# 界面问题只有画出来才看得见。除出图外还断言"看着对但可能没接上"的几件事：
+# 字段编辑器都建出来了、设备下拉真枚举到了设备、改参数后延迟读数会变、
+# 切档位后控件值会跟着变。
+if ((Test-Path 'SnadProfileShot.cs') -and (Test-Path 'SnadProfileForm.cs')) {
+    $psArgs = @('/nologo', '/target:winexe', '/platform:x64', '/optimize+',
+                '/main:Snad.ProfileShot', '/out:SnadProfileShot.new.exe')
+    foreach ($a in $coreRefs) { $psArgs += ("/r:" + (Join-Path $fw $a)) }
+    $psArgs += $receiverCoreSources + @('SnadTheme.cs', 'SnadControls.cs', 'SnadWidgets.cs',
+                                        'SnadProfileForm.cs', 'SnadLogView.cs', 'SnadLogForm.cs',
+                                        'SnadProfileShot.cs')
+    & $csc @psArgs
+    if ($LASTEXITCODE -ne 0) { throw "配置编辑器检查工具编译失败，csc 退出码 $LASTEXITCODE" }
+    Install-Binary 'SnadProfileShot.new.exe' 'SnadProfileShot.exe'
+}
+
+# ---- 回环测量 ----
+#
+# 计划 §3.2：用 WASAPI loopback 录下接收器实际放出来的声音，
+# 与"交出去的样本"对齐，得到**真实**的输出链路延迟。
+# 没有它，三档位的延迟数字只能是公式推的，而其中最大一项（缓冲池）
+# 从未被验证过——③ 的缓冲策略也就没有可比较的基准。
+#
+# 它要用生产的播放路径（WaveOut.Play / WasapiSink），因此必须带上
+# 接收器全套源文件，不能简化成独立的小程序。
+if (Test-Path 'SnadLoopback.cs') {
+    $lbArgs = @('/nologo', '/target:exe', '/platform:x64', '/optimize+',
+                '/main:Snad.LoopbackTest', '/out:SnadLoopback.new.exe', '/define:CONSOLE_BUILD')
+    foreach ($a in $coreRefs) { $lbArgs += ("/r:" + (Join-Path $fw $a)) }
+    $lbArgs += $receiverCoreSources + @('SnadLoopback.cs')
+    & $csc @lbArgs
+    if ($LASTEXITCODE -ne 0) { throw "回环测量工具编译失败，csc 退出码 $LASTEXITCODE" }
+    Install-Binary 'SnadLoopback.new.exe' 'SnadLoopback.exe'
+}
+
+# ---- 缓冲策略验证 ----
+#
+# 计划 §8 要求"抖动注入下跑三种策略，比较实测延迟与欠载次数"。
+# 端到端负责后者（接上去不炸、欠载不增加），但 adaptive/calibrated 的
+# 收敛行为依赖掉坑序列，端到端里那序列不可复现。因此收敛性用
+# 合成序列断言，结果确定、可解析核对。
+if ((Test-Path 'SnadBufferPolicyTest.cs') -and (Test-Path 'SnadBufferPolicy.cs')) {
+    $bpArgs = @('/nologo', '/target:exe', '/platform:x64', '/optimize+',
+                '/main:Snad.BufferPolicyTest', '/out:SnadBufferPolicyTest.new.exe', '/define:CONSOLE_BUILD')
+    foreach ($a in $coreRefs) { $bpArgs += ("/r:" + (Join-Path $fw $a)) }
+    $bpArgs += $receiverCoreSources + @('SnadBufferPolicyTest.cs')
+    & $csc @bpArgs
+    if ($LASTEXITCODE -ne 0) { throw "缓冲策略验证工具编译失败，csc 退出码 $LASTEXITCODE" }
+    Install-Binary 'SnadBufferPolicyTest.new.exe' 'SnadBufferPolicyTest.exe'
+}
+
+# ---- 到达统计验证 ----
+#
+# 抖动与漂移这两个数决定"缓冲该留多深"，必须能用已知输入精确验证。
+# 端到端注入受发包器调度误差与接收端欠载干扰，噪声远大于被测的量，
+# 因此这里直接对纯函数喂合成序列，结果是确定的。
+if ((Test-Path 'SnadArrivalStats.cs') -and (Test-Path 'SnadArrivalStatsTest.cs')) {
+    $arrArgs = @('/nologo', '/target:exe', '/platform:x64', '/optimize+',
+                 '/main:Snad.ArrivalStatsTest', '/out:SnadArrivalStatsTest.new.exe')
+    foreach ($a in $coreRefs) { $arrArgs += ("/r:" + (Join-Path $fw $a)) }
+    $arrArgs += @('SnadArrivalStats.cs', 'SnadArrivalStatsTest.cs')
+    & $csc @arrArgs
+    if ($LASTEXITCODE -ne 0) { throw "到达统计验证工具编译失败，csc 退出码 $LASTEXITCODE" }
+    Install-Binary 'SnadArrivalStatsTest.new.exe' 'SnadArrivalStatsTest.exe'
+}
+
+# ---- 发包器 ----
+#
+# 把"手机"变成本地一个进程：按相同协议送音频，并可注入丢包/抖动/乱序。
+# 在此之前，接收器的行为只能拿真手机试，无法自动回归。
+if (Test-Path 'SnadSender.cs') {
+    $sndArgs = @('/nologo', '/target:exe', '/platform:x64', '/optimize+',
+                 '/main:Snad.Sender', '/out:SnadSender.new.exe')
+    foreach ($a in $coreRefs) { $sndArgs += ("/r:" + (Join-Path $fw $a)) }
+    # 需要位深编解码：发包器要能按 v2 协议发 pcm16/24/32/float32，
+    # 且必须与接收端共用同一套编码规则，不能各写一份
+    $sndArgs += @('SnadAudioSink.cs', 'SnadAudioCodec.cs', 'SnadWireProtocol.cs', 'SnadSender.cs')
+    & $csc @sndArgs
+    if ($LASTEXITCODE -ne 0) { throw "发包器编译失败，csc 退出码 $LASTEXITCODE" }
+    Install-Binary 'SnadSender.new.exe' 'SnadSender.exe'
+}
+
+# ---- 1c) 信标协议验证工具（独立入口，用于在手机端实现前先证明协议可用）----
 if (Test-Path 'SnadBeaconTest.cs') {
     $testSources = @('SnadBeacon.cs', 'SnadBeaconService.cs', 'SnadSecret.cs', 'SnadBeaconTest.cs')
     $testArgs = @('/nologo', '/target:exe', '/platform:x64', '/optimize+',
@@ -110,20 +278,90 @@ if (Test-Path 'SnadBeaconTest.cs') {
     if ($LASTEXITCODE -ne 0) { throw "信标验证工具编译失败，csc 退出码 $LASTEXITCODE" }
 }
 
+# ---- 1d) 均衡器 DSP 验证工具 ----
+if (Test-Path 'SnadEqTest.cs') {
+    $eqTestArgs = @('/nologo', '/target:exe', '/platform:x64', '/optimize+',
+                    '/main:Snad.EqTest', '/out:SnadEqTest.exe')
+    foreach ($a in $coreRefs) { $eqTestArgs += ("/r:" + (Join-Path $fw $a)) }
+    $eqTestArgs += @('SnadEq.cs', 'SnadEqTest.cs')
+    & $csc @eqTestArgs
+    if ($LASTEXITCODE -ne 0) { throw "均衡器验证工具编译失败，csc 退出码 $LASTEXITCODE" }
+}
+
+# ---- 1d) 均衡器界面自渲染检查工具 ----
+if (Test-Path 'SnadEqShot.cs') {
+    $eqShotArgs = @('/nologo', '/target:winexe', '/platform:x64', '/optimize+',
+                    '/main:Snad.EqShot', '/out:SnadEqShot.exe')
+    foreach ($a in $guiRefs) { $eqShotArgs += ("/r:" + (Join-Path $fw $a)) }
+    $eqShotArgs += @('SnadEq.cs', 'SnadEqForm.cs', 'SnadEqShot.cs',
+                     'SnadTheme.cs', 'SnadControls.cs', 'SnadWidgets.cs', 'SnadWordmark.cs', 'SnadChannelStrip.cs', 'SnadLogView.cs', 'SnadStereo.cs', 'SnadLogForm.cs', 'SnadGraph.cs',
+                     'SnadMetricStrip.cs', 'SnadSpectrum.cs')
+    & $csc @eqShotArgs
+    if ($LASTEXITCODE -ne 0) { throw "均衡器界面检查工具编译失败，csc 退出码 $LASTEXITCODE" }
+}
+
+# ---- 1e) 配置读写往返验证工具 ----
+if (Test-Path 'SnadConfigTest.cs') {
+    $cfgTestArgs = @('/nologo', '/target:exe', '/platform:x64', '/optimize+',
+                     '/main:Snad.ConfigTest', '/out:SnadConfigTest.exe')
+    foreach ($a in $coreRefs) { $cfgTestArgs += ("/r:" + (Join-Path $fw $a)) }
+    # 需要 SnadReceiver.cs 是因为 Logger 定义在其中；而它又引用 SnadSecret，
+    # 因此密钥单元也必须一起编译。接收器现在可切换后端，故还需 WASAPI 那四个文件。
+    $cfgTestArgs += $receiverCoreSources + @('SnadConfigTest.cs')
+    & $csc @cfgTestArgs
+    if ($LASTEXITCODE -ne 0) { throw "配置验证工具编译失败，csc 退出码 $LASTEXITCODE" }
+}
+
+# ---- 1f) 界面自渲染检查工具（主界面 + 均衡器）----
+if (Test-Path 'SnadShot.cs') {
+    $shotArgs = @('/nologo', '/target:winexe', '/platform:x64', '/optimize+',
+                  '/main:Snad.Shot', '/out:SnadShot.exe')
+    foreach ($a in $guiRefs) { $shotArgs += ("/r:" + (Join-Path $fw $a)) }
+    $shotArgs += $receiverCoreSources + @('SnadEqForm.cs', 'SnadProfileForm.cs', 'SnadSpectrum.cs', 'SnadGui.cs',
+                   'SnadTheme.cs', 'SnadControls.cs', 'SnadWidgets.cs', 'SnadWordmark.cs',
+                   'SnadChannelStrip.cs', 'SnadLogView.cs', 'SnadStereo.cs', 'SnadLogForm.cs',
+                   'SnadGraph.cs', 'SnadMetricStrip.cs', 'SnadShot.cs')
+    & $csc @shotArgs
+    if ($LASTEXITCODE -ne 0) { throw "界面检查工具编译失败，csc 退出码 $LASTEXITCODE" }
+}
+
+# ---- 1h) 字标放大预览工具 ----
+if (Test-Path 'SnadWordShot.cs') {
+    $wordArgs = @('/nologo', '/target:winexe', '/platform:x64', '/optimize+',
+                  '/main:Snad.WordShot', '/out:SnadWordShot.exe')
+    foreach ($a in $guiRefs) { $wordArgs += ("/r:" + (Join-Path $fw $a)) }
+    $wordArgs += @('SnadTheme.cs', 'SnadWordmark.cs', 'SnadWordShot.cs')
+    & $csc @wordArgs
+    if ($LASTEXITCODE -ne 0) { throw "字标预览工具编译失败，csc 退出码 $LASTEXITCODE" }
+}
+
+# ---- 1g) UI 组件预览工具（频谱图与通道条单独渲染）----
+if (Test-Path 'SnadPreview.cs') {
+    $prevArgs = @('/nologo', '/target:winexe', '/platform:x64', '/optimize+',
+                  '/main:Snad.Preview', '/out:SnadPreview.exe')
+    foreach ($a in $guiRefs) { $prevArgs += ("/r:" + (Join-Path $fw $a)) }
+    $prevArgs += @('SnadTheme.cs', 'SnadControls.cs', 'SnadWidgets.cs', 'SnadWordmark.cs', 'SnadChannelStrip.cs', 'SnadLogView.cs', 'SnadStereo.cs', 'SnadLogForm.cs', 'SnadGraph.cs', 'SnadMetricStrip.cs',
+                   'SnadSpectrum.cs', 'SnadEq.cs', 'SnadPreview.cs')
+    & $csc @prevArgs
+    if ($LASTEXITCODE -ne 0) { throw "UI 预览工具编译失败，csc 退出码 $LASTEXITCODE" }
+}
+
 # ---- 2) GUI 版 ----
 if ($buildGui) {
-    $guiSources = @('SnadReceiver.cs', 'SnadProfile.cs', 'SnadBeacon.cs', 'SnadBeaconService.cs',
-                    'SnadSecret.cs', 'SnadGui.cs', 'SnadSpectrum.cs')
+    $guiSources = $receiverCoreSources + @('SnadEqForm.cs', 'SnadProfileForm.cs',
+                    'SnadTheme.cs', 'SnadControls.cs', 'SnadWidgets.cs', 'SnadWordmark.cs', 'SnadChannelStrip.cs', 'SnadLogView.cs', 'SnadStereo.cs', 'SnadLogForm.cs', 'SnadGraph.cs', 'SnadMetricStrip.cs',
+                    'SnadGui.cs', 'SnadSpectrum.cs')
     $missing = $guiSources | Where-Object { -not (Test-Path $_) }
     if ($missing.Count -eq 0) {
         $guiArgs = @('/nologo', '/target:winexe', '/platform:x64', '/optimize+',
-                     '/main:Snad.GuiEntry', '/out:SnadGui.exe')
+                     '/main:Snad.GuiEntry', '/out:SnadGui.new.exe')
         # 嵌入应用图标：双击时不再显示 .NET 默认图标
         if (Test-Path 'app.ico') { $guiArgs += '/win32icon:app.ico' }
         foreach ($a in $guiRefs) { $guiArgs += ("/r:" + (Join-Path $fw $a)) }
         $guiArgs += $guiSources
         & $csc @guiArgs
         if ($LASTEXITCODE -ne 0) { throw "GUI 版编译失败，csc 退出码 $LASTEXITCODE" }
+        Install-Binary 'SnadGui.new.exe' 'SnadGui.exe'
     } else {
         Write-Host ("跳过 GUI 版，缺少源文件: " + ($missing -join ', '))
     }

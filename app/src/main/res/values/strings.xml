@@ -19,4 +19,11 @@
     <string name="status_waiting">等待授权…</string>
     <string name="status_streaming">串流中</string>
     <string name="status_error">出错</string>
+
+    <!-- 自动发现：正常路径下用户不需要输入任何地址 -->
+    <string name="finding_pc">正在搜索电脑…</string>
+    <string name="finding_pc_hint">电脑端启动接收器后会每 2 秒广播一次，手机收到即自动连接。请确认电脑端已点「开始」。</string>
+    <string name="pc_found">已找到电脑</string>
+    <string name="btn_manual">手动指定地址</string>
+    <string name="btn_manual_hide">收起手动输入</string>
 </resources>

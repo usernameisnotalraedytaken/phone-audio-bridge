@@ -26,6 +26,34 @@ namespace Snad
         /// <summary>抖动缓冲目标水位（毫秒）。这是延迟的最大单项。</summary>
         public int TargetBufferMs = 80;
 
+        // ---- 缓冲策略 ----
+        //
+        // 目标水位由谁来定，本身就是个可配置的选择：
+        //   static      固定用 TargetBufferMs（行为与 v2.0 一致，可预测）
+        //   adaptive    按实测抖动自动调整，受 min/max 约束
+        //   calibrated  启动时观察一段时间，锁定一个够用的深度
+        //
+        // 回环实测（LATENCY-MEASURED.md）表明缓冲池不是稳态延迟，
+        // 真正决定延迟的是这个水位——所以它才是该被策略化的那个量。
+
+        /// <summary>缓冲策略：static / adaptive / calibrated。</summary>
+        public string BufferMode = "static";
+
+        /// <summary>自适应/标定时的下限（毫秒）。</summary>
+        public int MinBufferMs = 40;
+
+        /// <summary>自适应/标定时的上限（毫秒）。</summary>
+        public int MaxBufferMs = 200;
+
+        /// <summary>
+        /// 自适应调整速度（0..1）。每次调整把目标往期望值移动这个比例，
+        /// 太小收敛慢、太大容易振荡。
+        /// </summary>
+        public double AdaptRate = 0.2;
+
+        /// <summary>标定观察时长（秒）。到时锁定并停止调整。</summary>
+        public int CalibrateSec = 10;
+
         /// <summary>起播前预填充量（毫秒）。越大起播越稳、等待越久。</summary>
         public int PrebufferMs = 60;
 
@@ -37,6 +65,34 @@ namespace Snad
 
         /// <summary>轮询间隔（毫秒）。</summary>
         public int PollMs = 1;
+
+        // ---- 输出后端 ----
+        //
+        // 后端与设备、格式、周期是**正交的四个维度**，各自可配：
+        //   同一台设备既能用 waveOut 也能用 WASAPI，
+        //   WASAPI 既能共享也能独占，独占可选位深。
+        // 实测结论（见 LATENCY-MEASURED.md）：
+        //   waveOut 把块与池调小也能到 16ms；WASAPI 共享约 10ms；
+        //   独占约 13ms（不比共享快，价值在绕开系统混音器）。
+        //
+        // 默认值取 waveout + 现参数，保证与 v2.0 行为一致——
+        // 换后端是有风险的选择，不该由升级擅自替用户决定。
+
+        /// <summary>输出后端：waveout / wasapi_shared / wasapi_exclusive。</summary>
+        public string Backend = "waveout";
+
+        /// <summary>
+        /// 输出设备 ID（WASAPI 的设备 ID 字符串）。
+        /// 空表示跟随系统默认。放进档位而不是全局，是为了让
+        /// "直连声卡求低延迟"与"经 Voicemeeter 便于录制"两套方案并存可切换。
+        /// </summary>
+        public string DeviceId = "";
+
+        /// <summary>输出位深：pcm16 / pcm24 / pcm32 / float32。waveOut 只支持 pcm16。</summary>
+        public string Format = "pcm16";
+
+        /// <summary>WASAPI 周期（毫秒）。0 表示由设备自适应（独占模式推荐）。</summary>
+        public int WasapiPeriodMs = 3;
 
         // ---- 音质/稳定性相关 ----
         /// <summary>waveOut 缓冲个数。越多越抗调度抖动，内存占用与在飞时延越高。</summary>
@@ -59,16 +115,120 @@ namespace Snad
         public int FormatWaitSec = 15;
         public int PrebufferWaitSec = 10;
 
+        // ---- 均衡器 ----
+        // 放在档位里而不是单独的配置文件：不同用途需要不同调音
+        // （游戏要突出脚步、音乐要平直），跟随档位切换更自然。
+        /// <summary>是否默认启用均衡器。默认关闭——可选效果不应擅自改变声音。</summary>
+        public bool EqEnabled = false;
+
+        /// <summary>各频段增益（dB）。空表示全平。频段顺序见 Equalizer 的构造。</summary>
+        public double[] EqGains = null;
+
+        /// <summary>前置增益（dB），用于补偿整体提升导致的削波。</summary>
+        public double EqPreampDb = 0;
+
         public int TargetFrames(int sampleRate) { return Math.Max(1, sampleRate * TargetBufferMs / 1000); }
         public int PrebufferFrames(int sampleRate) { return Math.Max(1, sampleRate * PrebufferMs / 1000); }
         public int RingCapacityFrames(int sampleRate) { return Math.Max(1024, sampleRate * RingCapacityMs / 1000); }
         public int BlockFrames(int sampleRate) { return Math.Max(64, sampleRate * BlockMs / 1000); }
         public int LeadFrames(int sampleRate) { return Math.Max(1, sampleRate * LeadMs / 1000); }
 
-        /// <summary>按此 profile 估算的端到端延迟（毫秒），不含音频设备自身延迟。</summary>
+        /// <summary>
+        /// 按此 profile 估算的端到端延迟（毫秒）。
+        ///
+        /// **这里曾经是错的**：旧公式把 `WaveOutBuffers × BlockMs`（balanced 下 256 ms、
+        /// highquality 下 672 ms）当成延迟直接相加，得出 386 / 421 / 1052 ms。
+        /// 回环实测（LATENCY-MEASURED.md）表明，源按实时到达时
+        /// 池深从 4 改到 32、延迟都在 25–32 ms 不动——池只是抗调度抖动的余量，
+        /// 不是"声音晚多久出来"。所以它不该出现在延迟里。
+        ///
+        /// 现在的模型只有四项，每一项的性质都标注清楚：
+        ///   抖动缓冲水位  配置决定，是延迟的主要可调项
+        ///   输出链路      实测得到的（OutputLegMs），未标定时按后端典型值并标注"估计"
+        ///   采集缓冲      手机上报（能力上报），未上报时按典型值并标注"估计"
+        ///   网络          仍无法实测（无 RTT），按典型值并标注"估计"
+        /// </summary>
         public int EstimatedPipelineLatencyMs()
         {
-            return 21 + 8 + TargetBufferMs + BlockMs;
+            return CaptureLatencyMs() + NetworkMs + BufferLatencyMs() + OutputLegLatencyMs();
+        }
+
+        /// <summary>
+        /// 抖动缓冲水位。自适应/标定模式下实际值由策略决定，
+        /// 这里只能按配置值估算，并在界面上标明"实际随策略变化"。
+        /// </summary>
+        public int BufferLatencyMs()
+        {
+            return BufferMode == "static" ? TargetBufferMs : TargetBufferMs;
+        }
+
+        /// <summary>
+        /// 输出链路延迟：标定过就用实测值，否则用该后端的实测典型值。
+        ///
+        /// 默认值来自回环实测（LATENCY-MEASURED.md）：waveOut 28.7 ms、
+        /// WASAPI 共享 43.7 ms。独占没有 loopback 可用，取 waveOut 同量级值并标注估计。
+        /// 这些是**测量结果**，不是可调参数，因此放常数而不是配置项；
+        /// 每台机器/每个设备真值不同，所以提供 OutputLegMs 由标定写入。
+        /// </summary>
+        public int OutputLegLatencyMs()
+        {
+            if (OutputLegMs > 0) return OutputLegMs;
+            if (Backend != null && Backend.StartsWith("wasapi_shared", StringComparison.OrdinalIgnoreCase))
+                return 44;
+            return 29;
+        }
+
+        /// <summary>输出链路是否来自本机实测（否则是后端典型值）。</summary>
+        public bool OutputLegIsMeasured { get { return OutputLegMs > 0; } }
+
+        /// <summary>采集缓冲：手机上报过就用上报值，否则按典型值。</summary>
+        public int CaptureLatencyMs()
+        {
+            return ReportedCaptureMs > 0 ? ReportedCaptureMs : AndroidCaptureMs;
+        }
+
+        /// <summary>输出链路延迟实测值（毫秒）。0 表示未标定。</summary>
+        public int OutputLegMs = 0;
+
+        /// <summary>标定来源设备名，便于分辨"这台机器测的"还是别人测的。</summary>
+        public string CalibratedOn = "";
+
+        /// <summary>手机上报的采集缓冲（毫秒）。0 表示未上报。</summary>
+        public int ReportedCaptureMs = 0;
+
+        /// <summary>采集缓冲的估计常数，仅在手机未上报时使用。</summary>
+        public const int AndroidCaptureMs = 8;
+
+        /// <summary>网络单程延迟的估计常数。协议没有 RTT 交换，仍无法实测。</summary>
+        public const int NetworkMs = 21;
+
+        /// <summary>后端是否走 WASAPI（决定估算里要不要计入 waveOut 缓冲池）。</summary>
+        public bool UsesWasapi
+        {
+            get
+            {
+                return Backend != null &&
+                       Backend.StartsWith("wasapi", StringComparison.OrdinalIgnoreCase);
+            }
+        }
+
+        /// <summary>延迟构成的明细，供界面或日志展示估计的依据。</summary>
+        public string LatencyBreakdown()
+        {
+            // 每一项都标出是"实测"还是"估计"，因为用户要求任何数字都能被解释。
+            // 未标定的项一律写 ~，避免把典型值当成这台机器的真值。
+            string capture = ReportedCaptureMs > 0
+                ? "capture " + ReportedCaptureMs
+                : "capture ~" + AndroidCaptureMs;
+            string output = OutputLegMs > 0
+                ? "output " + OutputLegMs
+                : "output ~" + OutputLegLatencyMs();
+
+            return capture
+                 + " + net ~" + NetworkMs
+                 + " + buffer " + BufferLatencyMs()
+                 + " + " + output
+                 + " = ~" + EstimatedPipelineLatencyMs() + " ms";
         }
 
         public override string ToString()
@@ -251,9 +411,77 @@ namespace Snad
                 case "name": p.Name = val; break;
                 case "description": p.Description = val; break;
 
+                // ---- 输出后端 ----
+                case "backend":
+                    {
+                        string b = val.Trim().ToLowerInvariant();
+                        if (b == "waveout" || b == "wasapi_shared" || b == "wasapi_exclusive")
+                            p.Backend = b;
+                        else
+                            Logger.Warn("第 " + lineNo + " 行 backend 取值无效：" + val +
+                                        "（应为 waveout / wasapi_shared / wasapi_exclusive），已忽略");
+                        break;
+                    }
+                case "device":
+                case "deviceid":
+                    p.DeviceId = val.Trim();
+                    break;
+                case "format":
+                    {
+                        string f = val.Trim().ToLowerInvariant();
+                        if (f == "pcm16" || f == "pcm24" || f == "pcm32" || f == "float32")
+                            p.Format = f;
+                        else
+                            Logger.Warn("第 " + lineNo + " 行 format 取值无效：" + val +
+                                        "（应为 pcm16/pcm24/pcm32/float32），已忽略");
+                        break;
+                    }
+                case "wasapiperiod":
+                    if (int.TryParse(val, out iv)) p.WasapiPeriodMs = Math.Max(0, iv);
+                    else Logger.Warn("第 " + lineNo + " 行 wasapiperiod 不是整数：" + val);
+                    break;
+
                 case "targetbuffer":
                     if (int.TryParse(val, out iv)) p.TargetBufferMs = iv;
                     else Logger.Warn("第 " + lineNo + " 行 targetbuffer 不是整数：" + val);
+                    break;
+                case "buffermode":
+                    {
+                        string m = val.Trim().ToLowerInvariant();
+                        if (m == "static" || m == "adaptive" || m == "calibrated")
+                            p.BufferMode = m;
+                        else
+                            Logger.Warn("第 " + lineNo + " 行 buffermode 取值无效：" + val +
+                                        "（应为 static / adaptive / calibrated），已忽略");
+                        break;
+                    }
+                case "minbuffer":
+                    if (int.TryParse(val, out iv)) p.MinBufferMs = Math.Max(5, iv);
+                    else Logger.Warn("第 " + lineNo + " 行 minbuffer 不是整数：" + val);
+                    break;
+                case "maxbuffer":
+                    if (int.TryParse(val, out iv)) p.MaxBufferMs = Math.Max(10, iv);
+                    else Logger.Warn("第 " + lineNo + " 行 maxbuffer 不是整数：" + val);
+                    break;
+                case "adaptrate":
+                    if (double.TryParse(val, NumberStyles.Float, CultureInfo.InvariantCulture, out dv))
+                        p.AdaptRate = Math.Max(0.01, Math.Min(1.0, dv));
+                    else Logger.Warn("第 " + lineNo + " 行 adaptrate 不是数字：" + val);
+                    break;
+                case "calibratesec":
+                    if (int.TryParse(val, out iv)) p.CalibrateSec = Math.Max(1, iv);
+                    else Logger.Warn("第 " + lineNo + " 行 calibratesec 不是整数：" + val);
+                    break;
+                case "outputleg":
+                    if (int.TryParse(val, out iv) && iv > 0) p.OutputLegMs = iv;
+                    else Logger.Warn("第 " + lineNo + " 行 outputleg 应为正整数：" + val);
+                    break;
+                case "calibratedon":
+                    p.CalibratedOn = val.Trim();
+                    break;
+                case "capturebuffer":
+                    if (int.TryParse(val, out iv) && iv >= 0) p.ReportedCaptureMs = iv;
+                    else Logger.Warn("第 " + lineNo + " 行 capturebuffer 应为非负整数：" + val);
                     break;
                 case "prebuffer":
                     if (int.TryParse(val, out iv)) p.PrebufferMs = iv;
@@ -306,10 +534,417 @@ namespace Snad
                     else Logger.Warn("第 " + lineNo + " 行 prebufferwait 不是整数：" + val);
                     break;
 
+                case "eq":
+                    // 接受 on/off/true/false/1/0
+                    p.EqEnabled = IsTruthy(val);
+                    break;
+                case "eqpreamp":
+                    if (double.TryParse(val, NumberStyles.Float, CultureInfo.InvariantCulture, out dv))
+                        p.EqPreampDb = dv;
+                    else
+                        Logger.Warn("第 " + lineNo + " 行 eqpreamp 不是数字：" + val);
+                    break;
+                case "eqgains":
+                    // 逗号分隔的 dB 值，按频段顺序
+                    {
+                        var parts = val.Split(new[] { ',', ' ', '\t' }, StringSplitOptions.RemoveEmptyEntries);
+                        var gains = new double[parts.Length];
+                        bool ok = true;
+                        for (int i = 0; i < parts.Length; i++)
+                        {
+                            if (!double.TryParse(parts[i], NumberStyles.Float, CultureInfo.InvariantCulture, out gains[i]))
+                            { ok = false; break; }
+                        }
+                        if (ok && gains.Length > 0) p.EqGains = gains;
+                        else Logger.Warn("第 " + lineNo + " 行 eqgains 解析失败：" + val);
+                    }
+                    break;
+
                 default:
                     Logger.Warn("第 " + lineNo + " 行未知配置项：" + key);
                     break;
             }
+        }
+
+        /// <summary>把 on/off/true/false/1/0 之类的写法统一成布尔值。</summary>
+        private static bool IsTruthy(string v)
+        {
+            if (string.IsNullOrEmpty(v)) return false;
+            v = v.Trim().ToLowerInvariant();
+            return v == "on" || v == "true" || v == "yes" || v == "1" || v == "开";
+        }
+
+        /// <summary>
+        /// 把均衡器设置写回配置文件。
+        ///
+        /// 为什么只改这三个键而不是整份重写：receiver.cfg 带注释、用户可能手改过其他字段，
+        /// 整份重写会把这些都冲掉。这里只在对应位置就地替换或追加。
+        ///
+        /// 写入位置：当前选中档位所在的段落。若无 [profile:name] 段则写在文件顶层。
+        /// </summary>
+        public static void SaveEq(string path, string profileName, Equalizer eq)
+        {
+            if (string.IsNullOrEmpty(path) || eq == null) return;
+
+            string[] lines;
+            try
+            {
+                lines = File.Exists(path) ? File.ReadAllLines(path) : new string[0];
+            }
+            catch (Exception ex)
+            {
+                Logger.Err("读取配置失败，均衡器设置未保存：" + path, ex);
+                return;
+            }
+
+            var gains = eq.GetGains();
+            var sbGains = new StringBuilder();
+            for (int i = 0; i < gains.Length; i++)
+            {
+                if (i > 0) sbGains.Append(',');
+                sbGains.Append(gains[i].ToString("0.#", CultureInfo.InvariantCulture));
+            }
+
+            string targetSection = "[profile:" + profileName + "]";
+            var outLines = new List<string>(lines);
+            int sectionStart = -1, sectionEnd = outLines.Count;
+
+            for (int i = 0; i < outLines.Count; i++)
+            {
+                string t = outLines[i].Trim();
+                if (t.StartsWith("[") && t.EndsWith("]"))
+                {
+                    if (sectionStart >= 0) { sectionEnd = i; break; }
+                    if (string.Equals(t, targetSection, StringComparison.OrdinalIgnoreCase)) sectionStart = i;
+                }
+            }
+
+            bool sawEq = false, sawPreamp = false, sawGains = false;
+            int lo = sectionStart >= 0 ? sectionStart + 1 : 0;
+            int hi = sectionStart >= 0 ? sectionEnd : outLines.Count;
+
+            for (int i = lo; i < hi; i++)
+            {
+                string line = outLines[i];
+                string t = line.Trim();
+                if (t.StartsWith("#") || t.Length == 0) continue;
+                int eqIdx = t.IndexOf('=');
+                if (eqIdx <= 0) continue;
+                string key = t.Substring(0, eqIdx).Trim().ToLowerInvariant();
+
+                if (key == "eq")
+                {
+                    outLines[i] = "eq = " + (eq.Enabled ? "on" : "off");
+                    sawEq = true;
+                }
+                else if (key == "eqpreamp")
+                {
+                    outLines[i] = "eqpreamp = " + eq.PreampDb.ToString("0.#", CultureInfo.InvariantCulture);
+                    sawPreamp = true;
+                }
+                else if (key == "eqgains")
+                {
+                    outLines[i] = "eqgains = " + sbGains;
+                    sawGains = true;
+                }
+            }
+
+            if (sectionStart < 0)
+            {
+                // 该档位还没有自己的段落。
+                //
+                // 注意不能把这几个键插到已有段落内部——那样会改到别的档位的设置
+                // （实测踩过：为"自定义档"保存时，键被插进了上一个 [profile:] 段里，
+                //  结果既没建出新段，又污染了别的档位）。
+                // 因此这里新建一个段落，且放在文件末尾，避免插进任何现有段。
+                var block = new List<string>();
+                if (outLines.Count > 0 && outLines[outLines.Count - 1].Trim().Length != 0)
+                    block.Add("");
+                block.Add("# 此段落由均衡器窗口自动创建");
+                block.Add(targetSection);
+                block.Add("eq = " + (eq.Enabled ? "on" : "off"));
+                block.Add("eqpreamp = " + eq.PreampDb.ToString("0.#", CultureInfo.InvariantCulture));
+                block.Add("eqgains = " + sbGains);
+                outLines.AddRange(block);
+
+                try
+                {
+                    File.WriteAllLines(path, outLines.ToArray());
+                    Logger.Info("均衡器设置已保存到 " + path + "（新建档位 " + profileName + "，已写入 3 个键）");
+                }
+                catch (Exception ex)
+                {
+                    Logger.Err("写入配置失败，均衡器设置未保存：" + path, ex);
+                }
+                return;
+            }
+
+            // 已有段落：缺失的键追加到该段末尾，保持同一段内聚
+            var add = new List<string>();
+            if (!sawEq) add.Add("eq = " + (eq.Enabled ? "on" : "off"));
+            if (!sawPreamp) add.Add("eqpreamp = " + eq.PreampDb.ToString("0.#", CultureInfo.InvariantCulture));
+            if (!sawGains) add.Add("eqgains = " + sbGains);
+            if (add.Count > 0) outLines.InsertRange(sectionEnd, add);
+
+            try
+            {
+                File.WriteAllLines(path, outLines.ToArray());
+                Logger.Info("均衡器设置已保存到 " + path + "（档位 " + profileName + "）");
+            }
+            catch (Exception ex)
+            {
+                Logger.Err("写入配置失败，均衡器设置未保存：" + path, ex);
+            }
+        }
+
+        /// <summary>
+        /// 把一组键值写入指定档位的段落。
+        ///
+        /// 这是配置持久化的**唯一入口**：SaveEq 与 SaveProfile 都走它，
+        /// 避免各写一份"段落定位"逻辑而逐渐不一致。
+        ///
+        /// 三条必须守住的规则（都由实测教训得来）：
+        ///   1. 档位还没有段落时，新段落只能加在**文件末尾**——
+        ///      插到已有段落内部会改到别的档位（踩过：为自定义档保存时，
+        ///      键被插进了上一个 [profile:] 段，既没建出新段又污染了别人）。
+        ///   2. 已有段落内缺失的键追加到**该段末尾**，保持段内聚。
+        ///   3. 只在段落范围内改动，绝不触碰段外内容与注释。
+        /// </summary>
+        /// <param name="pairs">键（小写）到值的映射。值里不要带换行。</param>
+        /// <param name="sectionComment">新建段落时写入的注释，便于用户知道它从哪来。</param>
+        public static bool SaveFields(string path, string profileName,
+                                      IEnumerable<KeyValuePair<string, string>> pairs,
+                                      string sectionComment)
+        {
+            if (string.IsNullOrEmpty(path) || string.IsNullOrEmpty(profileName)) return false;
+
+            var wanted = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+            foreach (var kv in pairs) wanted[kv.Key.ToLowerInvariant()] = kv.Value;
+            if (wanted.Count == 0) return false;
+
+            string[] lines;
+            try
+            {
+                lines = File.Exists(path) ? File.ReadAllLines(path) : new string[0];
+            }
+            catch (Exception ex)
+            {
+                Logger.Err("读取配置失败，未保存：" + path, ex);
+                return false;
+            }
+
+            string targetSection = "[profile:" + profileName + "]";
+            var outLines = new List<string>(lines);
+            int sectionStart = -1, sectionEnd = outLines.Count;
+
+            for (int i = 0; i < outLines.Count; i++)
+            {
+                string t = outLines[i].Trim();
+                if (t.StartsWith("[") && t.EndsWith("]"))
+                {
+                    if (sectionStart >= 0) { sectionEnd = i; break; }
+                    if (string.Equals(t, targetSection, StringComparison.OrdinalIgnoreCase)) sectionStart = i;
+                }
+            }
+
+            var remaining = new Dictionary<string, string>(wanted, StringComparer.OrdinalIgnoreCase);
+
+            if (sectionStart < 0)
+            {
+                // 没有该档位的段落：整段新建在文件末尾
+                var block = new List<string>();
+                if (outLines.Count > 0 && outLines[outLines.Count - 1].Trim().Length != 0)
+                    block.Add("");
+                if (!string.IsNullOrEmpty(sectionComment)) block.Add("# " + sectionComment);
+                block.Add(targetSection);
+                foreach (var kv in wanted) block.Add(kv.Key + " = " + kv.Value);
+                outLines.AddRange(block);
+            }
+            else
+            {
+                // 已有段落：就地更新已存在的键，记录缺失的
+                for (int i = sectionStart + 1; i < sectionEnd && remaining.Count > 0; i++)
+                {
+                    string t = outLines[i].Trim();
+                    if (t.StartsWith("#") || t.Length == 0) continue;
+                    int eqIdx = t.IndexOf('=');
+                    if (eqIdx <= 0) continue;
+                    string key = t.Substring(0, eqIdx).Trim().ToLowerInvariant();
+                    string val;
+                    if (remaining.TryGetValue(key, out val))
+                    {
+                        outLines[i] = key + " = " + val;
+                        remaining.Remove(key);
+                    }
+                }
+                if (remaining.Count > 0)
+                {
+                    var add = new List<string>();
+                    foreach (var kv in remaining) add.Add(kv.Key + " = " + kv.Value);
+                    outLines.InsertRange(sectionEnd, add);
+                }
+            }
+
+            try
+            {
+                File.WriteAllLines(path, outLines.ToArray());
+                Logger.Info("配置已保存到 " + path + "（档位 " + profileName + "，" +
+                            wanted.Count + " 个键）");
+                return true;
+            }
+            catch (Exception ex)
+            {
+                Logger.Err("写入配置失败：" + path, ex);
+                return false;
+            }
+        }
+
+        /// <summary>把档位的全部可调参数写成键值对，供 SaveFields 落盘。</summary>
+        public static List<KeyValuePair<string, string>> ToPairs(Profile p)
+        {
+            var list = new List<KeyValuePair<string, string>>();
+            if (p == null) return list;
+            Func<string, string, KeyValuePair<string, string>> kv =
+                (k, v) => new KeyValuePair<string, string>(k, v);
+            var ci = CultureInfo.InvariantCulture;
+
+            if (!string.IsNullOrEmpty(p.Description)) list.Add(kv("description", p.Description));
+
+            // 输出后端
+            list.Add(kv("backend", p.Backend));
+            if (!string.IsNullOrEmpty(p.DeviceId)) list.Add(kv("device", p.DeviceId));
+            list.Add(kv("format", p.Format));
+            list.Add(kv("wasapiperiod", p.WasapiPeriodMs.ToString(ci)));
+
+            // 延迟相关
+            list.Add(kv("targetbuffer", p.TargetBufferMs.ToString(ci)));
+
+            // 缓冲策略
+            list.Add(kv("buffermode", p.BufferMode));
+            list.Add(kv("minbuffer", p.MinBufferMs.ToString(ci)));
+            list.Add(kv("maxbuffer", p.MaxBufferMs.ToString(ci)));
+            list.Add(kv("adaptrate", p.AdaptRate.ToString("0.###", ci)));
+            list.Add(kv("calibratesec", p.CalibrateSec.ToString(ci)));
+
+            // 标定与上报（②④）。只在有值时才写，避免把"未标定"写成 0 而看起来像标定过。
+            if (p.OutputLegMs > 0) list.Add(kv("outputleg", p.OutputLegMs.ToString(ci)));
+            if (!string.IsNullOrEmpty(p.CalibratedOn)) list.Add(kv("calibratedon", p.CalibratedOn));
+            if (p.ReportedCaptureMs > 0) list.Add(kv("capturebuffer", p.ReportedCaptureMs.ToString(ci)));
+            list.Add(kv("prebuffer", p.PrebufferMs.ToString(ci)));
+            list.Add(kv("ringcapacity", p.RingCapacityMs.ToString(ci)));
+            list.Add(kv("block", p.BlockMs.ToString(ci)));
+            list.Add(kv("poll", p.PollMs.ToString(ci)));
+
+            // 稳定性相关
+            list.Add(kv("waveoutbuffers", p.WaveOutBuffers.ToString(ci)));
+            list.Add(kv("lead", p.LeadMs.ToString(ci)));
+            list.Add(kv("driftrange", p.DriftRange.ToString("0.####", ci)));
+            list.Add(kv("driftgain", p.DriftGain.ToString("0.####", ci)));
+            list.Add(kv("ratiomin", p.RatioMin.ToString("0.####", ci)));
+            list.Add(kv("ratiomax", p.RatioMax.ToString("0.####", ci)));
+            list.Add(kv("formatwait", p.FormatWaitSec.ToString(ci)));
+            list.Add(kv("prebufferwait", p.PrebufferWaitSec.ToString(ci)));
+
+            // 均衡器
+            list.Add(kv("eq", p.EqEnabled ? "on" : "off"));
+            list.Add(kv("eqpreamp", p.EqPreampDb.ToString("0.#", ci)));
+            if (p.EqGains != null && p.EqGains.Length > 0)
+            {
+                var sb = new StringBuilder();
+                for (int i = 0; i < p.EqGains.Length; i++)
+                {
+                    if (i > 0) sb.Append(',');
+                    sb.Append(p.EqGains[i].ToString("0.#", ci));
+                }
+                list.Add(kv("eqgains", sb.ToString()));
+            }
+            return list;
+        }
+
+        /// <summary>把档位的全部参数落盘。编辑器的保存入口。</summary>
+        public static bool SaveProfile(string path, Profile p)
+        {
+            if (p == null) return false;
+            return SaveFields(path, p.Name, ToPairs(p), "此段落由配置编辑器保存");
+        }
+
+        /// <summary>
+        /// 从配置文件里删除某个档位的段落。
+        ///
+        /// 只删该段落本身（从段头到下一个段头之前），不触碰其他段落与注释。
+        /// 内置档位即使删掉段落也会回退到代码里的默认值——这是有意的：
+        /// 内置档位的默认值应当在代码里，配置文件只是覆盖。
+        /// </summary>
+        public static bool DeleteProfile(string path, string profileName)
+        {
+            if (string.IsNullOrEmpty(path) || string.IsNullOrEmpty(profileName)) return false;
+            if (!File.Exists(path)) return false;
+
+            string[] lines;
+            try { lines = File.ReadAllLines(path); }
+            catch (Exception ex) { Logger.Err("读取配置失败，未删除：" + path, ex); return false; }
+
+            string target = "[profile:" + profileName + "]";
+            var outLines = new List<string>(lines);
+            int start = -1, end = -1;
+
+            for (int i = 0; i < outLines.Count; i++)
+            {
+                string t = outLines[i].Trim();
+                if (!(t.StartsWith("[") && t.EndsWith("]"))) continue;
+
+                if (start < 0)
+                {
+                    if (string.Equals(t, target, StringComparison.OrdinalIgnoreCase))
+                    {
+                        start = i;
+                        // 顺带吃掉紧邻上方的自动生成注释，避免留下孤立注释
+                        int up = i - 1;
+                        while (up >= 0 && outLines[up].Trim().StartsWith("#"))
+                        {
+                            if (outLines[up].Contains("自动创建") || outLines[up].Contains("配置编辑器"))
+                                start = up;
+                            up--;
+                        }
+                    }
+                }
+                else { end = i; break; }
+            }
+
+            if (start < 0) return false;
+            if (end < 0) end = outLines.Count;
+
+            outLines.RemoveRange(start, end - start);
+
+            try
+            {
+                File.WriteAllLines(path, outLines.ToArray());
+                Logger.Info("已从 " + path + " 删除档位 " + profileName);
+                return true;
+            }
+            catch (Exception ex)
+            {
+                Logger.Err("写入配置失败，未删除：" + path, ex);
+                return false;
+            }
+        }
+
+        /// <summary>把档位里保存的均衡器设置套用到均衡器实例上。</summary>
+        public static void ApplyEq(Profile p, Equalizer eq)
+        {
+            if (p == null || eq == null) return;
+            if (p.EqGains != null && p.EqGains.Length > 0) eq.SetAllGains(p.EqGains);
+            eq.PreampDb = p.EqPreampDb;
+            eq.Enabled = p.EqEnabled;
+        }
+
+        /// <summary>把均衡器的当前设置存进档位对象（不落盘）。</summary>
+        public static void CaptureEq(Profile p, Equalizer eq)
+        {
+            if (p == null || eq == null) return;
+            p.EqGains = eq.GetGains();
+            p.EqPreampDb = eq.PreampDb;
+            p.EqEnabled = eq.Enabled;
         }
 
         /// <summary>写出带注释的默认配置，首次运行时生成，便于用户直接改。</summary>
@@ -336,6 +971,14 @@ namespace Snad
             sb.AppendLine("# ratiomin/max   读侧比率安全钳位");
             sb.AppendLine("# formatwait     等待首个包的秒数");
             sb.AppendLine("# prebufferwait  等待预填充的秒数");
+            sb.AppendLine();
+            sb.AppendLine("# ---- 均衡器 ----");
+            sb.AppendLine("# eq        是否启用（on/off）。默认 off，可选效果不擅自改变声音");
+            sb.AppendLine("# eqpreamp  前置增益(dB)，用于补偿整体提升导致的削波");
+            sb.AppendLine("# eqgains   各频段增益(dB)，逗号分隔，顺序为：");
+            sb.AppendLine("#           105, 240, 470, 900, 1.8k, 3.5k, 6k, 8k, 12k, 16k");
+            sb.AppendLine("#           范围 -12 ~ +12。105 与 12k 是搁架式，其余为峰值式");
+            sb.AppendLine("# 例：低音增强 eqgains = 7,5,3,1,0,0,0,0,0,0");
             sb.AppendLine();
             sb.AppendLine("# ---- 自定义档位示例（去掉 # 即可启用）----");
             sb.AppendLine("# [profile:gaming]");

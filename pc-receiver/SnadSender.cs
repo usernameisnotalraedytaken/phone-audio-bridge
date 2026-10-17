@@ -1,0 +1,395 @@
+// 发包器：按与手机完全相同的协议向接收器送音频。
+//
+// 为什么需要它：
+//   接收器的行为（抖动缓冲、漂移补偿、后端表现）此前只能拿真手机试，
+//   而手机在别的设备上、要人手操作，无法自动回归。发包器把"手机"变成
+//   本地一个进程，于是这些行为可以本地复现、自动跑、可注入故障。
+//
+// 同时它也是**网络损伤模拟器**：丢包、乱序、抖动、时间戳偏移都能注入，
+// 用来回答"这个缓冲深度能扛多大抖动"这类问题——这比拿真手机在房间里
+// 走来走去试可靠得多。
+//
+// 协议（与 SnadProtocol.kt 一致，20/22 字节头，小端）：
+//   0..3   magic 'S','N','A','D'
+//   4      version = 1
+//   5      channels
+//   6..9   sampleRate
+//   10..13 sequence
+//   14..17 timestampMs（手机侧单调时钟低 32 位）—— 接收器目前还没用它
+//   18..21 payloadBytes
+//   22..   PCM16LE 交错
+//
+// 用法：
+//   SnadSender.exe <目标IP> [选项]
+//     端口 <port>        默认 6981
+//     时长 <秒>          默认 10
+//     块 <ms>            每个包携带的音频时长，默认 21
+//     丢包 <百分比>      默认 0
+//     抖动 <ms>          发送时刻的随机偏移，默认 0
+//     乱序 <百分比>      默认 0
+//     音调 <Hz>          默认 440
+//     时间戳偏移 <ms>    故意让时间戳与真实时刻错开，用于验证延迟测量
+//     静默               不发音频，只发包头（用于测极端情况）
+//
+// 例：SnadSender.exe 127.0.0.1 时长 20 块 21 丢包 1 抖动 3
+
+using System;
+using System.Collections.Generic;
+using System.Globalization;
+using System.Net;
+using System.Net.Sockets;
+using System.Threading;
+
+namespace Snad
+{
+    internal static class Sender
+    {
+        private const int HeaderSize = 22;
+        private const int DefaultPort = 6981;
+
+        private static int _sent, _dropped, _reordered;
+
+        /// <summary>一个待发出去的包，连同它的释放时刻。</summary>
+        private sealed class PendingPkt
+        {
+            public double ReleaseAt;      // 相对发送器启动的毫秒数
+            public byte[] Payload;
+        }
+
+        private static int Main(string[] args)
+        {
+            if (args.Length < 1)
+            {
+                Usage();
+                return 0;
+            }
+
+            string host = args[0];
+            int port = DefaultPort;
+            double seconds = 10;
+            int blockMs = 21;
+            double lossPct = 0, jitterMs = 0, reorderPct = 0;
+            double baseDelayMs = 80;      // 抖动摆动的基准，需 ≥ 最大抖动
+            int version = 1;              // 协议版本：1 = 22 字节头，2 = 26 字节头（带位深）
+            SampleFormat format = SampleFormat.Pcm16;
+            int capBufferMs = 20;         // 能力上报里的"手机采集缓冲"，模拟值
+            double toneHz = 440;
+            int timestampOffsetMs = 0;
+            bool silent = false;
+
+            for (int i = 1; i < args.Length - 1; i += 2)
+            {
+                string k = args[i].ToLowerInvariant();
+                string v = args[i + 1];
+                switch (k)
+                {
+                    case "端口": case "port": port = int.Parse(v); break;
+                    case "时长": case "seconds": seconds = double.Parse(v, CultureInfo.InvariantCulture); break;
+                    case "块": case "block": blockMs = int.Parse(v); break;
+                    case "丢包": case "loss": lossPct = double.Parse(v, CultureInfo.InvariantCulture); break;
+                    case "抖动": case "jitter": jitterMs = double.Parse(v, CultureInfo.InvariantCulture); break;
+                    case "基准延迟": case "base": baseDelayMs = double.Parse(v, CultureInfo.InvariantCulture); break;
+                    case "版本": case "version": version = int.Parse(v); break;
+                    case "采集缓冲": case "capbuffer": capBufferMs = int.Parse(v); break;
+                    case "格式": case "format":
+                        {
+                            string f = v.Trim().ToLowerInvariant();
+                            if (f == "pcm16") format = SampleFormat.Pcm16;
+                            else if (f == "pcm24") format = SampleFormat.Pcm24;
+                            else if (f == "pcm32") format = SampleFormat.Pcm32;
+                            else if (f == "float32") format = SampleFormat.Float32;
+                            else Console.WriteLine("未知格式 " + v + "，按 pcm16 处理");
+                            break;
+                        }
+                    case "乱序": case "reorder": reorderPct = double.Parse(v, CultureInfo.InvariantCulture); break;
+                    case "音调": case "tone": toneHz = double.Parse(v, CultureInfo.InvariantCulture); break;
+                    case "时间戳偏移": case "tsoffset": timestampOffsetMs = int.Parse(v); break;
+                }
+                if (k == "静默" || k == "silent") silent = true;
+            }
+            for (int i = 1; i < args.Length; i++)
+                if (args[i] == "静默" || args[i] == "silent") silent = true;
+
+            const int rate = 48000, channels = 2;
+            int framesPerPacket = rate * blockMs / 1000;
+            int payloadBytes = framesPerPacket * channels * AudioCodec.BytesPerSample(format);
+
+            // v1 的包头没有格式字段，载荷按约定必须是 pcm16
+            if (version == 1 && format != SampleFormat.Pcm16)
+            {
+                Console.WriteLine("v1 协议不支持 " + AudioCodec.Name(format) + "，已改为 pcm16");
+                format = SampleFormat.Pcm16;
+                payloadBytes = framesPerPacket * channels * AudioCodec.BytesPerSample(format);
+            }
+
+            Console.WriteLine("SNAD 发包器");
+            Console.WriteLine("  目标      " + host + ":" + port);
+            Console.WriteLine("  时长      " + seconds.ToString("F1") + " 秒");
+            Console.WriteLine("  块        " + blockMs + " ms（" + framesPerPacket + " 帧 / " +
+                              payloadBytes + " 字节）");
+            Console.WriteLine("  音调      " + toneHz.ToString("F0") + " Hz" + (silent ? "（静默）" : ""));
+            Console.WriteLine("  丢包      " + lossPct.ToString("F1") + " %");
+            Console.WriteLine("  抖动      0.." + jitterMs.ToString("F1") + " ms 随机（叠加在基准延迟上）");
+            Console.WriteLine("  协议      v" + version + "（包头 " +
+                              (version == 2 ? WireProtocol.HeaderSizeV2 : WireProtocol.HeaderSizeV1) + " 字节）" +
+                              "，位深 " + AudioCodec.Name(format));
+            Console.WriteLine("  基准延迟  " + baseDelayMs.ToString("F1") + " ms（抖动摆动空间，需 ≥ 最大抖动）");
+            Console.WriteLine("  乱序      " + reorderPct.ToString("F1") + " %");
+            if (timestampOffsetMs != 0)
+                Console.WriteLine("  时间戳偏移 " + timestampOffsetMs + " ms（故意错开，用于验证测量）");
+            Console.WriteLine();
+
+            IPEndPoint target;
+            try
+            {
+                var addrs = Dns.GetHostAddresses(host);
+                if (addrs.Length == 0) { Console.WriteLine("无法解析主机 " + host); return 2; }
+                target = new IPEndPoint(addrs[0], port);
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine("解析目标地址失败：" + ex.Message);
+                return 2;
+            }
+
+            using (var sock = new UdpClient())
+            {
+                sock.Client.SendBufferSize = 1 << 20;
+
+                // v2 先发一次能力上报（发往日志端口），让接收端把"手机采集延迟"
+                // 从猜测变成已知。v1 没有这个包，接收端会继续按缺省值估算。
+                if (version == 2)
+                {
+                    try
+                    {
+                        var capEnd = new IPEndPoint(target.Address, port + 1);
+                        var cap = BuildCapabilityPacket(rate, capBufferMs, format);
+                        sock.Send(cap, cap.Length, capEnd);
+                        Console.WriteLine("  已发送能力上报：采集 " + rate + " Hz，采集缓冲 " +
+                                          capBufferMs + " ms，位深 " + AudioCodec.Name(format));
+                    }
+                    catch (Exception ex)
+                    {
+                        Console.WriteLine("  能力上报发送失败：" + ex.Message);
+                    }
+                }
+
+                var pcm = new byte[payloadBytes];
+                double phase = 0;
+                int seq = 0;
+                var rnd = new Random(20261017);
+                var sw = System.Diagnostics.Stopwatch.StartNew();
+                var startWall = DateTime.UtcNow;
+
+                // 发送队列：采集与发送必须分开两个线程。
+                //
+                // 抖动是"包已按固定节拍产生、路上各自被耽搁"，因此
+                // 采集时刻必须严格每 blockMs 一次，而释放时刻 = 采集 + 基础延迟 + 抖动。
+                // 单线程做不到：等完基础延迟就赶不上下一次采集，
+                // 于是采集节拍被拖慢、平均吞吐塌掉（实测吞吐掉到 73%，
+                // 接收端被饿死——测到的已不是网络，而是源跟不上实时）。
+                var queue = new System.Collections.Concurrent.BlockingCollection<PendingPkt>();
+                var sender = new Thread(() =>
+                {
+                    try
+                    {
+                        foreach (var item in queue.GetConsumingEnumerable())
+                        {
+                            while (sw.Elapsed.TotalMilliseconds < item.ReleaseAt) Thread.Sleep(1);
+                            TrySend(sock, target, item.Payload);
+                            _sent++;
+                        }
+                    }
+                    catch { }
+                }) { IsBackground = true, Name = "snad-send" };
+                sender.Start();
+
+                int packets = (int)(seconds * 1000 / blockMs);
+
+                long nextSendMs = 0;
+                for (int p = 0; p < packets; p++)
+                {
+                    // 采集时刻严格每 blockMs 一次：真实手机的采集缓冲是固定节拍，
+                    // 抖动发生在**采集之后**的网络传输上。
+                    while (sw.ElapsedMilliseconds < nextSendMs) Thread.Sleep(1);
+                    nextSendMs += blockMs;
+
+                    // 采集时刻要在施加传输延迟**之前**取。
+                    // 若先延迟再打时间戳，这个包看起来只是"采集得更晚"，
+                    // 接收端算出的 arrival − timestamp 完全不变，注入等于没做。
+                    double captureAt = sw.Elapsed.TotalMilliseconds;
+
+                    bool drop = rnd.NextDouble() * 100 < lossPct;
+                    if (!drop)
+                    {
+                        FillTone(pcm, framesPerPacket, channels, toneHz, ref phase, silent, format);
+
+                        long tsRaw = (long)captureAt + timestampOffsetMs;
+                        int ts = (int)(tsRaw & 0xFFFFFFFFL);
+                        byte[] pkt = BuildPacket(channels, rate, seq, ts, payloadBytes, pcm,
+                                                 version, format);
+
+                        // 释放时刻 = 采集 + 基础延迟 + 独立抖动。
+                        // 基础延迟给抖动留出摆动空间，使平均到达间隔仍等于采集间隔；
+                        // 没有它时抖动会单向地把发送往后推，吞吐随之塌掉。
+                        double releaseAt = captureAt + baseDelayMs +
+                                           (jitterMs > 0 ? rnd.NextDouble() * jitterMs : 0);
+
+                        if (reorderPct > 0 && rnd.NextDouble() * 100 < reorderPct)
+                        {
+                            // 额外压后一点再发，制造乱序
+                            releaseAt += blockMs * 1.5;
+                            _reordered++;
+                        }
+
+                        queue.Add(new PendingPkt { ReleaseAt = releaseAt, Payload = pkt });
+
+                        // 正常情况下队列只有基础延迟/块长 那么几个包；
+                        // 超过这个量说明消费端落后，提示而不是无限堆积
+                        while (queue.Count > 64) Thread.Sleep(1);
+                    }
+                    else _dropped++;
+
+                    seq++;
+                }
+
+                // 收尾：队列里还没到点的包也要发出去，否则末尾会凭空丢一段
+                queue.CompleteAdding();
+                sender.Join(2000);
+
+                sw.Stop();
+                Console.WriteLine();
+                Console.WriteLine("=== 结果 ===");
+                Console.WriteLine("  实际时长    " + sw.Elapsed.TotalSeconds.ToString("F2") + " 秒");
+                Console.WriteLine("  已发送      " + _sent + " 包（" +
+                                  (_sent * blockMs) + " ms 音频）");
+                Console.WriteLine("  故意丢弃    " + _dropped + " 包（" + lossPct.ToString("F1") + "%）");
+                Console.WriteLine("  故意乱序    " + _reordered + " 包");
+            }
+            return 0;
+        }
+
+        private static void TrySend(UdpClient sock, IPEndPoint target, byte[] pkt)
+        {
+            try { sock.Send(pkt, pkt.Length, target); }            catch (Exception ex) { Console.WriteLine("发送失败：" + ex.Message); }
+        }
+
+        /// <summary>按手机端 SnadProtocol.buildHeader 的布局构造包头。</summary>
+        /// <summary>
+        /// 构造音频包。version 决定包头长度：
+        ///   v1 = 22 字节，载荷固定 pcm16（旧手机）
+        ///   v2 = 26 字节，22..23 为格式码（新协议）
+        /// 前 22 字节两者完全一致，因此 v1 接收端能读出 v2 包的核心字段。
+        /// </summary>
+        /// <summary>
+        /// 能力上报包（发往日志端口，14 字节）：
+        ///   0..3 magic / 4 version / 5 type='C'
+        ///   6..9 captureRate（u32）
+        ///   10..11 captureBufferMs（u16）
+        ///   12 formatMask（u8）  13 保留
+        /// 与接收端 HandleCapability 的布局必须一致。
+        /// </summary>
+        private static byte[] BuildCapabilityPacket(int rate, int captureBufferMs, SampleFormat format)
+        {
+            var p = new byte[14];
+            p[0] = (byte)'S'; p[1] = (byte)'N'; p[2] = (byte)'A'; p[3] = (byte)'D';
+            p[4] = WireProtocol.Version2;
+            p[5] = (byte)'C';
+            WireProtocol.PutInt32LE(p, 6, rate);
+            WireProtocol.PutInt16LE(p, 10, captureBufferMs);
+
+            int mask = 1;                                   // pcm16 总是有
+            if (format == SampleFormat.Pcm24) mask |= 2;
+            if (format == SampleFormat.Pcm32) mask |= 4;
+            if (format == SampleFormat.Float32) mask |= 8;
+            p[12] = (byte)mask;
+            p[13] = 0;
+            return p;
+        }
+
+        private static byte[] BuildPacket(int channels, int rate, int seq, int timestampMs,
+                                          int payloadBytes, byte[] pcm,
+                                          int version, SampleFormat format)
+        {
+            int headerSize = version == 2 ? WireProtocol.HeaderSizeV2 : WireProtocol.HeaderSizeV1;
+            var pkt = new byte[headerSize + payloadBytes];
+            pkt[0] = (byte)'S'; pkt[1] = (byte)'N'; pkt[2] = (byte)'A'; pkt[3] = (byte)'D';
+            pkt[4] = (byte)version;
+            pkt[5] = (byte)channels;
+            PutIntLE(pkt, 6, rate);
+            PutIntLE(pkt, 10, seq);
+            PutIntLE(pkt, 14, timestampMs);
+            PutIntLE(pkt, 18, payloadBytes);
+            if (version == 2)
+            {
+                int code = WireProtocol.CodeFromFormat(format);
+                pkt[22] = (byte)(code & 0xFF);
+                pkt[23] = (byte)((code >> 8) & 0xFF);
+                pkt[24] = 0;                     // flags，保留
+                pkt[25] = 0;
+            }
+            Buffer.BlockCopy(pcm, 0, pkt, headerSize, payloadBytes);
+            return pkt;
+        }
+
+        private static void PutIntLE(byte[] b, int off, int v)
+        {
+            b[off] = (byte)(v & 0xFF);
+            b[off + 1] = (byte)((v >> 8) & 0xFF);
+            b[off + 2] = (byte)((v >> 16) & 0xFF);
+            b[off + 3] = (byte)((v >> 24) & 0xFF);
+        }
+
+        /// <summary>
+        /// 生成测试音频：基频 + 三次谐波 + 每 500ms 一个脉冲。
+        /// 脉冲便于人耳核对通路是否连续（能听到规律哒哒声）。
+        /// </summary>
+        private static void FillTone(byte[] pcm, int frames, int channels, double toneHz,
+                                     ref double phase, bool silent, SampleFormat format)
+        {
+            int bps = AudioCodec.BytesPerSample(format);
+            for (int i = 0; i < frames; i++)
+            {
+                double v;
+                if (silent) v = 0;
+                else
+                {
+                    double t = phase / 48000.0;
+                    v = 0.22 * Math.Sin(2 * Math.PI * toneHz * t)
+                      + 0.07 * Math.Sin(2 * Math.PI * toneHz * 3 * t);
+                    if (t % 0.5 < 0.02) v += 0.4 * Math.Sin(2 * Math.PI * 1200 * t);
+                }
+                phase += 1;
+
+                if (v > 1) v = 1;
+                if (v < -1) v = -1;
+
+                int off = i * channels * bps;
+                for (int c = 0; c < channels; c++)
+                    AudioCodec.Encode(pcm, off + c * bps, (float)v, format);
+            }
+        }
+
+        private static void Usage()
+        {
+            Console.WriteLine("SNAD 发包器 —— 按与手机相同的协议向接收器送音频");
+            Console.WriteLine();
+            Console.WriteLine("  SnadSender.exe <目标IP> [选项]");
+            Console.WriteLine();
+            Console.WriteLine("  端口 <port>         默认 6981");
+            Console.WriteLine("  时长 <秒>           默认 10");
+            Console.WriteLine("  块 <ms>             每包音频时长，默认 21");
+            Console.WriteLine("  丢包 <百分比>       默认 0");
+            Console.WriteLine("  抖动 <ms>           发送时刻随机偏移，默认 0");
+            Console.WriteLine("  乱序 <百分比>       默认 0");
+            Console.WriteLine("  音调 <Hz>           默认 440");
+            Console.WriteLine("  时间戳偏移 <ms>     让时间戳与真实时刻错开");
+            Console.WriteLine("  静默                只发零样本");
+            Console.WriteLine();
+            Console.WriteLine("  例：SnadSender.exe 127.0.0.1 时长 20 丢包 1 抖动 3");
+            Console.WriteLine();
+            Console.WriteLine("  配合接收器使用：先起 SnadReceiver.exe，再起本工具。");
+            Console.WriteLine("  接收器默认监听 6981，本机测试直接给 127.0.0.1。");
+        }
+    }
+}

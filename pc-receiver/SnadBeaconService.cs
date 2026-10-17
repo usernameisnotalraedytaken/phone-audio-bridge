@@ -59,7 +59,14 @@ namespace Snad
             {
                 udp = new UdpClient();
                 udp.EnableBroadcast = true;
-                var target = new IPEndPoint(IPAddress.Broadcast, SnadBeacon.DefaultPort);
+
+                // 把广播目标记下来。这一行是排查"手机收不到"的第一手材料：
+                // 若目标列表里没有手机所在网段的广播地址，说明枚举或掩码算错了。
+                var targets = BroadcastTargets(_log);
+                if (targets.Count == 0)
+                    _log("未枚举到任何可广播的网卡，将退回受限广播 255.255.255.255");
+                else
+                    _log("广播目标：" + string.Join("、", targets.ConvertAll(t => t.ToString()).ToArray()));
 
                 while (_running)
                 {
@@ -67,7 +74,33 @@ namespace Snad
                     {
                         long s = Interlocked.Increment(ref _seq);
                         byte[] pkt = SnadBeacon.Build(_deviceId, _port, s, _key);
-                        udp.Send(pkt, pkt.Length, target);
+
+                        // 逐个网卡计算子网广播地址并发送。
+                        //
+                        // 为什么不只发 255.255.255.255：受限广播由路由表决定从哪块网卡出去，
+                        // 本机有 WLAN、VMware、WSL 等多块网卡时可能只走其中一块，
+                        // 手机所在网卡收不到（实测监听只收到 VMware 与 WSL 网卡的广播）。
+                        // 逐网卡发子网广播可确保每块网卡都真正发出，代价是几字节冗余。
+                        var sentTo = false;
+                        foreach (var target in targets)
+                        {
+                            try
+                            {
+                                udp.Send(pkt, pkt.Length, new IPEndPoint(target, SnadBeacon.DefaultPort));
+                                sentTo = true;
+                            }
+                            catch (SocketException)
+                            {
+                                // 某些网卡（未连接的、虚拟的）发不出去是正常的，继续下一块
+                            }
+                        }
+
+                        // 兜底：所有网卡都失败时仍试一次受限广播
+                        if (!sentTo)
+                        {
+                            udp.Send(pkt, pkt.Length,
+                                     new IPEndPoint(IPAddress.Broadcast, SnadBeacon.DefaultPort));
+                        }
                         Interlocked.Increment(ref _sent);
                     }
                     catch (SocketException ex)
@@ -88,6 +121,52 @@ namespace Snad
             {
                 if (udp != null) { try { udp.Close(); } catch { } }
             }
+        }
+
+        /// <summary>
+        /// 枚举本机所有 IPv4 网卡，按掩码计算各自的子网广播地址。
+        /// 跳过环回与未连接的链路本地地址（169.254.x.x）。
+        /// </summary>
+        private static List<IPAddress> BroadcastTargets(Action<string> log)
+        {
+            var list = new List<IPAddress>();
+            try
+            {
+                foreach (var ni in System.Net.NetworkInformation.NetworkInterface.GetAllNetworkInterfaces())
+                {
+                    if (ni.OperationalStatus != System.Net.NetworkInformation.OperationalStatus.Up) continue;
+                    if (ni.NetworkInterfaceType == System.Net.NetworkInformation.NetworkInterfaceType.Loopback) continue;
+
+                    foreach (var ua in ni.GetIPProperties().UnicastAddresses)
+                    {
+                        if (ua.Address.AddressFamily != AddressFamily.InterNetwork) continue;
+                        byte[] ip = ua.Address.GetAddressBytes();
+                        if (ip[0] == 127) continue;                       // 环回
+                        if (ip[0] == 169 && ip[1] == 254) continue;        // 链路本地，无实际网络
+
+                        int prefix = ua.PrefixLength;
+                        if (prefix <= 0 || prefix > 32) continue;
+
+                        // 广播地址 = ip | ~mask
+                        var mask = new byte[4];
+                        for (int i = 0; i < 4; i++)
+                        {
+                            int bits = prefix - i * 8;
+                            mask[i] = bits >= 8 ? (byte)0xFF : (bits <= 0 ? (byte)0x00 : (byte)(0xFF << (8 - bits)));
+                        }
+                        var bcast = new byte[4];
+                        for (int i = 0; i < 4; i++) bcast[i] = (byte)(ip[i] | ~mask[i]);
+
+                        var addr = new IPAddress(bcast);
+                        if (!list.Contains(addr)) list.Add(addr);
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                log("枚举广播目标失败（将退回受限广播）：" + ex.Message);
+            }
+            return list;
         }
 
         public void Dispose()

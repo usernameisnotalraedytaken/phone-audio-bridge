@@ -120,7 +120,19 @@ namespace Snad
     internal static class Program
     {
         internal const int DefaultPort = 6981;   // 避开 Voicemeeter 的 VBAN 服务（占用 6980）
-        internal const int HeaderSize = 22;
+
+        // 协议定义统一放在 WireProtocol（SnadWireProtocol.cs），
+        // 接收器与发包器共用同一份，避免两处各自臆测包头布局。
+        internal const int HeaderSize = WireProtocol.HeaderSizeV1;
+        internal const int HeaderSizeV2 = WireProtocol.HeaderSizeV2;
+
+        /// <summary>按版本返回包头长度。未知版本返回 0，由调用方报错。</summary>
+        internal static int HeaderSizeFor(byte version) { return WireProtocol.HeaderSizeFor(version); }
+
+        /// <summary>包头里的格式码 ↔ 采样格式。</summary>
+        internal static SampleFormat FormatFromCode(int code) { return WireProtocol.FormatFromCode(code); }
+
+        internal static int CodeFromFormat(SampleFormat f) { return WireProtocol.CodeFromFormat(f); }
 
         /// <summary>日志端口 = 音频端口 + 1。</summary>
         internal const int LogPortOffset = 1;
@@ -134,6 +146,30 @@ namespace Snad
         /// 直接撞满并从此再也排不空。
         /// </summary>
         internal const int QueueCapacity = 8;
+
+        /// <summary>
+        /// 信标里使用的本机标识。用途仅是让手机区分"是哪台电脑"，
+        /// 不承担授权职责（授权完全由 HMAC 保证），因此可以稳定公开。
+        /// 用机器名 + 密钥指纹前 4 位：换机器或换密钥时标识随之变化，便于识别。
+        /// </summary>
+        internal static readonly string MachineDeviceId = BuildMachineDeviceId();
+
+        private static string BuildMachineDeviceId()
+        {
+            string name;
+            try { name = Environment.MachineName; }
+            catch (Exception) { name = "pc"; }
+            if (string.IsNullOrEmpty(name)) name = "pc";
+            // 去掉可能干扰显示的字符，保留可读性
+            var sb = new StringBuilder();
+            foreach (char c in name)
+                if (char.IsLetterOrDigit(c) || c == '-' || c == '_') sb.Append(c);
+            string clean = sb.Length > 0 ? sb.ToString() : "pc";
+
+            string kid = SnadSecret.KeyId;
+            string suffix = string.IsNullOrEmpty(kid) ? "nokey" : kid.Substring(0, Math.Min(4, kid.Length));
+            return "snad-" + clean + "-" + suffix;
+        }
 
         // ---- 系统计时器精度 ----
         // 本机实测：Stopwatch 计时的 Thread.Sleep(100) 实际睡了 223 ms，
@@ -170,7 +206,12 @@ namespace Snad
             int port = DefaultPort;
             int logPort = DefaultPort + 1;
             bool listOnly = false;
-            LogVerbosity verbosity = LogVerbosity.None;
+            // 默认 verbose：启动阶段的信息（档位、设备选择、信标广播、缓冲换算）
+            // 是排查问题的第一手材料，默认就写下来。
+            // 之前默认 none 只在 WARN/ERROR 落盘，结果调试时连"信标广播已启动"
+            // 都看不到，只能去翻 stdout —— 默认值应该偏向可排查，而不是偏向省空间。
+            // 日常嫌吵可显式加 --log none。
+            LogVerbosity verbosity = LogVerbosity.Verbose;
             string profileOverride = null;   // --profile 覆盖配置文件中的选择
 
             for (int i = 0; i < args.Length; i++)
@@ -314,11 +355,31 @@ namespace Snad
             Console.WriteLine("按 Ctrl+C 退出。");
             Console.WriteLine();
 
+            // 启动信标广播：手机端据此自动发现本机，无需手填地址。
+            // 密钥来自构建时注入的 SnadSecret；缺失时明确报错，不静默跳过广播
+            // （否则表现为"手机永远找不到电脑"，很难排查）。
+            BeaconBroadcaster beacon = null;
+            try
+            {
+                byte[] beaconKey = SnadBeacon.DeriveKey(SnadSecret.Psk);
+                beacon = new BeaconBroadcaster(MachineDeviceId, port, beaconKey, 2000,
+                    m => Logger.Warn("信标：" + m));
+                beacon.Start();
+                Logger.Info("信标广播已启动：device=" + MachineDeviceId + " 端口=" + port +
+                            " KeyId=" + SnadSecret.KeyId + "（手机端此值必须一致）");
+            }
+            catch (Exception ex)
+            {
+                Logger.Err("信标广播启动失败（手机端将无法自动发现本机，仍可手填地址）", ex);
+            }
+
             using (var receiver = new SnadReceiver(deviceIndex, port, active))
             {
                 Console.CancelKeyPress += (s, e) => { e.Cancel = true; receiver.Stop(); };
                 receiver.Run();
             }
+
+            if (beacon != null) { beacon.Dispose(); Logger.Info("信标广播已停止"); }
 
             // 恢复系统计时器精度，避免影响其它程序
             uint tResEnd = TimeEndPeriod(TimerResolutionMs);
@@ -626,6 +687,224 @@ namespace Snad
         [DllImport("ole32.dll")]
         private static extern int PropVariantClear(ref PROPVARIANT pvar);
 
+
+        /// <summary>
+        /// 按 profile 选定的后端播放。这是对外的统一入口。
+        ///
+        /// 后端选择由档位决定，而不是写死：
+        ///   waveout           现有实现（已充分验证，作为退路）
+        ///   wasapi_shared     经过系统混音器，实测声卡侧约 10ms（LATENCY-MEASURED.md）
+        ///   wasapi_exclusive  绕开混音器，会占住设备；独占的是路由能力而非延迟
+        ///
+        /// 失败时**不回退到其他后端**：换了后端声音会从别的设备出来，
+        /// 那是比报错更难排查的行为。如实抛出，由界面显示原因。
+        /// </summary>
+        public static void Play(int deviceIndex, Func<int> getSampleRate, Func<int> getChannels,
+                                Func<byte[]> pull, CancellationToken token, Profile profile,
+                                Action<byte[], int, int> onBlock = null, Equalizer eq = null)
+        {
+            string backend = profile != null && !string.IsNullOrEmpty(profile.Backend)
+                ? profile.Backend.Trim().ToLowerInvariant() : "waveout";
+
+            if (backend == "waveout")
+            {
+                PlayWaveOut(deviceIndex, getSampleRate, getChannels, pull, token, profile, onBlock, eq);
+                return;
+            }
+
+            PlayWasapi(getSampleRate, getChannels, pull, token, profile, onBlock, eq);
+        }
+
+        /// <summary>
+        /// WASAPI 播放路径（共享或独占）。
+        ///
+        /// 与 waveOut 路径的差别在于驱动的方向：
+        ///   waveOut 我们主动填池，池深度就是我们能控制的在飞量；
+        ///   WASAPI 由 AudioSink 内部按设备节奏取数据，我们只管往它的
+        ///   环形缓冲里写——因此"在飞量"由 sink 的队列而不是池深度决定。
+        ///
+        /// 均衡器与可视回调放在写入之前，保证频谱画的是实际听到的声音。
+        /// </summary>
+        private static void PlayWasapi(Func<int> getSampleRate, Func<int> getChannels,
+                                       Func<byte[]> pull, CancellationToken token, Profile profile,
+                                       Action<byte[], int, int> onBlock, Equalizer eq)
+        {
+            int sampleRate = getSampleRate();
+            int channels = getChannels();
+            if (eq != null) eq.Configure(sampleRate, channels);
+
+            bool exclusive = profile.Backend.Trim().ToLowerInvariant() == "wasapi_exclusive";
+            SampleFormat fmt = ParseFormat(profile.Format);
+
+            // 选设备：档位里填了 device 就用它，否则跟随系统默认
+            DeviceCapability dev = null;
+            var all = DeviceEnumerator.Probe();
+            if (!string.IsNullOrEmpty(profile.DeviceId))
+            {
+                foreach (var d in all) if (string.Equals(d.Id, profile.DeviceId, StringComparison.OrdinalIgnoreCase)) { dev = d; break; }
+                if (dev == null)
+                    throw new InvalidOperationException(
+                        "档位指定的输出设备不存在（id=" + profile.DeviceId + "）。" +
+                        "设备可能已拔出或被禁用，请在界面里重新选择。");
+            }
+            else
+            {
+                dev = DeviceEnumerator.Default();
+                if (dev == null) throw new InvalidOperationException("找不到可用的输出设备");
+            }
+
+            // waveOut 只支持 pcm16；选了其他位深必须明确告诉用户，
+            // 而不是悄悄按 pcm16 播（那会让"选了 24bit"变成一句空话）
+            if (!exclusive && fmt != dev.MixSampleFormat)
+            {
+                Logger.Info("共享模式下实际格式由设备混音格式决定：" +
+                            AudioCodec.Name(dev.MixSampleFormat) + "（档位里写的 " +
+                            AudioCodec.Name(fmt) + " 不生效）");
+            }
+
+            int periodMs = profile.WasapiPeriodMs;
+            using (var sink = new WasapiSink())
+            {
+                // 把渲染侧的内部计数也写进接收器日志——
+                // "队列贴上限"这类异常的成因在渲染线程里，只有两边数据放一起才看得出
+                sink.SetVerbose(m => Logger.Info(m));
+
+                sink.Open(dev, fmt, sampleRate, channels, periodMs, exclusive);
+                Logger.Info("WASAPI 已打开：" + sink.Name +
+                            "  设备=" + dev.Name +
+                            "  设备缓冲=" + sink.DeviceBufferMs.ToString("F1") + "ms" +
+                            "  流延迟=" + sink.StreamLatencyMs.ToString("F1") + "ms" +
+                            "  待播队列上限=" + sink.CapacityMs.ToString("F1") + "ms");
+
+                sink.Start();
+
+                long writes = 0, starved = 0, nullPulls = 0, fullWaits = 0;
+                long pullCalls = 0, pullFrames = 0, writeAttempts = 0, bytesAccepted = 0;
+                var lastStat = DateTime.UtcNow;
+                double queueSum = 0; long queueN = 0;
+                double minQueue = double.MaxValue, maxQueue = 0;
+                long bytesWritten = 0;
+
+                while (!token.IsCancellationRequested)
+                {
+                    var data = pull();
+                    pullCalls++;
+                    if (data == null)
+                    {
+                        // 没有数据可写：稍等，但记录"队列见底"的次数——
+                        // 那是欠载的前兆，比事后听出爆音更早暴露问题
+                        nullPulls++;
+                        if (sink.QueuedMs < 1.0) starved++;
+                        Thread.Sleep(1);
+                        continue;
+                    }
+                    pullFrames += data.Length / 4;
+
+                    if (eq != null && eq.Enabled)
+                    {
+                        try { eq.Process(data, data.Length); }
+                        catch (Exception ex)
+                        {
+                            eq.Enabled = false;
+                            Logger.Err("均衡器处理异常，已自动关闭", ex);
+                        }
+                    }
+
+                    // 写不进去说明 sink 的环形缓冲满了，退让后重试同一块，
+                    // 不能丢——丢了就是音频空洞
+                    //
+                    // 注意统计口径：off 是"本次累计已写入"，循环里不能用它累加，
+                    // 否则重试 N 次就把同一批数据加了 N 遍（先前正是这样算出
+                    // 虚高一倍的"接受帧率"，浪费了几轮排查）。要累加的是每次
+                    // 实际写入的增量 n。
+                    int off = 0;
+                    int attempts = 0;
+                    while (off < data.Length && !token.IsCancellationRequested)
+                    {
+                        int n = sink.Write(data, off, data.Length - off);
+                        attempts++;
+                        if (n <= 0) { fullWaits++; Thread.Sleep(1); continue; }
+                        off += n;
+                        bytesAccepted += n;
+                    }
+                    writeAttempts += attempts;
+
+                    double q = sink.QueuedMs;
+                    queueSum += q; queueN++;
+                    if (q < minQueue) minQueue = q;
+                    if (q > maxQueue) maxQueue = q;
+                    bytesWritten += data.Length;
+                    writes++;
+
+                    if (onBlock != null)
+                    {
+                        try { onBlock(data, sampleRate, channels); }
+                        catch (Exception ex)
+                        {
+                            if (_blockCbErrors++ < 3)
+                                Logger.Warn("音频块回调异常（第 " + _blockCbErrors + " 次）：" + ex.Message);
+                        }
+                    }
+
+                    var now = DateTime.UtcNow;
+                    if ((now - lastStat).TotalSeconds >= 10)
+                    {
+                        double secs = (now - lastStat).TotalSeconds;
+                        Logger.Info(string.Format(CultureInfo.InvariantCulture,
+                            "[WASAPI 状态] 队列 均{0:F1} 低{1:F1} 高{2:F1} ms（上限 {3:F1}），" +
+                            "无数据 {4}，见底 {5}，写满等待 {6}" +
+                            "  |  实际接受 {7:F0} 帧/秒（实时 {8}），每块试 {9:F2} 次",
+                            queueN > 0 ? queueSum / queueN : 0,
+                            minQueue == double.MaxValue ? 0 : minQueue, maxQueue, sink.CapacityMs,
+                            nullPulls, starved, fullWaits,
+                            bytesAccepted / 4.0 / secs, sampleRate,
+                            writes > 0 ? (double)writeAttempts / writes : 0));
+
+                        // 累计值对比：写入侧与渲染侧的差额就是"写进去但还没播出"的量。
+                        // 若它远超队列容量，说明有帧既不在队列也没被播出——那才是真问题。
+                        Logger.Info(string.Format(CultureInfo.InvariantCulture,
+                            "[累计] 写入 {0} 帧，渲染 {1} 帧，差额 {2} 帧（{3:F0} ms，" +
+                            "队列容量 {4:F0} ms）",
+                            sink.WrittenFrames, sink.RenderedFrames,
+                            sink.WrittenFrames - sink.RenderedFrames,
+                            (sink.WrittenFrames - sink.RenderedFrames) * 1000.0 / sampleRate,
+                            sink.CapacityMs));
+
+                        // 每个统计窗口内重置计数：这些"每秒速率"必须用窗口内增量算，
+                        // 用累计值配窗口分母会得到虚高的数（先前正是这样算出 1.5 倍，
+                        // 把正常的写入侧误报成"供过于求"）。
+                        writeAttempts = 0; bytesAccepted = 0; pullCalls = 0; pullFrames = 0;
+                        writes = 0; nullPulls = 0; starved = 0; fullWaits = 0;
+                        queueSum = 0; queueN = 0; minQueue = double.MaxValue; maxQueue = 0;
+                        lastStat = now;
+                    }
+                }
+
+                sink.Stop();
+                Logger.Info(string.Format(CultureInfo.InvariantCulture,
+                    "WASAPI 播放结束：写入 {0} 块 {1} 字节，队列 均{2:F1} 低{3:F1} 高{4:F1} ms" +
+                    "，无数据 {5} 次，见底 {6} 次，写满等待 {7} 次",
+                    writes, bytesWritten, queueN > 0 ? queueSum / queueN : 0,
+                    minQueue == double.MaxValue ? 0 : minQueue, maxQueue,
+                    nullPulls, starved, fullWaits));
+            }
+        }
+
+        /// <summary>把档位里的格式名解析为枚举。无法识别时明确报错而不静默取默认。</summary>
+        private static SampleFormat ParseFormat(string name)
+        {
+            switch ((name ?? "pcm16").Trim().ToLowerInvariant())
+            {
+                case "pcm16": return SampleFormat.Pcm16;
+                case "pcm24": return SampleFormat.Pcm24;
+                case "pcm32": return SampleFormat.Pcm32;
+                case "float32": return SampleFormat.Float32;
+                default:
+                    throw new InvalidOperationException(
+                        "档位里的 format 取值无效：" + name + "（应为 pcm16/pcm24/pcm32/float32）");
+            }
+        }
+
         /// <summary>
         /// 打开设备并持续播放。
         /// 实现要点（经实测验证，74 次连续写入零失败）：
@@ -634,12 +913,15 @@ namespace Snad
         ///      手工清位会在缓冲仍被驱动持有时破坏状态机，导致 MMSYSERR_INVALPARAM(34)。
         ///   3. pull 返回 null 表示暂无数据，本轮跳过而不是灌静音，避免欠载爆音。
         /// </summary>
-        public static void Play(int deviceIndex, Func<int> getSampleRate, Func<int> getChannels,
-                                Func<byte[]> pull, CancellationToken token, Profile profile,
-                                Action<byte[], int, int> onBlock = null)
+        public static void PlayWaveOut(int deviceIndex, Func<int> getSampleRate, Func<int> getChannels,
+                                       Func<byte[]> pull, CancellationToken token, Profile profile,
+                                       Action<byte[], int, int> onBlock = null, Equalizer eq = null)
         {
             int sampleRate = getSampleRate();
             int channels = getChannels();
+
+            // 均衡器必须知道实际采样率才能算对系数（同一个频段在 44.1k 与 48k 下系数不同）
+            if (eq != null) eq.Configure(sampleRate, channels);
 
             IntPtr hwo = IntPtr.Zero;
             int hr = OpenDevice(out hwo, deviceIndex, sampleRate, channels);
@@ -687,6 +969,21 @@ namespace Snad
                         var data = pull();
                         if (data == null) continue;
                         var fitted = Fit(data, bufBytes);
+
+                        // 均衡器就地处理。放在提交与可视化回调之前，
+                        // 这样频谱画的就是实际听到的声音（包含 EQ 效果）。
+                        // Enabled 为 false 时 Process 立即返回，无额外开销。
+                        if (eq != null && eq.Enabled)
+                        {
+                            try { eq.Process(fitted, fitted.Length); }
+                            catch (Exception ex)
+                            {
+                                // EQ 出错不能拖垮播放：关掉它并报告一次
+                                eq.Enabled = false;
+                                Logger.Err("均衡器处理异常，已自动关闭", ex);
+                            }
+                        }
+
                         bufs[i].Submit(fitted);
                         // 通知 GUI：这块音频即将播放，可用于绘制波形/频谱。
                         // 回调抛异常不能影响播放，因此单独捕获并只提示有限次数。
@@ -889,8 +1186,22 @@ namespace Snad
         /// </summary>
         public bool Write(byte[] pcm, int channels, int payloadBytes)
         {
+            return Write(pcm, channels, payloadBytes, SampleFormat.Pcm16);
+        }
+
+        /// <summary>
+        /// 按指定位深把载荷写进环形缓冲。
+        ///
+        /// 位深不能假设：v2 协议允许 pcm16/24/32/float32，
+        /// 若仍按"每帧 2 字节、short 组装"处理 24bit 载荷，
+        /// 每帧字节数会算错（高估 50%），解出来的波形则是噪声。
+        /// 解码走 AudioCodec.Decode，与编码端共用同一套位深规则。
+        /// </summary>
+        public bool Write(byte[] pcm, int channels, int payloadBytes, SampleFormat format)
+        {
             if (channels < 1) return false;
-            int bytesPerFrame = channels * 2;
+            int bytesPerSample = AudioCodec.BytesPerSample(format);
+            int bytesPerFrame = channels * bytesPerSample;
             int frames = payloadBytes / bytesPerFrame;
             if (frames <= 0) return false;
 
@@ -920,12 +1231,12 @@ namespace Snad
                 for (int f = 0; f < frames; f++)
                 {
                     int b = f * bytesPerFrame;
-                    short l = (short)(pcm[b] | (pcm[b + 1] << 8));
-                    short r = channels >= 2 ? (short)(pcm[b + 2] | (pcm[b + 3] << 8)) : l;
+                    float l = AudioCodec.Decode(pcm, b, format);
+                    float r = channels >= 2 ? AudioCodec.Decode(pcm, b + bytesPerSample, format) : l;
 
                     int slot = (int)(_framesWritten % _frameCap) * 2;
-                    _slots[slot] = l / 32768f;
-                    _slots[slot + 1] = r / 32768f;
+                    _slots[slot] = l;
+                    _slots[slot + 1] = r;
                     _framesWritten++;
                 }
                 Interlocked.Add(ref _framesProduced, frames);
@@ -1015,6 +1326,14 @@ namespace Snad
         public Profile CurrentProfile { get { return _profile; } }
 
         /// <summary>
+        /// 均衡器。由 GUI 或控制台在启动前配置；播放线程在提交音频前调用它。
+        /// 采样率由 WaveOut.Play 在打开设备时按实际值配置，因此这里不必预设。
+        /// </summary>
+        public Equalizer Equalizer { get { return _eq; } }
+
+        private readonly Equalizer _eq = new Equalizer();
+
+        /// <summary>
         /// 每次向 waveOut 提交一块音频时触发，供 GUI 绘制波形/频谱。
         /// 参数为立体声交错 PCM16LE。
         /// </summary>
@@ -1048,6 +1367,172 @@ namespace Snad
         private bool _formatLogged;
         private int _seqExpected = -1;
         private long _seqGaps, _seqMissing;
+
+        /// <summary>
+        /// 当前接收的载荷位深。v1 恒为 pcm16；v2 由包头声明。
+        /// 变化时必须记日志——它改变每帧字节数，静默切换会让声音突变。
+        /// </summary>
+        private SampleFormat _pktFormat = SampleFormat.Pcm16;
+
+        /// <summary>
+        /// 最近一次缓冲策略的状态，供周期日志打印。
+        /// adaptive/calibrated 会随时间变化，只写一次启动值是看不出它是否收敛的。
+        /// </summary>
+        private volatile string _lastPolicyStatus = "";
+
+        // ------------------------------------------------------------------ 到达时间统计
+        //
+        // 目的：把"网络与发送侧的抖动"变成可读数字，从而回答"缓冲该留多深"。
+        // 协议里一直带着发送端时间戳（偏移 14），但此前接收器根本没读它。
+        //
+        // 为什么不能直接算绝对延迟：
+        //   发送端时间戳来自手机的单调时钟，接收端用本机时钟，
+        //   两者起点与速率都不同，且没有往返测量可确定偏移。
+        //   但差值的**变化量**与偏移无关，因此抖动与漂移可以精确得出。
+        //   绝对延迟另用声卡回环测。
+        //
+        // 用滑动窗口而不是全局极值：
+        //   全局极值会被一次偶发尖峰永久污染，之后测什么都显示"抖动很大"。
+        //   窗口统计反映当前状态，与"当前需要多深的缓冲"一致。
+
+        private const int ArrivalWindow = 256;
+        private readonly double[] _arrivalOffset = new double[ArrivalWindow];
+        /// <summary>与 _arrivalOffset 对应的本地到达时刻，用于按实际窗口时长算漂移。</summary>
+        private readonly double[] _arrivalLocalMs = new double[ArrivalWindow];
+        private int _arrivalCount;
+        private int _arrivalWrite;
+        private long _arrivalTotal;
+        private double _tsFirstArrivalMs;
+        private int _tsFirstSender;
+
+        /// <summary>
+        /// 单调时钟（毫秒）。
+        ///
+        /// 不能用 Environment.TickCount：它是 **32 位**，约 49.7 天回绕一次，
+        /// 回绕时"本地经过时间"会跳成负数；而漂移用首尾均值斜率算，
+        /// 一次跳变就能把它污染成几十上百 ms/分（实测如此）。
+        /// Stopwatch 是 64 位单调时钟，不受系统时间调整影响。
+        /// （Environment.TickCount64 是 .NET Core 才有的 API，此处不可用。）
+        /// </summary>
+        private static readonly System.Diagnostics.Stopwatch Clock = System.Diagnostics.Stopwatch.StartNew();
+
+        /// <summary>记录一个包的"到达时刻 − 发送时刻"差值。</summary>
+        private void TrackArrival(int senderTsMs)
+        {
+            double nowMs = Clock.Elapsed.TotalMilliseconds;
+            if (_arrivalTotal == 0)
+            {
+                _tsFirstArrivalMs = nowMs;
+                _tsFirstSender = senderTsMs;
+            }
+
+            // 都取相对第一个包的增量，避免 senderTsMs 的低 32 位回绕影响
+            double senderElapsed = senderTsMs - (double)_tsFirstSender;
+            if (senderElapsed < -2147483648.0) senderElapsed += 4294967296.0;
+            double localElapsed = nowMs - _tsFirstArrivalMs;
+
+            // 差值 = 时钟偏移 + (网络与发送侧延迟)。偏移是常数，
+            // 因此差值的**变化**就是延迟的变化。
+            _arrivalOffset[_arrivalWrite] = localElapsed - senderElapsed;
+            _arrivalLocalMs[_arrivalWrite] = nowMs;
+            _arrivalWrite = (_arrivalWrite + 1) % ArrivalWindow;
+            if (_arrivalCount < ArrivalWindow) _arrivalCount++;
+            _arrivalTotal++;
+        }
+
+        /// <summary>
+        /// 处理手机端能力上报（type = 'C'，14 字节）：
+        ///   0..3  magic "SNAD"
+        ///   4     version
+        ///   5     type = 'C'
+        ///   6..9  captureRate（u32，采集采样率）
+        ///   10..11 captureBufferMs（u16，采集缓冲）
+        ///   12    formatMask（u8）：bit0 pcm16 / bit1 pcm24 / bit2 pcm32 / bit3 float32
+        ///   13    保留
+        ///
+        /// 这些值把"手机采集延迟"从猜测变成已知：
+        /// 此前估算里 capture 固定按 8 ms、网络按 21 ms，两者都不是测出来的。
+        /// </summary>
+        private void HandleCapability(byte[] pkt, IPEndPoint remote)
+        {
+            if (pkt.Length < 14)
+            {
+                Logger.Warn("能力上报包过短：" + pkt.Length + " 字节（需 ≥ 14），来自 " + remote);
+                return;
+            }
+
+            int capRate = BitConverter.ToInt32(pkt, 6);
+            int capBufMs = BitConverter.ToUInt16(pkt, 10);
+            int mask = pkt[12];
+
+            var names = new List<string>();
+            if ((mask & 1) != 0) names.Add("pcm16");
+            if ((mask & 2) != 0) names.Add("pcm24");
+            if ((mask & 4) != 0) names.Add("pcm32");
+            if ((mask & 8) != 0) names.Add("float32");
+            if (names.Count == 0) names.Add("未声明");
+
+            _capRate = capRate;
+            _capBufferMs = capBufMs;
+
+            // 把上报值真正接进延迟估算，否则这个包只是被记下来、对界面毫无影响。
+            // 采集缓冲此前是按 8 ms 的典型值猜的，这里换成实测。
+            if (capBufMs > 0 && _profile != null)
+            {
+                _profile.ReportedCaptureMs = capBufMs;
+                Logger.Info("采集缓冲已按上报值 " + capBufMs + " ms 计入延迟估算" +
+                            "（此前按典型值 " + Profile.AndroidCaptureMs + " ms）");
+            }
+            _capMask = mask;
+
+            Logger.Info(string.Format(
+                "手机能力上报：采集 {0} Hz，采集缓冲 {1} ms，可用位深 {2}",
+                capRate, capBufMs, string.Join(" / ", names.ToArray())));
+
+            // 采样率不一致要显式警告：那意味着两端对"同一段音频"的理解不同，
+            // 表现为音高偏高或偏低，而不是报错
+            if (capRate > 0 && _sampleRate > 0 && capRate != _sampleRate)
+                Logger.Warn("采集采样率 " + capRate + " Hz 与播放 " + _sampleRate +
+                            " Hz 不一致，音高会偏移（需重采样，当前未做）");
+
+            // 位深协商的结果要等音频流真的开始以后再判断：
+            // 能力包通常先于第一个音频包到达，此刻 _pktFormat 还是缺省 pcm16，
+            // 立刻下"仍用 pcm16"的结论会误导（实测就会先报一句假结论）。
+            // 因此这里只记录能力，判断放到周期统计里做。
+        }
+
+        private int _capRate, _capBufferMs, _capMask = -1;
+        private bool _notedBitDepth;
+
+        /// <summary>最近一次能力上报的采集缓冲（毫秒）。-1 表示未收到。</summary>
+        public int ReportedCaptureBufferMs { get { return _capBufferMs; } }
+
+        /// <summary>
+        /// 到达抖动与漂移。返回 false 表示样本不足——此时不给数字，
+        /// 因为样本太少算出的"抖动"没有意义，报一个数反而误导。
+        /// 计算本身在 ArrivalStats 里，是纯函数，可脱离网络单独验证。
+        /// </summary>
+        public bool TryGetArrivalStats(out double jitterMs, out double driftMsPerMin, out double spanMs)
+        {
+            jitterMs = driftMsPerMin = spanMs = 0;
+            int n = _arrivalCount;
+            if (n < ArrivalStats.MinSamples) return false;
+
+            // 按时间顺序展开环形缓冲，连同各自的本地到达时刻一起交给纯函数。
+            // 传本地时刻是为了让漂移按**实际窗口时长**归一——
+            // 先前按固定的 21ms 包间隔估算，换个 block 大小就错了。
+            var offsets = new double[n];
+            var times = new double[n];
+            int start = n < ArrivalWindow ? 0 : _arrivalWrite;
+            for (int i = 0; i < n; i++)
+            {
+                int idx = (start + i) % ArrivalWindow;
+                offsets[i] = _arrivalOffset[idx];
+                times[i] = _arrivalLocalMs[idx];
+            }
+
+            return ArrivalStats.Compute(offsets, times, out jitterMs, out driftMsPerMin, out spanMs);
+        }
         private long _framesIn;            // 从网络收到的累计帧数（包级，未丢）
         private long _lastFramesIn, _lastFramesWritten, _lastFramesRead, _lastReadCalls;
         // 最近一次统计周期的速率，供 GUI 快照读取（避免 GUI 自己再算一遍）。
@@ -1137,9 +1622,16 @@ namespace Snad
                             Logger.Warn("日志端口收到非 SNAD 包，长度 " + pkt.Length + "，来自 " + remote);
                             continue;
                         }
+                        if (pkt[5] == (byte)'C')
+                        {
+                            // 能力上报包。它不是日志，因此不进 phone.log，
+                            // 而是解析出来写进接收器日志并用于后续估计。
+                            HandleCapability(pkt, remote);
+                            continue;
+                        }
                         if (pkt[5] != (byte)'T')
                         {
-                            Logger.Warn("日志端口收到非文本包 type=" + pkt[5] + "，来自 " + remote);
+                            Logger.Warn("日志端口收到未知类型包 type=" + pkt[5] + "，来自 " + remote);
                             continue;
                         }
 
@@ -1219,24 +1711,57 @@ namespace Snad
                                 Logger.Warn("丢弃 magic 不匹配的包，首字节=" + pkt[0] + "，来自 " + remote);
                             continue;
                         }
-                        if (pkt[4] != 1)
+                        // 版本决定包头长度与载荷含义。v1 的 22 字节核心布局保持不变，
+                        // v2 只在其后追加格式字段，因此旧客户端仍能收下新包的核心部分。
+                        int headerSize = Program.HeaderSizeFor(pkt[4]);
+                        if (headerSize == 0)
                         {
                             Interlocked.Increment(ref _badVersion);
                             if (Interlocked.Read(ref _badVersion) <= 3)
-                                Logger.Warn("丢弃协议版本不支持的包：version=" + pkt[4]);
+                                Logger.Warn("丢弃协议版本不支持的包：version=" + pkt[4] +
+                                            "（支持 1 与 2）");
                             continue;
                         }
 
                         int rate = BitConverter.ToInt32(pkt, 6);
                         int ch = pkt[5];
                         int seq = BitConverter.ToInt32(pkt, 10);
+                        int senderTsMs = BitConverter.ToInt32(pkt, 14);
                         int payload = BitConverter.ToInt32(pkt, 18);
-                        if (payload <= 0 || Program.HeaderSize + payload > pkt.Length)
+
+                        // v1 没有格式字段，按约定就是 pcm16；v2 由包头声明
+                        SampleFormat pktFormat = SampleFormat.Pcm16;
+                        if (headerSize >= Program.HeaderSizeV2 && pkt.Length >= Program.HeaderSizeV2)
+                        {
+                            int code = BitConverter.ToUInt16(pkt, 22);
+                            pktFormat = Program.FormatFromCode(code);
+                            if (_pktFormat != pktFormat)
+                            {
+                                // 格式变化必须可见：它改变每帧字节数与解码方式，
+                                // 静默切换会让声音突然变调或变噪声
+                                if (_pktFormat != SampleFormat.Pcm16 || code != 0)
+                                    Logger.Info("接收格式变更为 " + AudioCodec.Name(pktFormat) +
+                                                "（每样本 " + AudioCodec.BytesPerSample(pktFormat) + " 字节）");
+                                _pktFormat = pktFormat;
+                            }
+                        }
+
+                        // 用发送端时间戳统计单程延迟的波动。
+                        //
+                        // 能得出什么、不能得出什么（重要）：
+                        //   两端时钟不同源，偏移未知，且拿不到往返时延，
+                        //   因此**无法**由它算出绝对延迟。
+                        //   但"到达时刻 − 发送时刻"这个差值的**变化量**与时钟偏移无关，
+                        //   它精确反映网络与发送侧的抖动——而这正是"缓冲要留多深"
+                        //   所依据的量。差值的长期趋势则反映两端时钟速率差（漂移）。
+                        //   绝对延迟另用声卡回环测。
+                        TrackArrival(senderTsMs);
+                        if (payload <= 0 || headerSize + payload > pkt.Length)
                         {
                             Interlocked.Increment(ref _badPayload);
                             if (Interlocked.Read(ref _badPayload) <= 3)
                                 Logger.Warn("丢弃负载长度非法的包：声明 " + payload + " 字节，实际可用 " +
-                                            (pkt.Length - Program.HeaderSize) + " 字节");
+                                            (pkt.Length - headerSize) + " 字节");
                             continue;
                         }
 
@@ -1301,11 +1826,16 @@ namespace Snad
                         }
 
                         var pcm = new byte[payload];
-                        Buffer.BlockCopy(pkt, Program.HeaderSize, pcm, 0, payload);
+                        Buffer.BlockCopy(pkt, headerSize, pcm, 0, payload);
+
+                        // 帧数必须按**每样本字节数**算，不能再写死 2 字节：
+                        // 24bit 载荷下写死会让帧数高估 50%，水位与速率全部失真
+                        int bytesPerSample = AudioCodec.BytesPerSample(pktFormat);
+                        int bytesPerFrame = Math.Max(1, _channels * bytesPerSample);
 
                         Interlocked.Increment(ref _packets);
                         Interlocked.Add(ref _bytes, payload);
-                        Interlocked.Add(ref _framesIn, payload / Math.Max(1, _channels * 2));
+                        Interlocked.Add(ref _framesIn, payload / bytesPerFrame);
 
                         if (!_ringReady)
                         {
@@ -1315,7 +1845,7 @@ namespace Snad
                             continue;
                         }
 
-                        if (!_ring.Write(pcm, _channels, payload))
+                        if (!_ring.Write(pcm, _channels, payload, pktFormat))
                         {
                             long ov = Interlocked.Increment(ref _overflow);
                             if (ov <= 3 || ov % 100 == 0)
@@ -1359,6 +1889,31 @@ namespace Snad
                                 _seqGaps, _seqMissing,
                                 Interlocked.Read(ref _shortPkt), Interlocked.Read(ref _badMagic),
                                 Interlocked.Read(ref _badVersion), Interlocked.Read(ref _badPayload)));
+
+                            // 到达抖动与漂移：这两个数决定"缓冲该留多深"，
+                            // 此前完全不可见（协议里一直带着时间戳但没人读）。
+                            double jit, drift, span;
+                            if (TryGetArrivalStats(out jit, out drift, out span))
+                            {
+                                Logger.Info(string.Format(
+                                    "[到达统计] 抖动 {0:F2} ms/包（相邻差值变化），" +
+                                    "窗口极差 {1:F1} ms，漂移 {2:+0.0;-0.0;0.0} ms/分",
+                                    jit, span, drift));
+                            }
+
+                            // 缓冲策略状态：adaptive/calibrated 的目标会随时间变化，
+                            // 只写一行启动值是看不出它有没有收敛的
+                            if (!string.IsNullOrEmpty(_lastPolicyStatus))
+                                Logger.Info("[缓冲策略] " + _lastPolicyStatus);
+
+                            // 位深协商的稳态判断（只报一次）
+                            if (!_notedBitDepth && _capMask >= 0 && _pktFormat == SampleFormat.Pcm16 &&
+                                (_capMask & 2) != 0)
+                            {
+                                Logger.Info("手机声明支持 pcm24，但音频仍以 pcm16 到达；" +
+                                            "升位深需手机端按 v2 协议发送");
+                                _notedBitDepth = true;
+                            }
 
                             _lastFramesIn = fIn;
                             _lastFramesWritten = fWr;
@@ -1423,15 +1978,19 @@ namespace Snad
                 // 每块时长、缓冲个数、轮询间隔、水位与漂移摆幅全部取自 profile，
                 // 因此换场景只需换档位，不必改代码。
                 int framesPerBuffer = _profile.BlockFrames(_sampleRate);
-                int targetFrames = _profile.TargetFrames(_sampleRate);
                 double gain = _profile.DriftGain;
                 double range = _profile.DriftRange;
 
+                // 目标水位不再是一个固定的数，而由策略给出：
+                // static 固定、adaptive 持续跟、calibrated 标定后锁定。
+                // 之所以值得策略化，是因为回环实测表明声卡池不是稳态延迟，
+                // 真正决定延迟的就是这个水位。
+                var policy = BufferPolicyFactory.Create(_profile);
+
                 Logger.Info(string.Format(
-                    "播放参数：每块 {0} 帧（{1} ms）、目标水位 {2} 帧（{3} ms）、" +
-                    "漂移摆幅 ±{4}%、增益 {5}",
+                    "播放参数：每块 {0} 帧（{1} ms）、缓冲策略 {2}、漂移摆幅 ±{3}%、增益 {4}",
                     framesPerBuffer, framesPerBuffer * 1000 / _sampleRate,
-                    targetFrames, _profile.TargetBufferMs, range * 100, gain));
+                    policy.Status(), range * 100, gain));
 
                 WaveOut.Play(_deviceIndex, () => _sampleRate, () => _channels, () =>
                 {
@@ -1450,15 +2009,31 @@ namespace Snad
                     // （丢帧 3129 帧），说明余量不足以吸收 Windows 线程调度抖动；
                     // 120 ms 则从未欠载但延迟偏高。80 ms 是两者之间的折中。
                     int avail = _ring.AvailableFrames;
+
+                    // 目标水位每块向策略要一次：adaptive/calibrated 会据此更新
+                    int targetFrames = _sampleRate * policy.TargetMs / 1000;
+                    if (targetFrames < 1) targetFrames = 1;
+
                     double ratio = 1.0 + (avail - targetFrames) / (double)Math.Max(1, targetFrames) * gain;
                     double hi = 1.0 + range, lo = 1.0 - range;
                     if (ratio > hi) ratio = hi;
                     if (ratio < lo) ratio = lo;
 
                     var buf = new byte[framesPerBuffer * 4];
+                    long urBefore = _ring.UnderrunEvents;
                     _ring.Read(buf, framesPerBuffer, ratio);
+
+                    // 用读取前的可用帧回报观测：掉坑深度就是从这一刻的欠载余量
+                    policy.Observe(avail, _sampleRate);
+
+                    // 把"刚刚真的读空了"告诉策略。
+                    // 只靠水位观测不够：水位是读取瞬间的采样，块内被读空它看不见，
+                    // 于是策略会在已经欠载的情况下继续往低处压（实测欠载 8 次仍在压）。
+                    long urAfter = _ring.UnderrunEvents;
+                    for (long u = urBefore; u < urAfter; u++) policy.NotifyUnderrun();
+                    _lastPolicyStatus = policy.Status();
                     return buf;
-                }, _cts.Token, _profile, AudioBlockReady);
+                }, _cts.Token, _profile, AudioBlockReady, Equalizer);
             }
             catch (OperationCanceledException)
             {

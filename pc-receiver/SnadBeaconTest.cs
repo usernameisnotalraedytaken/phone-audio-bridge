@@ -34,20 +34,33 @@ namespace Snad
         private static int Main(string[] args)
         {
             bool listen = false, broadcast = false, tamper = false, replay = false;
-            foreach (var a in args)
+            string bindAddr = null;
+            List<string> targets = new List<string>();
+            for (int i = 0; i < args.Length; i++)
             {
-                switch (a)
+                switch (args[i])
                 {
                     case "--listen": listen = true; break;
                     case "--broadcast": broadcast = true; break;
                     case "--tamper": tamper = true; break;
                     case "--replay": replay = true; break;
+                    case "--bind":
+                        if (i + 1 < args.Length) bindAddr = args[++i];
+                        break;
+                    case "--to":
+                        // 指定广播目标地址，可重复。用于比较受限广播与子网广播
+                        // 在本机各网卡上的实际可达性。
+                        if (i + 1 < args.Length) targets.Add(args[++i]);
+                        break;
                     case "--help": case "-h":
-                        Console.WriteLine("用法：--listen | --broadcast | --tamper | --replay（可组合）");
+                        Console.WriteLine("用法：--listen | --broadcast | --tamper | --replay");
+                        Console.WriteLine("      --bind <本机地址>   监听绑定到指定网卡地址");
+                        Console.WriteLine("      --to <目标地址>     发送到指定地址（可重复），默认 255.255.255.255");
                         return 0;
                 }
             }
             if (!listen && !broadcast && !tamper && !replay) { listen = true; broadcast = true; }
+            if (targets.Count == 0) targets.Add("255.255.255.255");
 
             Console.WriteLine("=== SNAD 信标验证 ===");
             Console.WriteLine("KeyId = " + SnadSecret.KeyId + "（两端必须一致）");
