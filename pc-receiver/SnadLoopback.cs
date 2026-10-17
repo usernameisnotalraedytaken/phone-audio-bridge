@@ -31,6 +31,7 @@
 
 using System;
 using System.Collections.Generic;
+using System.Diagnostics;
 using System.Globalization;
 using System.Runtime.InteropServices;
 using System.Threading;
@@ -214,6 +215,11 @@ namespace Snad
             string backend = "waveout";
             int deviceIndex = 0, blockMs = 16, buffers = 16, repeat = 5, prebufferMs = 60;
 
+            // 端到端模式：e2e <档位名>。非空时走"接收器 → 环形缓冲 → 输出"的完整链路。
+            string e2eProfile = null;
+            int e2ePort = 6981;
+            double primeSec = 3.0;
+
             for (int i = 0; i + 1 < args.Length; i += 2)
             {
                 string k = args[i].ToLowerInvariant();
@@ -226,6 +232,9 @@ namespace Snad
                     case "buffers": buffers = int.Parse(v, CultureInfo.InvariantCulture); break;
                     case "repeat": repeat = Math.Max(1, int.Parse(v, CultureInfo.InvariantCulture)); break;
                     case "prebuffer": prebufferMs = Math.Max(0, int.Parse(v, CultureInfo.InvariantCulture)); break;
+                    case "e2e": e2eProfile = v; break;
+                    case "port": e2ePort = int.Parse(v, CultureInfo.InvariantCulture); break;
+                    case "prime": primeSec = double.Parse(v, CultureInfo.InvariantCulture); break;
                 }
             }
 
@@ -262,11 +271,34 @@ namespace Snad
                                   cap.Frames + " 帧）");
                 Console.WriteLine();
 
-                for (int r = 0; r < repeat; r++)
+                if (e2eProfile != null)
                 {
-                    double ms = RunOnce(cap, backend, deviceIndex, blockMs, buffers, prebufferMs, r + 1, repeat);
-                    if (ms > 0) results.Add(ms);
-                    Thread.Sleep(220);
+                    // 端到端：信号经由真实的接收器（环形缓冲 → 输出）再被录回。
+                    // 直接写 sink 的测法绕过了抖动缓冲，只覆盖输出段；
+                    // 计划 §3.2 要求覆盖"抖动缓冲 + 播放池 + 声卡"，必须走这一条。
+                    using (var recv = StartReceiver(e2eProfile))
+                    {
+                        try
+                        {
+                            for (int r = 0; r < repeat; r++)
+                            {
+                                double ms = RunEndToEnd(cap, recv, e2ePort, deviceIndex,
+                                                        primeSec, r + 1, repeat);
+                                if (ms > 0) results.Add(ms);
+                                Thread.Sleep(220);
+                            }
+                        }
+                        finally { StopReceiver(recv); }
+                    }
+                }
+                else
+                {
+                    for (int r = 0; r < repeat; r++)
+                    {
+                        double ms = RunOnce(cap, backend, deviceIndex, blockMs, buffers, prebufferMs, r + 1, repeat);
+                        if (ms > 0) results.Add(ms);
+                        Thread.Sleep(220);
+                    }
                 }
             }
 
@@ -290,6 +322,165 @@ namespace Snad
             Console.WriteLine("  该值包含：输出缓冲池 + 设备缓冲 + 系统混音 + 采集侧缓冲。");
             Console.WriteLine("  不包含：DAC 之后到实际出声（需麦克风回环）。");
             return 0;
+        }
+
+        /// <summary>
+        /// 起一个真实的接收器进程（用指定档位），测完随进程退出一起结束。
+        ///
+        /// 为什么要起真进程而不是在工具里内嵌接收器：
+        ///   要测的是"接收器 + 环形缓冲 + 输出"这条真实链路，
+        ///   内嵌一份就等于测一份仿制品。用磁盘上那个二进制，测的才是会被交付的东西。
+        /// </summary>
+        private static Process StartReceiver(string profile)
+        {
+            string exe = System.IO.Path.Combine(
+                System.IO.Path.GetDirectoryName(typeof(LoopbackTest).Assembly.Location),
+                "SnadReceiver.exe");
+
+            if (!System.IO.File.Exists(exe))
+                throw new InvalidOperationException("找不到接收器：" + exe +
+                    "（端到端模式需要同目录下的 SnadReceiver.exe）");
+
+            var psi = new ProcessStartInfo(exe, "--profile \"" + profile + "\"")
+            {
+                UseShellExecute = false,
+                CreateNoWindow = true
+                // 不要重定向 stdout/stderr：接收器日志量大，管道缓冲写满后
+                // 它会阻塞在写日志上，表现为"测量工具无输出、也没测到信号"。
+                // 实测就踩过这个坑。
+            };
+
+            var p = Process.Start(psi);
+            // 起播要等它的格式判定与预填充完成；给它一点时间
+            Thread.Sleep(2200);
+            return p;
+        }
+
+        /// <summary>结束子进程。它是本工具起的测量用进程，不是用户的应用。</summary>
+        private static void StopReceiver(Process p)
+        {
+            try
+            {
+                if (p != null && !p.HasExited) p.Kill();
+                if (p != null) p.Dispose();
+            }
+            catch { }
+        }
+
+        /// <summary>
+        /// 端到端测一次：先按实时喂若干秒让接收器进入稳态，
+        /// 再送一个噪声串，记录"交出该包时采集端已采到第几帧"，
+        /// 最后在采集里找到它——差值就是**从进入接收器到出现在声卡输出**的整段延迟。
+        /// </summary>
+        private static double RunEndToEnd(LoopbackCapture cap, Process recv, int port,
+                                          int deviceIndex, double primeSec, int round, int total)
+        {
+            int rate = cap.SampleRate;
+            int channels = 2;
+            const int blockMs = 21;                       // 与手机端包长一致
+            int framesPerPacket = rate * blockMs / 1000;
+            int payloadBytes = framesPerPacket * channels * 2;
+
+            var burst = BuildBurstPcm16(rate, channels);   // 4096 帧的单声道串
+            int burstFrames = BurstFrames;
+
+            long handedAt = -1;
+            var sw = System.Diagnostics.Stopwatch.StartNew();
+
+            using (var sock = new System.Net.Sockets.UdpClient())
+            {
+                sock.Client.SendBufferSize = 1 << 20;
+                var target = new System.Net.IPEndPoint(System.Net.IPAddress.Loopback, port);
+
+                int seq = 0;
+                long streamFrame = 0;
+                double pacePerPacket = blockMs;
+
+                // 稳态预热：让接收器把环形缓冲填到目标水位
+                long primePackets = (long)(primeSec * 1000 / pacePerPacket);
+                // 串之后再来一秒静音，保证它已经被采到
+                long tailPackets = (long)(1000 / pacePerPacket);
+
+                long totalPackets = primePackets + (burstFrames / framesPerPacket + 1) + tailPackets;
+                long burstStartPacket = primePackets;
+
+                var pcm = new byte[payloadBytes];
+                for (long pk = 0; pk < totalPackets; pk++)
+                {
+                    while (sw.Elapsed.TotalMilliseconds < pk * pacePerPacket) Thread.Sleep(1);
+
+                    Array.Clear(pcm, 0, pcm.Length);
+                    for (int f = 0; f < framesPerPacket; f++)
+                    {
+                        long sf = streamFrame + f;
+                        int b = (int)(sf - burstStartPacket * framesPerPacket);
+                        short s = 0;
+                        if (b >= 0 && b < burstFrames)
+                        {
+                            if (b == 0) Volatile.Write(ref handedAt, cap.Frames);
+                            s = burst[b * channels];
+                        }
+                        for (int c = 0; c < channels; c++)
+                        {
+                            pcm[(f * channels + c) * 2] = (byte)(s & 0xFF);
+                            pcm[(f * channels + c) * 2 + 1] = (byte)((s >> 8) & 0xFF);
+                        }
+                    }
+
+                    var ts = (int)((sw.ElapsedMilliseconds) & 0xFFFFFFFFL);
+                    var pkt = BuildPacket(channels, rate, seq, ts, payloadBytes, pcm);
+                    try { sock.Send(pkt, pkt.Length, target); } catch { }
+                    seq++;
+                    streamFrame += framesPerPacket;
+                }
+            }
+
+            // 等采集端把尾巴收进来
+            Thread.Sleep(250);
+
+            if (handedAt < 0)
+            {
+                Console.WriteLine("  第 " + round + " 次：未记录到交付时刻");
+                return -1;
+            }
+
+            float[] all = cap.Samples;
+            int from = (int)Math.Max(0, handedAt - rate / 4);   // 允许采集端略早于交付
+            if (all.Length <= from + 1000)
+            {
+                Console.WriteLine("  第 " + round + " 次：采集样本不足（共 " + all.Length +
+                                  " 帧，起点 " + from + "）");
+                return -1;
+            }
+
+            int found = FindBurst(all, from, BuildBurstFloat(rate, channels), rate);
+            if (found < 0)
+            {
+                Console.WriteLine("  第 " + round + " 次：采集中未找到信号");
+                return -1;
+            }
+
+            double ms = (found - handedAt) * 1000.0 / rate;
+            Console.WriteLine("  第 " + round + "/" + total + " 次：" + ms.ToString("F2") + " ms" +
+                              "   (交付帧 " + handedAt + " → 检出帧 " + found + ")" +
+                              "   接收器仍运行=" + (!recv.HasExited));
+            return ms;
+        }
+
+        /// <summary>构造一个 v1 音频包（与手机端一致）。</summary>
+        private static byte[] BuildPacket(int channels, int rate, int seq, int timestampMs,
+                                          int payloadBytes, byte[] pcm)
+        {
+            var pkt = new byte[WireProtocol.HeaderSizeV1 + payloadBytes];
+            pkt[0] = (byte)'S'; pkt[1] = (byte)'N'; pkt[2] = (byte)'A'; pkt[3] = (byte)'D';
+            pkt[4] = WireProtocol.Version1;
+            pkt[5] = (byte)channels;
+            WireProtocol.PutInt32LE(pkt, 6, rate);
+            WireProtocol.PutInt32LE(pkt, 10, seq);
+            WireProtocol.PutInt32LE(pkt, 14, timestampMs);
+            WireProtocol.PutInt32LE(pkt, 18, payloadBytes);
+            Buffer.BlockCopy(pcm, 0, pkt, WireProtocol.HeaderSizeV1, payloadBytes);
+            return pkt;
         }
 
         /// <summary>测一次：送一段噪声串，在采集里找它，算时间差。</summary>

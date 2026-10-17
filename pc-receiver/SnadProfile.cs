@@ -190,13 +190,41 @@ namespace Snad
         /// 这些是**测量结果**，不是可调参数，因此放常数而不是配置项；
         /// 每台机器/每个设备真值不同，所以提供 OutputLegMs 由标定写入。
         /// </summary>
+        /// <summary>
+        /// 输出链路延迟。**waveOut 必须计入缓冲池**。
+        ///
+        /// 这里我犯过一次方向性错误，记下来免得再犯：
+        /// 早先用"直接写 sink"的方式测输出段，得到 28.67 ms，
+        /// 于是断定"缓冲池不是稳态延迟"。那是**测法造成的假象**——
+        /// 直连时源按实时喂，池来不及预填充；而真实接收器的环里一直有数据，
+        /// waveOut.Play 会把整个池填满并保持。
+        ///
+        /// 端到端实测（经真实接收器、loopback 录回）：
+        ///   waveOut 池=16 → 317.81 ms
+        ///   waveOut 池= 4 → 148.50 ms    差 169 ms ≈ 12 块 × 16 ms
+        /// 池深确实按"块×个数"线性进入延迟。计划 §12 原本的判断是对的。
+        /// </summary>
         public int OutputLegLatencyMs()
         {
             if (OutputLegMs > 0) return OutputLegMs;
-            if (Backend != null && Backend.StartsWith("wasapi_shared", StringComparison.OrdinalIgnoreCase))
-                return 44;
-            return 29;
+            return DeviceLegMs + PoolMs();
         }
+
+        /// <summary>
+        /// waveOut 缓冲池的在飞量。WASAPI 后端没有这一项（由驱动的设备缓冲替代）。
+        /// </summary>
+        public int PoolMs()
+        {
+            if (Backend != null && Backend.StartsWith("wasapi", StringComparison.OrdinalIgnoreCase))
+                return 0;
+            return WaveOutBuffers * BlockMs;
+        }
+
+        /// <summary>
+        /// 设备侧固定开销（块边界 + 驱动 + 混音），由"池=1"的量级反推：
+        /// 直连实测 16ms 块时 28.67 ms，减掉一块 16 ms 得约 13 ms。
+        /// </summary>
+        public const int DeviceLegMs = 13;
 
         /// <summary>输出链路是否来自本机实测（否则是后端典型值）。</summary>
         public bool OutputLegIsMeasured { get { return OutputLegMs > 0; } }
@@ -240,14 +268,18 @@ namespace Snad
             string capture = ReportedCaptureMs > 0
                 ? "capture " + ReportedCaptureMs
                 : "capture ~" + AndroidCaptureMs;
+            // 池单独列出来：它是 waveOut 下最大的一项（balanced 256 ms），
+            // 混在 "output" 里看不出来，而它恰恰是最该被调的那个。
+            string pool = PoolMs() > 0 ? " + pool " + PoolMs() : "";
             string output = OutputLegMs > 0
-                ? "output " + OutputLegMs
-                : "output ~" + OutputLegLatencyMs();
+                ? " + output " + OutputLegMs
+                : " + device ~" + DeviceLegMs;
 
             return capture
                  + " + net ~" + NetworkMs
                  + " + buffer " + BufferLatencyMs()
-                 + " + " + output
+                 + pool
+                 + output
                  + " = ~" + EstimatedPipelineLatencyMs() + " ms";
         }
 
