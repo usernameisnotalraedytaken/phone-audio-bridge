@@ -162,6 +162,14 @@ namespace Snad
             });
             _fields.Add(new Field
             {
+                Key = "samplerate", Label = "SAMPLE RATE", Kind = Kind.Enum, Restart = true,
+                Options = new[] { "follow", "44100", "48000", "96000" },
+                Display = v => v == "follow" ? "follow source" : v + " Hz",
+                GetText = p => p.SampleRate,
+                SetText = (p, v) => p.SampleRate = v
+            });
+            _fields.Add(new Field
+            {
                 Key = "wasapiperiod", Label = "WASAPI PERIOD", Kind = Kind.Int, Restart = true,
                 Min = 0, Max = 50, Step = 1, Unit = "ms",
                 GetNumber = p => p.WasapiPeriodMs, SetNumber = (p, v) => p.WasapiPeriodMs = (int)v
@@ -832,6 +840,13 @@ namespace Snad
             if (p.BlockMs < 16 && !wasapi)
                 w.Add("waveOut 下块时长小于 16ms 实测读速率会低于 48000，建议 16ms 起");
 
+            // 指定采样率而没有重采样：与源不一致时会直接拒绝启动。
+            // 与其等运行到一半才发现，不如保存时先说清楚。
+            int wantRate = p.DeclaredSampleRate();
+            if (wantRate > 0)
+                w.Add("采样率固定为 " + wantRate + " Hz：手机若送来别的采样率会拒绝启动" +
+                      "（本版无重采样）。不确定就选 follow");
+
             // 设备相关的组合校验：明确指定设备时，检查后端与位深是否被支持
             if (!string.IsNullOrEmpty(p.DeviceId))
             {
@@ -1491,6 +1506,7 @@ namespace Snad
                 Backend = src.Backend,
                 DeviceId = src.DeviceId,
                 Format = src.Format,
+                SampleRate = src.SampleRate,
                 WasapiPeriodMs = src.WasapiPeriodMs,
                 TargetBufferMs = src.TargetBufferMs,
                 // 缓冲策略（③）

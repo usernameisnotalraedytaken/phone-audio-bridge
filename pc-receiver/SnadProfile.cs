@@ -94,6 +94,26 @@ namespace Snad
         /// <summary>WASAPI 周期（毫秒）。0 表示由设备自适应（独占模式推荐）。</summary>
         public int WasapiPeriodMs = 3;
 
+        /// <summary>
+        /// 采样率策略（计划 §1.1）："follow" 跟随手机送来的采样率；
+        /// 填具体数字（如 48000）则要求与之一致。
+        ///
+        /// 本版**没有重采样**，因此指定值与源不一致时会明确报错停止，
+        /// 而不是悄悄跟随源（那会让这个设置变成空话）或强行按错误速率播放（那会变调）。
+        /// </summary>
+        public string SampleRate = "follow";
+
+        /// <summary>解析 SampleRate：返回 0 表示跟随源。</summary>
+        public int DeclaredSampleRate()
+        {
+            if (string.IsNullOrEmpty(SampleRate)) return 0;
+            string s = SampleRate.Trim();
+            if (s.Equals("follow", StringComparison.OrdinalIgnoreCase)) return 0;
+            int v;
+            if (int.TryParse(s, out v) && v >= 8000 && v <= 384000) return v;
+            return 0;
+        }
+
         // ---- 音质/稳定性相关 ----
         /// <summary>waveOut 缓冲个数。越多越抗调度抖动，内存占用与在飞时延越高。</summary>
         public int WaveOutBuffers = 16;
@@ -440,6 +460,22 @@ namespace Snad
                     if (int.TryParse(val, out iv)) p.WasapiPeriodMs = Math.Max(0, iv);
                     else Logger.Warn("第 " + lineNo + " 行 wasapiperiod 不是整数：" + val);
                     break;
+                case "samplerate":
+                    {
+                        string r = val.Trim();
+                        if (r.Equals("follow", StringComparison.OrdinalIgnoreCase))
+                            p.SampleRate = "follow";
+                        else
+                        {
+                            int rv;
+                            if (int.TryParse(r, out rv) && rv >= 8000 && rv <= 384000)
+                                p.SampleRate = rv.ToString(CultureInfo.InvariantCulture);
+                            else
+                                Logger.Warn("第 " + lineNo + " 行 samplerate 取值无效：" + val +
+                                            "（应为 follow 或 8000..384000 的整数），已忽略");
+                        }
+                        break;
+                    }
 
                 case "targetbuffer":
                     if (int.TryParse(val, out iv)) p.TargetBufferMs = iv;
@@ -815,6 +851,7 @@ namespace Snad
             if (!string.IsNullOrEmpty(p.DeviceId)) list.Add(kv("device", p.DeviceId));
             list.Add(kv("format", p.Format));
             list.Add(kv("wasapiperiod", p.WasapiPeriodMs.ToString(ci)));
+            list.Add(kv("samplerate", string.IsNullOrEmpty(p.SampleRate) ? "follow" : p.SampleRate));
 
             // 延迟相关
             list.Add(kv("targetbuffer", p.TargetBufferMs.ToString(ci)));

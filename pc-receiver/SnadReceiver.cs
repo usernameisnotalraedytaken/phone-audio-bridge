@@ -72,6 +72,12 @@ namespace Snad
 
         public static void Err(string what, Exception ex)
         {
+            // ex 允许为 null：调用方在"只陈述事实、没有异常对象"时也会用它。
+            // 日志函数绝不能因为参数缺失就把调用方打崩——
+            // 实测踩过：这里对 null 解引用，把一个"采样率不符"的明确报错
+            // 变成了看不出原因的 NullReferenceException。
+            if (ex == null) { Write("ERROR", what); return; }
+
             Write("ERROR", what + " -> " + ex.GetType().Name + ": " + ex.Message);
             if (ex.StackTrace != null)
             {
@@ -1813,6 +1819,24 @@ namespace Snad
 
                         if (!_formatLogged || rate != _sampleRate || ch != _channels)
                         {
+                            // 采样率策略（计划 §1.1）：follow 跟随源；指定值则要求一致。
+                            //
+                            // 指定值不一致时**必须报错停下**，不能悄悄跟随源：
+                            // 那会让"我设了 44100"变成一句空话。真正的重采样没有实现，
+                            // 而直接按错误速率播放只会变调——所以宁可明确失败。
+                            int wantRate = _profile.DeclaredSampleRate();
+                            if (wantRate > 0 && rate > 0 && rate != wantRate)
+                            {
+                                var mismatch = new InvalidOperationException(
+                                    "采样率不符：" + rate + " Hz ≠ 档位要求 " + wantRate +
+                                    " Hz（本版无重采样，已停止）");
+                                Logger.Err("采样率不符：手机送来 " + rate + " Hz，档位要求 " +
+                                           wantRate + " Hz。本版没有重采样，无法转换；" +
+                                           "请把档位的采样率改为 follow 或改成与手机一致的值。",
+                                           mismatch);
+                                throw mismatch;
+                            }
+
                             _sampleRate = rate > 0 ? rate : 48000;
                             _channels = ch > 0 ? ch : 2;
 
