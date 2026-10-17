@@ -38,6 +38,10 @@ class SnadBeaconListener(
     private val acceptedCount = AtomicLong(0)
     private val rejectedCount = AtomicLong(0)
 
+    /** 时间同步专用密钥；PSK 未就绪或派生失败时为 null，收到探测会明确报错。 */
+    @Volatile
+    private var timeSyncKey: ByteArray? = null
+
     val accepted: Long get() = acceptedCount.get()
     val rejected: Long get() = rejectedCount.get()
 
@@ -83,6 +87,9 @@ class SnadBeaconListener(
             val key = SnadBeacon.deriveKey(psk)
             onLog("密钥就绪，KeyId=${SnadSecret.KEY_ID}（应与电脑端一致）")
 
+            // 时间同步用独立派生密钥：与信标密钥分开，避免一个用途的报文被另一用途复用。
+            timeSyncKey = SnadTimeSync.deriveKey(psk)
+
             socket = DatagramSocket(null)
             socket.reuseAddress = true
             socket.broadcast = true
@@ -105,6 +112,37 @@ class SnadBeaconListener(
                 }
 
                 val src = packet.address?.hostAddress ?: "?"
+
+                // 时间同步探测（type 'T'）走同一个端口，但语义不同：
+                // 它由电脑主动发来，要求手机立刻回显两个时刻。
+                //
+                // 必须在信标解析之前分流：信标的第 9 字节是"设备名长度"，
+                // 探测包的第 9 字节是类型，混在一起会让信标解析把长度读成 84 而报错。
+                val typeByte = if (packet.length > 9) packet.data[9] else 0
+                if (packet.length >= SnadTimeSync.PROBE_SIZE &&
+                    typeByte == SnadTimeSync.TYPE_PROBE) {
+                    if (timeSyncKey == null) {
+                        onLog("收到时间同步探测，但密钥未就绪，无法回应")
+                    } else {
+                        val reply = SnadTimeSync.replyTo(packet.data, packet.length, timeSyncKey)
+                        reply.fold(
+                            onSuccess = { bytes ->
+                                try {
+                                    socket.send(DatagramPacket(bytes, bytes.size, packet.address, packet.port))
+                                } catch (e: Exception) {
+                                    // 发送失败必须留痕：静默会让电脑端永远等不到校准，
+                                    // 而手机上看起来一切正常。
+                                    onLog("时间同步回复发送失败：${e.javaClass.simpleName}: ${e.message}")
+                                }
+                            },
+                            onFailure = { e ->
+                                onLog("时间同步探测被拒：${e.javaClass.simpleName}: ${e.message}")
+                            }
+                        )
+                    }
+                    continue
+                }
+
                 val result = SnadBeacon.parse(packet.data, packet.length, key, src)
 
                 result.fold(

@@ -116,7 +116,7 @@ function Install-Binary {
 
 # ---- 1) 控制台版（无 GUI，便于在无桌面环境或脚本中运行）----
 $consoleSources = @('SnadReceiver.cs', 'SnadProfile.cs', 'SnadBeacon.cs', 'SnadBeaconService.cs',
-                    'SnadEq.cs', 'SnadSecret.cs')
+                    'SnadEq.cs', 'SnadSecret.cs', 'SnadTimeSync.cs', 'SnadClockSync.cs')
 $consoleArgs = @('/nologo', '/target:exe', '/platform:x64', '/optimize+',
                  '/out:SnadReceiver.new.exe', '/define:CONSOLE_BUILD')
 foreach ($a in $coreRefs) { $consoleArgs += ("/r:" + (Join-Path $fw $a)) }
@@ -164,8 +164,10 @@ if (Test-Path 'SnadConfigTest.cs') {
                      '/main:Snad.ConfigTest', '/out:SnadConfigTest.exe')
     foreach ($a in $coreRefs) { $cfgTestArgs += ("/r:" + (Join-Path $fw $a)) }
     # 需要 SnadReceiver.cs 是因为 Logger 定义在其中；而它又引用 SnadSecret，
-    # 因此密钥单元也必须一起编译。
-    $cfgTestArgs += @('SnadReceiver.cs', 'SnadProfile.cs', 'SnadEq.cs', 'SnadSecret.cs', 'SnadConfigTest.cs')
+    # 因此密钥单元也必须一起编译。SnadReceiver 现在还引用时钟基准与校准器，
+    # 这两个文件也要跟着编译——否则这里会报"找不到类型"，而主程序却编译通过。
+    $cfgTestArgs += @('SnadReceiver.cs', 'SnadProfile.cs', 'SnadEq.cs', 'SnadSecret.cs',
+                      'SnadTimeSync.cs', 'SnadClockSync.cs', 'SnadBeacon.cs', 'SnadConfigTest.cs')
     & $csc @cfgTestArgs
     if ($LASTEXITCODE -ne 0) { throw "配置验证工具编译失败，csc 退出码 $LASTEXITCODE" }
 }
@@ -178,7 +180,7 @@ if (Test-Path 'SnadShot.cs') {
     $shotArgs += @('SnadReceiver.cs', 'SnadProfile.cs', 'SnadBeacon.cs', 'SnadBeaconService.cs',
                    'SnadEq.cs', 'SnadEqForm.cs', 'SnadSpectrum.cs', 'SnadGui.cs',
                    'SnadTheme.cs', 'SnadControls.cs', 'SnadWidgets.cs', 'SnadWordmark.cs', 'SnadChannelStrip.cs', 'SnadLogView.cs', 'SnadStereo.cs', 'SnadLogForm.cs', 'SnadGraph.cs', 'SnadMetricStrip.cs',
-                   'SnadSecret.cs', 'SnadShot.cs')
+                   'SnadSecret.cs', 'SnadTimeSync.cs', 'SnadClockSync.cs', 'SnadShot.cs')
     & $csc @shotArgs
     if ($LASTEXITCODE -ne 0) { throw "界面检查工具编译失败，csc 退出码 $LASTEXITCODE" }
 }
@@ -207,7 +209,7 @@ if (Test-Path 'SnadPreview.cs') {
 # ---- 2) GUI 版 ----
 if ($buildGui) {
     $guiSources = @('SnadReceiver.cs', 'SnadProfile.cs', 'SnadBeacon.cs', 'SnadBeaconService.cs',
-                    'SnadSecret.cs', 'SnadEq.cs', 'SnadEqForm.cs',
+                    'SnadSecret.cs', 'SnadTimeSync.cs', 'SnadClockSync.cs', 'SnadEq.cs', 'SnadEqForm.cs',
                     'SnadTheme.cs', 'SnadControls.cs', 'SnadWidgets.cs', 'SnadWordmark.cs', 'SnadChannelStrip.cs', 'SnadLogView.cs', 'SnadStereo.cs', 'SnadLogForm.cs', 'SnadGraph.cs', 'SnadMetricStrip.cs',
                     'SnadGui.cs', 'SnadSpectrum.cs')
     $missing = $guiSources | Where-Object { -not (Test-Path $_) }

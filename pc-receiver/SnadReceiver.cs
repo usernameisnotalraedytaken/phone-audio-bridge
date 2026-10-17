@@ -17,6 +17,7 @@ using System.Collections.Generic;
 using System.Globalization;
 using System.Linq;
 using System.Net;
+using System.Diagnostics;
 using System.Net.Sockets;
 using System.Runtime.InteropServices;
 using System.Text;
@@ -181,6 +182,14 @@ namespace Snad
             // 管道重定向时 Console.Out 是块缓冲，不显式 flush 会看不到实时统计
             var auto = new System.IO.StreamWriter(Console.OpenStandardOutput(), Encoding.UTF8) { AutoFlush = true };
             Console.SetOut(auto);
+
+            // 时钟基准自检：不联网、不需要手机，先证明"已知答案能算回来"。
+            // 端到端延迟的可信度完全建立在这一层上，所以它必须能单独验证。
+            if (args.Length > 0 && args[0] == "--timesync-selftest")
+            {
+                Console.WriteLine("=== 时钟基准自检 ===");
+                return SnadTimeSync.SelfTest();
+            }
 
             // 提高系统计时器精度到 1 ms。不做这一步，播放线程会被 15.6 ms 的
             // 调度粒度拖慢，而音频块只有 16 ms，消费必然跟不上产出。
@@ -1119,6 +1128,26 @@ namespace Snad
         private volatile int _channels = 2;
         private long _packets, _bytes, _overflow;
         private long _shortPkt, _badMagic, _badVersion, _badPayload;
+
+        // ---- 端到端延迟测量的第一段：包到达 ----
+        //
+        // 手机在每个音频包里带了采集时刻（单调时钟 ms）。要把它换算成延迟，
+        // 缺的是两台机器的时钟差。这里先取**最小的 (到达 − 采集)** 作为该差值的
+        // 下界估计：最理想的那个包几乎没排队，所以它最接近真实的时钟差。
+        //
+        // 误差 = 该包真实的网络单向时延（局域网 1–10 ms）。这个误差是**已知方向**的：
+        // 估计值偏大，因此算出的延迟偏小。等手机端能回显信标后改用往返校准，
+        // 误差可降到 RTT/2 且方向对称。
+        private long _clockSkewFloorMs = long.MaxValue;   // min(到达 − 采集)
+        private long _lastArrivalMs;                       // 最近一包到达时刻（本机单调 ms）
+        private uint _lastPhoneTsMs;                       // 该包的采集时刻
+
+        /// <summary>时钟校准器。收到第一个音频包时创建（此时才知道手机地址）。</summary>
+        private SnadClockSync _clockSync;
+        private long _clockSyncStartFailures;
+
+        private static readonly double MsPerTick = 1000.0 / Stopwatch.Frequency;
+        private static double NowMs() { return Stopwatch.GetTimestamp() * MsPerTick; }
         private long _logLines, _logPkts;
         private bool _formatLogged;
         private int _seqExpected = -1;
@@ -1304,6 +1333,14 @@ namespace Snad
 
                         int rate = BitConverter.ToInt32(pkt, 6);
                         int ch = pkt[5];
+
+                        // 手机采集时刻（单调时钟低 32 位，ms）。
+                        //
+                        // 这个字段协议里一直有，接收端此前从未读取——
+                        // 时间戳在线上跑了几万包，却没人用它。端到端延迟要可测，
+                        // 起点只能是它：没有它就只剩"包到达 PC"这个更晚的时刻。
+                        uint phoneTsMs = BitConverter.ToUInt32(pkt, 14);
+
                         int seq = BitConverter.ToInt32(pkt, 10);
                         int payload = BitConverter.ToInt32(pkt, 18);
                         if (payload <= 0 || Program.HeaderSize + payload > pkt.Length)
@@ -1375,6 +1412,38 @@ namespace Snad
                                 _ring.AvailableFrames, remote));
                         }
 
+                        // 记录这一包的到达时刻，并与手机采集时刻相减。
+                        // 差值的**最小值**就是两端时钟差的下界估计：
+                        // 最理想的那个包几乎没排队，它最接近真实时钟差。
+                        {
+                            double arrivalMs = NowMs();
+                            long diff = (long)arrivalMs - phoneTsMs;
+                            if (diff < _clockSkewFloorMs) _clockSkewFloorMs = diff;
+                            _lastArrivalMs = (long)arrivalMs;
+                            _lastPhoneTsMs = phoneTsMs;
+                        }
+
+                        // 第一个音频包带来了手机地址——从这一刻起才能做时钟校准。
+                        // 失败必须留痕：没有校准，端到端延迟就不能报数。
+                        if (_clockSync == null)
+                        {
+                            try
+                            {
+                                _clockSync = new SnadClockSync(
+                                    SnadSecret.Psk, remote.Address, SnadBeacon.DefaultPort,
+                                    msg => Logger.Info(msg));
+                                _clockSync.Start();
+                                Logger.Info("时钟校准已启动：目标 " + remote.Address +
+                                            ":" + SnadBeacon.DefaultPort);
+                            }
+                            catch (Exception ex)
+                            {
+                                _clockSyncStartFailures++;
+                                _clockSync = null;
+                                Logger.Err("时钟校准启动失败（端到端延迟将不可用）", ex);
+                            }
+                        }
+
                         var pcm = new byte[payload];
                         Buffer.BlockCopy(pkt, Program.HeaderSize, pcm, 0, payload);
 
@@ -1434,6 +1503,44 @@ namespace Snad
                                 _seqGaps, _seqMissing,
                                 Interlocked.Read(ref _shortPkt), Interlocked.Read(ref _badMagic),
                                 Interlocked.Read(ref _badVersion), Interlocked.Read(ref _badPayload)));
+
+                            // 端到端测量的当前进度：手机采集 → 现在，已经走了多久。
+                            //
+                            // 它还不是完整延迟：还差"最后这块音频真正播出的时刻"。
+                            // 但那一段是确定的（缓冲区里还有多少帧 ÷ 采样率），
+                            // 因此这里先给出**已确定的**部分，不掺估计。
+                            if (_clockSkewFloorMs != long.MaxValue)
+                            {
+                                double sinceArrival = NowMs() - _lastArrivalMs;
+                                double inFlight = (_lastArrivalMs - _lastPhoneTsMs) - _clockSkewFloorMs;
+                                Logger.Info(string.Format(CultureInfo.InvariantCulture,
+                                    "[端到端] 手机采集→现在 = {0:F1} ms（含在途 {1:F1} + 到达后 {2:F1}）；" +
+                                    "时钟差下界 {3} ms（误差 ≤ 最小网络单向时延）",
+                                    inFlight + sinceArrival, inFlight, sinceArrival,
+                                    _clockSkewFloorMs));
+                            }
+
+                            // 时钟校准状态必须每报一次：没有它，上面那个数只能算"已走过的时长"，
+                            // 不能算端到端延迟。缺样本时说清楚缺，而不是沉默。
+                            if (_clockSync == null)
+                            {
+                                Logger.Warn("[时钟] 尚未启动（启动失败 " + _clockSyncStartFailures +
+                                            " 次），端到端延迟不可用");
+                            }
+                            else if (!_clockSync.HasCalibration)
+                            {
+                                Logger.Warn("[时钟] 未校准：已失败 " + _clockSync.Failures +
+                                            " 次" + (_clockSync.LastError != null
+                                                ? "，最后一次原因：" + _clockSync.LastError : "") +
+                                            "；端到端延迟不可用");
+                            }
+                            else
+                            {
+                                Logger.Info(string.Format(CultureInfo.InvariantCulture,
+                                    "[时钟] 已校准：Δ={0:F2} ms（样本 {1}，最优 RTT {2:F1} ms，失败 {3} 次）",
+                                    _clockSync.OffsetMs, _clockSync.Samples,
+                                    _clockSync.BestRttMs, _clockSync.Failures));
+                            }
 
                             _lastFramesIn = fIn;
                             _lastFramesWritten = fWr;
