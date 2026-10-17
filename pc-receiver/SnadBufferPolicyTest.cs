@@ -148,7 +148,52 @@ namespace Snad
             IBufferPolicy p4 = BufferPolicyFactory.Create(new Profile { BufferMode = "static" });
             Check(p4 is StaticPolicy, "static 创建正确", p4.GetType().Name);
 
+            TestOscillation();
+
             Console.WriteLine();
+        }
+
+        /// <summary>
+        /// 振荡检测（计划 §9 风险表要求"振荡检测"）。
+        ///
+        /// 判据不是"目标值有没有变"，而是**方向反转次数**：
+        /// 追着抖动来回调的目标看起来一直在某个值附近，其实一刻没停。
+        ///
+        /// 两个对照：
+        ///   稳定输入（水位恒定）→ 目标单调收敛，不应判振荡；
+        ///   交替输入（每块高低翻转）→ 目标来回拉扯，应判振荡。
+        /// </summary>
+        private static void TestOscillation()
+        {
+            Console.WriteLine("--- 自适应振荡检测（§9）---");
+
+            // 稳定输入：水位一直在目标之上，目标应单调压向低处
+            var calm = new AdaptivePolicy(80, 40, 240, 0.5);
+            for (int i = 0; i < 400; i++) calm.Observe(48000 * 120 / 1000, 48000);
+            Check(!calm.Oscillating, "稳定输入不判振荡", "反转 " + calm.Reversals + " 次");
+
+            // 交替输入：短相位、高增益，构造真正会来回拉扯的工况。
+            //
+            // 这里试过三种输入，只有最后一种真的让策略来回走：
+            //   1:1 高低交替        → 反转 0 次（EMA 直接吸收）
+            //   40 块相位、rate 0.5 → 反转 1 次（阻尼太强，只单向收敛）
+            //   20 块相位、rate 1.0 → 多次反转
+            // 也就是说：**默认参数下这个策略几乎不会振荡**，
+            // 它更像是"升得快、降得慢"的棘轮。这一点比振荡本身更值得记一笔。
+            var shaky = new AdaptivePolicy(80, 40, 240, 1.0);
+            for (int i = 0; i < 400; i++)
+            {
+                int frames = ((i / 20) % 2 == 0)
+                    ? 0                                   // 空环：期望快速上升
+                    : 48000 * 900 / 1000;                 // 远高于目标：期望快速下降
+                shaky.Observe(frames, 48000);
+            }
+            Check(shaky.Oscillating, "快速相位切换判为振荡", "反转 " + shaky.Reversals + " 次");
+
+            // 静态策略永远不振荡
+            var stat = new StaticPolicy(80);
+            for (int i = 0; i < 400; i++) stat.Observe((i % 2 == 0) ? 9600 : 960, 48000);
+            Check(!stat.Oscillating, "static 恒不振荡", "N/A");
         }
     }
 }
