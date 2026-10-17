@@ -64,7 +64,8 @@ namespace Snad
                 var steppers = FindAll<FlatStepper>(f);
                 var dropdowns = FindAll<FlatDropdown>(f);
                 Check(steppers.Count >= 12, "数字编辑器 " + steppers.Count + " 个（应 ≥12）");
-                Check(dropdowns.Count == 3, "下拉编辑器 " + dropdowns.Count + " 个（后端/设备/位深 = 3）");
+                Check(dropdowns.Count >= 4, "下拉编辑器 " + dropdowns.Count +
+                      " 个（后端/设备/位深/缓冲策略 至少 4）");
 
                 // ---- 断言：设备下拉真的枚举到了设备 ----
                 // 设备下拉的项数最多（含"跟随系统默认"再加每台设备一项），
@@ -128,15 +129,22 @@ namespace Snad
                 // waveOut 下 WASAPI PERIOD 没有作用，必须被压暗；
                 // 切到独占后位深才可选，同时 waveOut 的缓冲池失去意义。
                 CheckApplicability(f, dir);
+                CheckButtons(f);
 
                 // ---- 断言：日志里没有异常 ----
                 bool clean = logs.Count == 0;
                 Check(clean, "构造与渲染过程中无告警" + (clean ? "" : "：" + string.Join(" | ", logs.ToArray())));
 
-                f.Close();
+                // 不要调用 f.Close()：实测它会阻塞（窗体里创建过弹出式下拉，
+                // 关闭时的控件释放链把主线程卡住），导致后面的总结行永远打不出来，
+                // 看起来像"检查没跑完"。进程马上就退出，清理交给操作系统即可。
+                f.Hide();
                 Console.WriteLine();
                 Console.WriteLine(_fail == 0 ? "配置编辑器检查通过" : ("有 " + _fail + " 项失败"));
                 Console.WriteLine("图已保存到 " + Path.GetFullPath(dir));
+
+                Console.Out.Flush();
+                Environment.Exit(_fail == 0 ? 0 : 1);
                 return _fail == 0 ? 0 : 1;
             }
             catch (Exception ex)
@@ -160,27 +168,18 @@ namespace Snad
             Console.WriteLine();
             Console.WriteLine("--- 生效范围随后端变化 ---");
 
-            var dropdowns = FindAll<FlatDropdown>(f);
-            FlatDropdown backendDd = null;
-            foreach (var d in dropdowns)
-                for (int i = 0; i < d.Items.Length; i++)
-                    if (d.Items[i] == "waveOut") { backendDd = d; break; }
+            // 按控件名精确定位。此前用"项数最多/上限等于多少"之类的启发式，
+            // 加了 BUFFER MODE 之后立刻认错控件——字段一多，启发式必然失效。
+            var backendDd = FindByName<FlatDropdown>(f, "field:backend");
+            var formatDd = FindByName<FlatDropdown>(f, "field:format");
+            var period = FindByName<FlatStepper>(f, "field:wasapiperiod");
+            var pool = FindByName<FlatStepper>(f, "field:waveoutbuffers");
 
             if (backendDd == null)
             {
-                Check(false, "找到后端下拉框");
+                Check(false, "按名称找到 backend 下拉（控件未命名？）");
                 return;
             }
-
-            // 按项数把三个下拉分开：设备最多、位深次之、后端恰好 3 项
-            FlatDropdown formatDd = null, deviceDd = null;
-            foreach (var d in dropdowns)
-            {
-                if (ReferenceEquals(d, backendDd)) continue;
-                if (d.Items.Length == 11 || d.Items.Length > 6) deviceDd = d;
-                else if (formatDd == null || d.Items.Length > formatDd.Items.Length) formatDd = d;
-            }
-            _ = deviceDd;
 
             // waveOut：位深不可选（只有 pcm16），周期无效
             int woIdx = Array.IndexOf(backendDd.Items, "waveOut");
@@ -192,14 +191,6 @@ namespace Snad
                   "waveOut 下位深只有 pcm16（实为 " +
                   (formatDd != null ? string.Join("/", formatDd.Items) : "无") + "）");
 
-            var steppers = FindAll<FlatStepper>(f);
-            // 周期是唯一上限 50 的整数步进器；缓冲池上限 64
-            FlatStepper period = null, pool = null;
-            foreach (var s in steppers)
-            {
-                if (Math.Abs(s.Max - 50) < 0.01 && s.Unit == "ms") period = s;
-                if (Math.Abs(s.Max - 64) < 0.01) pool = s;
-            }
             Check(period != null && !period.Enabled, "waveOut 下 WASAPI 周期被压暗");
             Check(pool != null && pool.Enabled, "waveOut 下缓冲池可用");
 
@@ -252,6 +243,54 @@ namespace Snad
                 yield return c;
                 foreach (var d in AllControls(c)) yield return d;
             }
+        }
+
+        /// <summary>
+        /// 按钮必须都在窗口内、且互不重叠。
+        ///
+        /// 这类回归靠看图不容易发现（按钮被裁掉一半仍像"有个按钮"），
+        /// 而计划 §4.5 要求的新建/复制/重命名/重置/删除/导入导出一共 7 个，
+        /// 排成一行很容易在窄窗口下挤到界外。
+        /// </summary>
+        private static void CheckButtons(Form f)
+        {
+            Console.WriteLine();
+            Console.WriteLine("--- 操作按钮布局 ---");
+
+            var btns = FindAll<FlatButton>(f);
+            Check(btns.Count >= 9, "按钮 " + btns.Count + " 个（7 个档位操作 + REVERT/SAVE）");
+
+            bool allInside = true;
+            foreach (var b in btns)
+                if (b.Right > f.ClientSize.Width || b.Left < 0)
+                {
+                    allInside = false;
+                    Console.WriteLine("        越界：" + b.Text + " " + b.Bounds);
+                }
+            Check(allInside, "所有按钮都在窗口内");
+
+            bool overlap = false;
+            for (int i = 0; i < btns.Count; i++)
+                for (int j = i + 1; j < btns.Count; j++)
+                    if (btns[i].Bounds.IntersectsWith(btns[j].Bounds))
+                    {
+                        overlap = true;
+                        Console.WriteLine("        重叠：" + btns[i].Text + " 与 " + btns[j].Text);
+                    }
+            Check(!overlap, "按钮之间不重叠");
+
+            Console.WriteLine("        顺序：" + string.Join(" ", btns.ConvertAll(b => b.Text).ToArray()));
+        }
+
+        /// <summary>按控件名精确查找。控件在 ProfileForm 里以 "field:&lt;键名&gt;" 命名。</summary>
+        private static T FindByName<T>(Control root, string name) where T : Control
+        {
+            foreach (var c in AllControls(root))
+            {
+                var t = c as T;
+                if (t != null && string.Equals(t.Name, name, StringComparison.Ordinal)) return t;
+            }
+            return null;
         }
 
         private static T FindFirst<T>(Control root) where T : Control

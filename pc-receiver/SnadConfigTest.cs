@@ -158,6 +158,16 @@ namespace Snad
                 LeadMs = 20,
                 DriftGain = 0.07,
                 DriftRange = 0.05,
+                // ③ 缓冲策略
+                BufferMode = "adaptive",
+                MinBufferMs = 35,
+                MaxBufferMs = 180,
+                AdaptRate = 0.35,
+                CalibrateSec = 12,
+                // ②④ 标定与上报
+                OutputLegMs = 31,
+                CalibratedOn = "Realtek 测试设备",
+                ReportedCaptureMs = 17,
                 EqEnabled = true,
                 EqPreampDb = -3.5
             };
@@ -184,6 +194,20 @@ namespace Snad
                 Check(Math.Abs(rt.EqPreampDb - (-3.5)) < 0.01, "eqpreamp 读回正确（" + rt.EqPreampDb + "）");
                 Check(rt.EqGains != null && rt.EqGains.Length == 10 && Math.Abs(rt.EqGains[9] - 10) < 0.01,
                       "eqgains 读回正确");
+
+                // ③ 缓冲策略必须能往返：漏掉任何一项都会在保存时被清零，
+                // 而界面上看不出异常，属于静默丢配置
+                Check(rt.BufferMode == "adaptive", "buffermode 读回正确（" + rt.BufferMode + "）");
+                Check(rt.MinBufferMs == 35, "minbuffer 读回正确（" + rt.MinBufferMs + "）");
+                Check(rt.MaxBufferMs == 180, "maxbuffer 读回正确（" + rt.MaxBufferMs + "）");
+                Check(Math.Abs(rt.AdaptRate - 0.35) < 0.001, "adaptrate 读回正确（" + rt.AdaptRate + "）");
+                Check(rt.CalibrateSec == 12, "calibratesec 读回正确（" + rt.CalibrateSec + "）");
+
+                // ②④ 标定与上报
+                Check(rt.OutputLegMs == 31, "outputleg 读回正确（" + rt.OutputLegMs + "）");
+                Check(rt.CalibratedOn == "Realtek 测试设备", "calibratedon 读回正确（" + rt.CalibratedOn + "）");
+                Check(rt.ReportedCaptureMs == 17, "capturebuffer 读回正确（" + rt.ReportedCaptureMs + "）");
+                Check(rt.OutputLegIsMeasured, "OutputLegMs > 0 时判定为已标定");
             }
 
             // 二次保存应就地更新，不产生重复键

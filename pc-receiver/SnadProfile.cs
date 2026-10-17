@@ -136,41 +136,70 @@ namespace Snad
         /// <summary>
         /// 按此 profile 估算的端到端延迟（毫秒）。
         ///
-        /// 这是**估计值，不是实测值**——由档位参数算出，因此同一个档位每次
-        /// 显示的数字都一样。它的用途是横向比较不同档位的取舍
-        /// （缓冲越大越抗抖动、延迟越高），而不是反映当前网络状况。
-        /// 真正常变的部分只有抖动缓冲水位，那个在 BUFFER 列单独显示。
+        /// **这里曾经是错的**：旧公式把 `WaveOutBuffers × BlockMs`（balanced 下 256 ms、
+        /// highquality 下 672 ms）当成延迟直接相加，得出 386 / 421 / 1052 ms。
+        /// 回环实测（LATENCY-MEASURED.md）表明，源按实时到达时
+        /// 池深从 4 改到 32、延迟都在 25–32 ms 不动——池只是抗调度抖动的余量，
+        /// 不是"声音晚多久出来"。所以它不该出现在延迟里。
         ///
-        /// 各项来源：
-        ///   TargetBufferMs          抖动缓冲目标水位（配置）
-        ///   BlockMs                 每次提交给 waveOut 的音频时长（配置）
-        ///   WaveOutBuffers × BlockMs 声卡侧在飞的数据量（配置）
-        ///   LeadMs                  时钟偏差余量（配置）
-        ///   AndroidCaptureMs        手机端采集缓冲（常数估计，协议未上报）
-        ///   NetworkMs               网络传输（常数估计，协议无 RTT）
+        /// 现在的模型只有四项，每一项的性质都标注清楚：
+        ///   抖动缓冲水位  配置决定，是延迟的主要可调项
+        ///   输出链路      实测得到的（OutputLegMs），未标定时按后端典型值并标注"估计"
+        ///   采集缓冲      手机上报（能力上报），未上报时按典型值并标注"估计"
+        ///   网络          仍无法实测（无 RTT），按典型值并标注"估计"
         /// </summary>
         public int EstimatedPipelineLatencyMs()
         {
-            return EstimatedPipelineLatencyMs(true);
+            return CaptureLatencyMs() + NetworkMs + BufferLatencyMs() + OutputLegLatencyMs();
         }
 
         /// <summary>
-        /// 估算延迟。<paramref name="includeOutputPool"/> = false 时不计输出缓冲池，
-        /// 用于 WASAPI 后端——那里的在飞量由驱动的设备缓冲与 sink 队列决定，
-        /// 不受 <see cref="WaveOutBuffers"/> 影响，算进去会得出一个虚高的数。
+        /// 抖动缓冲水位。自适应/标定模式下实际值由策略决定，
+        /// 这里只能按配置值估算，并在界面上标明"实际随策略变化"。
         /// </summary>
-        public int EstimatedPipelineLatencyMs(bool includeOutputPool)
+        public int BufferLatencyMs()
         {
-            return AndroidCaptureMs + NetworkMs + TargetBufferMs + BlockMs
-                 + (includeOutputPool ? WaveOutBuffers * BlockMs : 0) + LeadMs;
+            return BufferMode == "static" ? TargetBufferMs : TargetBufferMs;
         }
 
         /// <summary>
-        /// 估算用的常数项。手机端采集缓冲与网络传输目前无法实测
-        /// （协议里没有 RTT 交换，手机端也不上报采集时延），
-        /// 因此按典型值估计。要变成实测值需要扩展协议。
+        /// 输出链路延迟：标定过就用实测值，否则用该后端的实测典型值。
+        ///
+        /// 默认值来自回环实测（LATENCY-MEASURED.md）：waveOut 28.7 ms、
+        /// WASAPI 共享 43.7 ms。独占没有 loopback 可用，取 waveOut 同量级值并标注估计。
+        /// 这些是**测量结果**，不是可调参数，因此放常数而不是配置项；
+        /// 每台机器/每个设备真值不同，所以提供 OutputLegMs 由标定写入。
         /// </summary>
+        public int OutputLegLatencyMs()
+        {
+            if (OutputLegMs > 0) return OutputLegMs;
+            if (Backend != null && Backend.StartsWith("wasapi_shared", StringComparison.OrdinalIgnoreCase))
+                return 44;
+            return 29;
+        }
+
+        /// <summary>输出链路是否来自本机实测（否则是后端典型值）。</summary>
+        public bool OutputLegIsMeasured { get { return OutputLegMs > 0; } }
+
+        /// <summary>采集缓冲：手机上报过就用上报值，否则按典型值。</summary>
+        public int CaptureLatencyMs()
+        {
+            return ReportedCaptureMs > 0 ? ReportedCaptureMs : AndroidCaptureMs;
+        }
+
+        /// <summary>输出链路延迟实测值（毫秒）。0 表示未标定。</summary>
+        public int OutputLegMs = 0;
+
+        /// <summary>标定来源设备名，便于分辨"这台机器测的"还是别人测的。</summary>
+        public string CalibratedOn = "";
+
+        /// <summary>手机上报的采集缓冲（毫秒）。0 表示未上报。</summary>
+        public int ReportedCaptureMs = 0;
+
+        /// <summary>采集缓冲的估计常数，仅在手机未上报时使用。</summary>
         public const int AndroidCaptureMs = 8;
+
+        /// <summary>网络单程延迟的估计常数。协议没有 RTT 交换，仍无法实测。</summary>
         public const int NetworkMs = 21;
 
         /// <summary>后端是否走 WASAPI（决定估算里要不要计入 waveOut 缓冲池）。</summary>
@@ -186,24 +215,20 @@ namespace Snad
         /// <summary>延迟构成的明细，供界面或日志展示估计的依据。</summary>
         public string LatencyBreakdown()
         {
-            return LatencyBreakdown(true);
-        }
+            // 每一项都标出是"实测"还是"估计"，因为用户要求任何数字都能被解释。
+            // 未标定的项一律写 ~，避免把典型值当成这台机器的真值。
+            string capture = ReportedCaptureMs > 0
+                ? "capture " + ReportedCaptureMs
+                : "capture ~" + AndroidCaptureMs;
+            string output = OutputLegMs > 0
+                ? "output " + OutputLegMs
+                : "output ~" + OutputLegLatencyMs();
 
-        /// <summary>
-        /// 延迟构成明细。<paramref name="includeOutputPool"/> = false 时，
-        /// 输出缓冲项改写为"由驱动决定"，因为那个量在启动前无法从配置推出。
-        /// </summary>
-        public string LatencyBreakdown(bool includeOutputPool)
-        {
-            string output = includeOutputPool
-                ? "pool " + (WaveOutBuffers * BlockMs)
-                : "driver buffers";
-            return "capture " + AndroidCaptureMs + " + net " + NetworkMs
-                 + " + jitter " + TargetBufferMs + " + block " + BlockMs
+            return capture
+                 + " + net ~" + NetworkMs
+                 + " + buffer " + BufferLatencyMs()
                  + " + " + output
-                 + " + lead " + LeadMs
-                 + " = " + (includeOutputPool ? "" : "at least ")
-                 + EstimatedPipelineLatencyMs(includeOutputPool) + " ms";
+                 + " = ~" + EstimatedPipelineLatencyMs() + " ms";
         }
 
         public override string ToString()
@@ -446,6 +471,17 @@ namespace Snad
                 case "calibratesec":
                     if (int.TryParse(val, out iv)) p.CalibrateSec = Math.Max(1, iv);
                     else Logger.Warn("第 " + lineNo + " 行 calibratesec 不是整数：" + val);
+                    break;
+                case "outputleg":
+                    if (int.TryParse(val, out iv) && iv > 0) p.OutputLegMs = iv;
+                    else Logger.Warn("第 " + lineNo + " 行 outputleg 应为正整数：" + val);
+                    break;
+                case "calibratedon":
+                    p.CalibratedOn = val.Trim();
+                    break;
+                case "capturebuffer":
+                    if (int.TryParse(val, out iv) && iv >= 0) p.ReportedCaptureMs = iv;
+                    else Logger.Warn("第 " + lineNo + " 行 capturebuffer 应为非负整数：" + val);
                     break;
                 case "prebuffer":
                     if (int.TryParse(val, out iv)) p.PrebufferMs = iv;
@@ -789,6 +825,11 @@ namespace Snad
             list.Add(kv("maxbuffer", p.MaxBufferMs.ToString(ci)));
             list.Add(kv("adaptrate", p.AdaptRate.ToString("0.###", ci)));
             list.Add(kv("calibratesec", p.CalibrateSec.ToString(ci)));
+
+            // 标定与上报（②④）。只在有值时才写，避免把"未标定"写成 0 而看起来像标定过。
+            if (p.OutputLegMs > 0) list.Add(kv("outputleg", p.OutputLegMs.ToString(ci)));
+            if (!string.IsNullOrEmpty(p.CalibratedOn)) list.Add(kv("calibratedon", p.CalibratedOn));
+            if (p.ReportedCaptureMs > 0) list.Add(kv("capturebuffer", p.ReportedCaptureMs.ToString(ci)));
             list.Add(kv("prebuffer", p.PrebufferMs.ToString(ci)));
             list.Add(kv("ringcapacity", p.RingCapacityMs.ToString(ci)));
             list.Add(kv("block", p.BlockMs.ToString(ci)));

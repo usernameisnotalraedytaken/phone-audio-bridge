@@ -68,7 +68,17 @@ namespace Snad
         private ListBox _list;
         private Panel _content;
         private Label _summary, _breakdown, _dirtyLabel;
+
+        /// <summary>
+        /// 当前被禁用项的**原因**。
+        ///
+        /// 计划 §4.4 明确要求"不可用原因……而不是静默禁灰"。
+        /// 灰掉一个控件却不说为什么，等于让用户去猜——而这里的原因
+        /// （后端不适用、设备不支持）恰好是无法从界面上推断出来的。
+        /// </summary>
+        private Label _notes;
         private FlatButton _saveBtn, _revertBtn, _deleteBtn, _newBtn, _copyBtn;
+        private FlatButton _renameBtn, _resetBtn, _exportBtn, _importBtn;
 
         private readonly List<Field> _fields = new List<Field>();
         private DeviceCapability[] _devices = new DeviceCapability[0];
@@ -171,6 +181,42 @@ namespace Snad
                 Key = "targetbuffer", Label = "TARGET BUFFER", Kind = Kind.Int, Restart = false,
                 Min = 10, Max = 400, Step = 5, Unit = "ms",
                 GetNumber = p => p.TargetBufferMs, SetNumber = (p, v) => p.TargetBufferMs = (int)v
+            });
+
+            // ---- 缓冲策略（③）：目标水位由谁决定 ----
+            _fields.Add(new Field
+            {
+                Key = "buffermode", Label = "BUFFER MODE", Kind = Kind.Enum, Restart = false,
+                Options = new[] { "static", "adaptive", "calibrated" },
+                Display = v => v == "static" ? "static (fixed)"
+                             : v == "adaptive" ? "adaptive"
+                             : "calibrated",
+                GetText = p => p.BufferMode,
+                SetText = (p, v) => p.BufferMode = v
+            });
+            _fields.Add(new Field
+            {
+                Key = "minbuffer", Label = "MIN BUFFER", Kind = Kind.Int, Restart = false,
+                Min = 5, Max = 400, Step = 5, Unit = "ms",
+                GetNumber = p => p.MinBufferMs, SetNumber = (p, v) => p.MinBufferMs = (int)v
+            });
+            _fields.Add(new Field
+            {
+                Key = "maxbuffer", Label = "MAX BUFFER", Kind = Kind.Int, Restart = false,
+                Min = 10, Max = 600, Step = 5, Unit = "ms",
+                GetNumber = p => p.MaxBufferMs, SetNumber = (p, v) => p.MaxBufferMs = (int)v
+            });
+            _fields.Add(new Field
+            {
+                Key = "adaptrate", Label = "ADAPT RATE", Kind = Kind.Double, Restart = false,
+                Min = 0.01, Max = 1.0, Step = 0.05, Decimals = 2,
+                GetNumber = p => p.AdaptRate, SetNumber = (p, v) => p.AdaptRate = v
+            });
+            _fields.Add(new Field
+            {
+                Key = "calibratesec", Label = "CALIBRATE", Kind = Kind.Int, Restart = false,
+                Min = 1, Max = 120, Step = 1, Unit = "s",
+                GetNumber = p => p.CalibrateSec, SetNumber = (p, v) => p.CalibrateSec = (int)v
             });
             _fields.Add(new Field
             {
@@ -361,6 +407,17 @@ namespace Snad
                 TextAlign = ContentAlignment.MiddleRight
             };
 
+            _notes = new Label
+            {
+                Text = "",
+                ForeColor = Theme.Warning,
+                Font = fLabel,
+                AutoSize = false,
+                BackColor = Theme.BgBase,
+                TextAlign = ContentAlignment.MiddleLeft,
+                UseMnemonic = false
+            };
+
             _saveBtn = new FlatButton("SAVE", true) { Enabled = false };
             _saveBtn.Click += (s, e) => SaveCurrent();
             _revertBtn = new FlatButton("REVERT") { Enabled = false };
@@ -373,19 +430,41 @@ namespace Snad
             _copyBtn = new FlatButton("COPY");
             _copyBtn.Click += (s, e) => CreateNew(true);
 
+            // 计划 §4.5 还要求 重命名 / 重置为内置默认 / 导入 / 导出。
+            // 前四项属于"档位生命周期"，与右侧的 REVERT/SAVE（本次编辑）分开摆，
+            // 免得把"改一个字段"和"删掉整个档位"混在同一组里。
+            _renameBtn = new FlatButton("RENAME");
+            _renameBtn.Click += (s, e) => RenameCurrent();
+            _resetBtn = new FlatButton("RESET");
+            _resetBtn.Click += (s, e) => ResetCurrent();
+            _exportBtn = new FlatButton("EXPORT");
+            _exportBtn.Click += (s, e) => ExportProfiles();
+            _importBtn = new FlatButton("IMPORT");
+            _importBtn.Click += (s, e) => ImportProfiles();
+
             Controls.Add(head);
             Controls.Add(_list);
             Controls.Add(_content);
             Controls.Add(_summary);
             Controls.Add(_breakdown);
             Controls.Add(_dirtyLabel);
+            Controls.Add(_notes);
             Controls.Add(_newBtn);
             Controls.Add(_copyBtn);
             Controls.Add(_deleteBtn);
+            Controls.Add(_renameBtn);
+            Controls.Add(_resetBtn);
+            Controls.Add(_exportBtn);
+            Controls.Add(_importBtn);
             Controls.Add(_saveBtn);
             Controls.Add(_revertBtn);
 
             CreateEditors(fLabel, fNorm);
+
+            // 最小尺寸按内容算，而不是写死一个数。
+            // 写死过 540，结果加入缓冲策略那 5 个字段后，最小尺寸下
+            // 左列最后一行被内容面板裁掉（截图可见 RATIO MAX 被切一半）。
+            ApplyContentMinimumSize();
 
             // 所有定位集中在 LayoutEditor，避免散落各处而逐渐错位
             Resize += (s, e) => LayoutEditor(head);
@@ -445,6 +524,12 @@ namespace Snad
                     f.Editor = st;
                 }
 
+                // 给控件起名（= 配置键）。自渲染检查工具靠它精确定位某个字段，
+                // 否则只能按"项数最多"之类的启发式去猜，字段一多就猜错
+                // （实测：加了 BUFFER MODE 之后，测试把位深下拉认成了它）。
+                f.Editor.Name = "field:" + f.Key;
+                f.LabelCtl.Name = "label:" + f.Key;
+
                 _content.Controls.Add(f.LabelCtl);
                 _content.Controls.Add(f.Editor);
             }
@@ -464,7 +549,7 @@ namespace Snad
             int w = ClientSize.Width, h = ClientSize.Height;
             int headH = Math.Max(30, (int)Math.Ceiling(Theme.Label(8f).Height * 2.2f));
             int btnH = _rowH + 4;
-            int footH = _rowH * 2 + btnH + _pad * 2;
+            int footH = _rowH * 3 + btnH + _pad * 2;   // 原因 + 摘要 + 分解 + 按钮行
 
             head.Bounds = new Rectangle(0, 0, w, headH);
 
@@ -478,17 +563,35 @@ namespace Snad
             _content.Bounds = new Rectangle(contentX, bodyTop + _pad, contentW, Math.Max(60, bodyH - _pad * 2));
 
             int sumTop = bodyTop + bodyH;
-            _summary.Bounds = new Rectangle(0, sumTop, Math.Max(80, w), _rowH + 2);
-            _breakdown.Bounds = new Rectangle(0, sumTop + _rowH + 2, Math.Max(80, w), _rowH);
+            // 顺序：原因 → 延迟摘要 → 分解 → 按钮
+            _notes.Bounds = new Rectangle(_pad, sumTop, Math.Max(80, w - _pad * 2), _rowH);
+            _summary.Bounds = new Rectangle(0, sumTop + _rowH, Math.Max(80, w), _rowH + 2);
+            _breakdown.Bounds = new Rectangle(0, sumTop + _rowH * 2 + 2, Math.Max(80, w), _rowH);
 
             int btnY = h - btnH - _pad;
-            const int bw = 92;
+
+            // 两组按钮，按职责分开：
+            //   左侧：档位生命周期（新建/复制/重命名/重置/删除/导入/导出）
+            //   右侧：本次编辑（撤销/保存）
+            // 混在一排会让"删掉整个档位"和"撤销一个字段"看起来同等危险。
+            const int bw = 80, gap = 6;
+            var leftGroup = new FlatButton[]
+            {
+                _newBtn, _copyBtn, _renameBtn, _deleteBtn, _resetBtn, _exportBtn, _importBtn
+            };
+            int bx = _pad;
+            foreach (var b in leftGroup)
+            {
+                b.Bounds = new Rectangle(bx, btnY, bw, btnH);
+                bx += bw + gap;
+            }
+
             _saveBtn.Bounds = new Rectangle(w - _pad - bw, btnY, bw, btnH);
-            _revertBtn.Bounds = new Rectangle(_saveBtn.Left - 8 - bw, btnY, bw, btnH);
-            _deleteBtn.Bounds = new Rectangle(_revertBtn.Left - 8 - bw, btnY, bw, btnH);
-            _copyBtn.Bounds = new Rectangle(_deleteBtn.Left - 8 - bw, btnY, bw, btnH);
-            _newBtn.Bounds = new Rectangle(_copyBtn.Left - 8 - bw, btnY, bw, btnH);
-            _dirtyLabel.Bounds = new Rectangle(_pad, btnY, Math.Max(40, _newBtn.Left - _pad - 8), btnH);
+            _revertBtn.Bounds = new Rectangle(_saveBtn.Left - gap - bw, btnY, bw, btnH);
+
+            int dirtyW = Math.Max(0, bx - _pad - 8);
+            _dirtyLabel.Bounds = new Rectangle(bx, btnY, Math.Max(0, _revertBtn.Left - gap - bx), btnH);
+            _ = dirtyW;
 
             LayoutFields();
         }
@@ -896,6 +999,203 @@ namespace Snad
             }
         }
 
+        /// <summary>重命名当前档位。配置文件里是"改段名"，因此要删旧段+写新段。</summary>
+        private void RenameCurrent()
+        {
+            if (_current == null) return;
+
+            string oldName = _current.Name;
+            string newName = PromptName("重命名档位", oldName);
+            if (newName == null) return;
+            newName = newName.Trim();
+            if (newName.Length == 0 || newName == oldName) return;
+
+            if (_profiles.ContainsKey(newName))
+            {
+                MessageBox.Show(this, "已存在同名档位：" + newName, "名称冲突",
+                                MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                return;
+            }
+
+            // 先把编辑器的值收进对象，否则重命名会把未保存的改动丢掉
+            CaptureEditors(_current);
+            _current.Name = newName;
+
+            // 先写新段再删旧段：中途失败时宁可多一个段，也不要两个都没了
+            if (!ProfileLibrary.SaveProfile(_cfgPath, _current))
+            {
+                _current.Name = oldName;
+                MessageBox.Show(this, "写入配置失败，重命名已回滚。", "重命名失败",
+                                MessageBoxButtons.OK, MessageBoxIcon.Error);
+                return;
+            }
+            ProfileLibrary.DeleteProfile(_cfgPath, oldName);
+
+            _profiles.Remove(oldName);
+            _profiles[newName] = _current;
+            if (_log != null) _log("档位已重命名：" + oldName + " → " + newName);
+
+            _dirty = false;
+            UpdateDirtyUi();
+            ReloadList(newName);
+            if (_onSaved != null) _onSaved();
+        }
+
+        /// <summary>
+        /// 重置为内置默认值。
+        ///
+        /// 内置档位有代码里的默认值可回退；自定义档位没有"内置默认"，
+        /// 因此以 balanced 为底、保留名字——重置的目的是"回到一个已知可用的状态"，
+        /// 而不是把档位删掉。
+        /// </summary>
+        private void ResetCurrent()
+        {
+            if (_current == null) return;
+
+            var builtins = ProfileLibrary.BuiltIn();
+            Profile basis;
+            string src;
+            if (builtins.TryGetValue(_current.Name, out basis) && basis != null) src = "内置默认值";
+            else if (builtins.TryGetValue("balanced", out basis) && basis != null) src = "balanced 默认值";
+            else
+            {
+                MessageBox.Show(this, "找不到可用的内置默认值。", "重置失败",
+                                MessageBoxButtons.OK, MessageBoxIcon.Error);
+                return;
+            }
+
+            var r = MessageBox.Show(this,
+                "把「" + _current.Name + "」重置为" + src + "？\n\n当前参数会被覆盖（EQ 设置保留）。",
+                "重置档位", MessageBoxButtons.OKCancel, MessageBoxIcon.Warning);
+            if (r != DialogResult.OK) return;
+
+            var fresh = CloneFor(basis);
+            fresh.Name = _current.Name;            // 名字不变
+            fresh.EqEnabled = _current.EqEnabled;  // 调音不因重置参数而丢
+            fresh.EqGains = _current.EqGains;
+            fresh.EqPreampDb = _current.EqPreampDb;
+
+            if (!ProfileLibrary.SaveProfile(_cfgPath, fresh))
+            {
+                MessageBox.Show(this, "写入配置失败，未重置。", "重置失败",
+                                MessageBoxButtons.OK, MessageBoxIcon.Error);
+                return;
+            }
+
+            _profiles[fresh.Name] = fresh;
+            _current = fresh;
+            LoadIntoEditors(fresh);
+            _dirty = false;
+            UpdateDirtyUi();
+            if (_log != null) _log("档位已重置：" + fresh.Name + "（来源：" + src + "）");
+            if (_onSaved != null) _onSaved();
+        }
+
+        /// <summary>
+        /// 导出全部档位到文件。
+        ///
+        /// 导出的是**配置片段**（[profile:名字] + 键值），因此可以直接
+        /// 拼回 receiver.cfg，也可以拿到另一台机器上导入——这就是计划说的"可分享"。
+        /// </summary>
+        private void ExportProfiles()
+        {
+            if (_profiles.Count == 0) return;
+
+            using (var dlg = new SaveFileDialog())
+            {
+                dlg.Title = "导出档位";
+                dlg.Filter = "SNAD 档位 (*.cfg)|*.cfg|所有文件 (*.*)|*.*";
+                dlg.FileName = "snad-profiles.cfg";
+                if (dlg.ShowDialog(this) != DialogResult.OK) return;
+
+                var sb = new System.Text.StringBuilder();
+                sb.AppendLine("# SNAD 档位导出");
+                sb.AppendLine("# 导出时间：" + DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss"));
+                sb.AppendLine("# 用法：拼回 receiver.cfg，或用 IMPORT 载入");
+                sb.AppendLine();
+
+                foreach (var kv in _profiles)
+                {
+                    var p = kv.Value;
+                    sb.AppendLine("[profile:" + p.Name + "]");
+                    foreach (var pair in ProfileLibrary.ToPairs(p))
+                        sb.AppendLine(pair.Key + " = " + pair.Value);
+                    sb.AppendLine();
+                }
+
+                try
+                {
+                    System.IO.File.WriteAllText(dlg.FileName, sb.ToString(), System.Text.Encoding.UTF8);
+                    if (_log != null) _log("已导出 " + _profiles.Count + " 个档位到 " + dlg.FileName);
+                }
+                catch (Exception ex)
+                {
+                    // 导出失败必须说出来，否则用户以为文件已经在那儿了
+                    MessageBox.Show(this, "导出失败：" + ex.Message, "导出",
+                                    MessageBoxButtons.OK, MessageBoxIcon.Error);
+                    if (_log != null) _log("导出失败：" + ex.Message);
+                }
+            }
+        }
+
+        /// <summary>从配置文件导入档位。同名档位询问是否覆盖，不静默替换。</summary>
+        private void ImportProfiles()
+        {
+            using (var dlg = new OpenFileDialog())
+            {
+                dlg.Title = "导入档位";
+                dlg.Filter = "SNAD 档位 (*.cfg)|*.cfg|所有文件 (*.*)|*.*";
+                if (dlg.ShowDialog(this) != DialogResult.OK) return;
+
+                string selected;
+                Dictionary<string, Profile> incoming;
+                try
+                {
+                    incoming = ProfileLibrary.Load(dlg.FileName, out selected);
+                }
+                catch (Exception ex)
+                {
+                    MessageBox.Show(this, "读取失败：" + ex.Message, "导入",
+                                    MessageBoxButtons.OK, MessageBoxIcon.Error);
+                    return;
+                }
+
+                if (incoming == null || incoming.Count == 0)
+                {
+                    MessageBox.Show(this, "该文件里没有可识别的档位。", "导入",
+                                    MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                    return;
+                }
+
+                int added = 0, replaced = 0, skipped = 0;
+                foreach (var kv in incoming)
+                {
+                    bool exists = _profiles.ContainsKey(kv.Key);
+                    if (exists)
+                    {
+                        var r = MessageBox.Show(this,
+                            "档位「" + kv.Key + "」已存在，要覆盖吗？\n\n选「否」则跳过该项。",
+                            "同名档位", MessageBoxButtons.YesNoCancel, MessageBoxIcon.Question);
+                        if (r == DialogResult.Cancel) break;
+                        if (r == DialogResult.No) { skipped++; continue; }
+                    }
+
+                    if (ProfileLibrary.SaveProfile(_cfgPath, kv.Value))
+                    {
+                        _profiles[kv.Key] = kv.Value;
+                        if (exists) replaced++; else added++;
+                    }
+                    else if (_log != null) _log("导入失败：" + kv.Key);
+                }
+
+                if (_log != null)
+                    _log("导入完成：新增 " + added + "，覆盖 " + replaced + "，跳过 " + skipped);
+
+                ReloadList(_current != null ? _current.Name : null);
+                if (_onSaved != null) _onSaved();
+            }
+        }
+
         private void DeleteCurrent()
         {
             if (_current == null) return;
@@ -927,7 +1227,48 @@ namespace Snad
         }
 
         /// <summary>
-        /// 按当前后端/设备决定哪些项真正生效，并把不适用的控件压暗。
+        /// 按"字段最多的那一列需要多高"反推窗口最小尺寸。
+        ///
+        /// 两列的行数是不对称的（热改项比需重启项多），所以不能对两列取平均，
+        /// 也不能写死——字段表一变，写死的值就会开始裁内容。
+        /// </summary>
+        private void ApplyContentMinimumSize()
+        {
+            int hot = 0, cold = 0;
+            foreach (var f in _fields)
+            {
+                if (f.Restart) cold++; else hot++;
+            }
+            int rows = Math.Max(hot, cold);
+
+            // 每组两条标题行（名称 + 后果说明）+ 行间距
+            int titleH = Math.Max(16, (int)Math.Ceiling(Theme.Label(8.5f).Height * 1.45f));
+            int subH = Math.Max(13, (int)Math.Ceiling(Theme.Label(7f).Height * 1.5f));
+            int headerBlock = titleH + subH + 4;
+
+            int contentH = headerBlock + rows * _rowH;
+            // 留一行余量：算出来刚好等于内容高度时，任何取整都会让最后一行
+            // 压到面板边缘并被裁掉（实测就是这样，RATIO MAX 只剩半行可见）
+            contentH += _rowH;
+            int headH = Math.Max(30, (int)Math.Ceiling(Theme.Label(8f).Height * 2.2f));
+            int btnH = _rowH + 4;
+            int footH = _rowH * 3 + btnH + _pad * 2;
+
+            int minH = headH + contentH + _pad * 2 + footH;
+            int minW = _pad + _listW + _pad + 2 * 240 + 30 + _pad;   // 列表 + 两列各 240 + 间距
+
+            var size = new Size(Math.Max(MinimumSize.Width, minW), Math.Max(MinimumSize.Height, minH));
+            MinimumSize = size;
+
+            // 当前尺寸若小于新的最小尺寸，撑开到刚好够——否则一打开就裁内容
+            int cw = Math.Max(ClientSize.Width, size.Width);
+            int ch = Math.Max(ClientSize.Height, size.Height);
+            if (cw != ClientSize.Width || ch != ClientSize.Height)
+                ClientSize = new Size(cw, ch);
+        }
+
+        /// <summary>
+        /// 当前后端/设备决定哪些项真正生效，并把不适用的控件压暗。
         ///
         /// 为什么必须做：waveOut 下 "WASAPI PERIOD" 完全没有作用，
         /// 但界面上它是个可点的步进器——用户会调它、并以为变快了。
@@ -976,6 +1317,31 @@ namespace Snad
                     finally { _loading = false; }
                 }
             }
+
+            // 把"为什么这些控件是灰的"写在界面上，而不是让用户猜
+            var why = new List<string>();
+            if (!wasapi)
+            {
+                why.Add("waveOut 固定 pcm16，位深不可选");
+                why.Add("WASAPI 周期对 waveOut 无效");
+            }
+            else
+            {
+                why.Add("WAVEOUT BUFS 只对 waveOut 有效");
+                if (backend == "wasapi_shared")
+                    why.Add("共享模式的位深由系统混音格式决定");
+            }
+
+            DeviceCapability dev = FindDevice(deviceId);
+            if (dev != null && wasapi && backend == "wasapi_exclusive")
+            {
+                if (opts.Length == 1)
+                    why.Add("该设备独占只支持 " + opts[0]);
+                else
+                    why.Add("该设备独占支持 " + string.Join("/", opts));
+            }
+            if (_notes != null)
+                _notes.Text = why.Count == 0 ? "" : "禁用原因：" + string.Join("；", why.ToArray());
 
             UpdateSummary();
         }
@@ -1093,20 +1459,29 @@ namespace Snad
             var probe = CloneFor(_current);
             CaptureEditors(probe);
 
-            // WASAPI 后端没有 waveOut 缓冲池，那一项不能计入，
-            // 否则会给出一个虚高、且与实际不符的数字
-            bool poolApplies = !probe.UsesWasapi;
+            // 估算模型已按回环实测改过（见 Profile.EstimatedPipelineLatencyMs 的注释）：
+            // 不再把 waveOut 缓冲池计入延迟，输出链路用实测值/后端典型值。
+            // 因此这里的数字会明显小于旧版，且分解里带 ~ 的项表示"估计"，
+            // 不带则表示实测或配置值。
+            int est = probe.EstimatedPipelineLatencyMs();
+            _summary.Text = "EST. LATENCY   ~" + est + " ms";
 
-            int est = probe.EstimatedPipelineLatencyMs(poolApplies);
-            _summary.Text = "EST. LATENCY   " + (poolApplies ? "" : "≥ ") + est + " ms";
-
-            string s = probe.LatencyBreakdown(poolApplies);
+            string s = probe.LatencyBreakdown();
             s += "      absorbs ±" +
                  (probe.TargetBufferMs / 2.0).ToString("F0", CultureInfo.InvariantCulture) +
                  " ms of jitter";
+            if (probe.BufferMode != "static")
+                s += "   （实际水位随策略变化）";
             _breakdown.Text = s;
         }
 
+        /// <summary>
+        /// 复制一个档位对象。
+        ///
+        /// 这里必须**逐字段**复制：任何漏掉的字段都会在保存时被写成默认值，
+        /// 而界面上看不出异常——这类静默丢配置比崩溃更难查。
+        /// 新增字段时务必同步这里（ToPairs 与解析处也是三处一起改）。
+        /// </summary>
         private static Profile CloneFor(Profile src)
         {
             return new Profile
@@ -1118,6 +1493,12 @@ namespace Snad
                 Format = src.Format,
                 WasapiPeriodMs = src.WasapiPeriodMs,
                 TargetBufferMs = src.TargetBufferMs,
+                // 缓冲策略（③）
+                BufferMode = src.BufferMode,
+                MinBufferMs = src.MinBufferMs,
+                MaxBufferMs = src.MaxBufferMs,
+                AdaptRate = src.AdaptRate,
+                CalibrateSec = src.CalibrateSec,
                 PrebufferMs = src.PrebufferMs,
                 RingCapacityMs = src.RingCapacityMs,
                 BlockMs = src.BlockMs,
@@ -1130,6 +1511,10 @@ namespace Snad
                 RatioMax = src.RatioMax,
                 FormatWaitSec = src.FormatWaitSec,
                 PrebufferWaitSec = src.PrebufferWaitSec,
+                // 标定与上报（②④）
+                OutputLegMs = src.OutputLegMs,
+                CalibratedOn = src.CalibratedOn,
+                ReportedCaptureMs = src.ReportedCaptureMs,
                 EqEnabled = src.EqEnabled,
                 EqPreampDb = src.EqPreampDb,
                 EqGains = src.EqGains
